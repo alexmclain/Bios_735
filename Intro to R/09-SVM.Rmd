@@ -1,0 +1,510 @@
+---
+title: "09 - Support Vector Machines"
+subtitle: "Biostatistics 735/794 — Machine Learning in Public Health"
+author: "Alexander McLain"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    theme: readable
+    df_print: paged
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  cache = TRUE,
+  fig.width = 7,
+  fig.height = 4.5
+)
+library(tidyverse)
+library(kableExtra)
+library(caret)
+library(e1071)  #Classic SVM package.
+library(kernlab) #Better SVM package
+library(pdp) # for partial dependence plots
+library(recipes)   # optional preprocessing for CV folds
+library(randomForest)
+library(mlbench)
+library(pROC)
+kbl2 <- function(x, ...) kable(x, align = "lrrrrrr", ...) %>% kable_styling(full_width = FALSE)
+```
+
+# Support Vector Machines on Simulated data
+
+In this example we're going to look at SVM's with some simulated data.
+
+```{r, printr.help.sections=c('description', 'usage', 'arguments')}
+
+set.seed(1)
+x <- matrix(rnorm(20*2),20,2)
+y <- c(rep(-1,10),rep(1,10))
+x[y==1,] = x[y==1,] + 1
+
+plot(x,col=(3-y), pch = 19, cex = 2)
+dat <- data.frame(x=x,y=as.factor(y))
+
+x <- matrix(rnorm(20*2),20,2)
+y <- c(rep(-1,10),rep(1,10))
+x[y==1,] = x[y==1,] + 1
+plot(x,col=(3-y), pch = 19, cex = 2, xlab=expression(X[1]),ylab=expression(X[2]))
+testdat <- data.frame(x=x,y=as.factor(y))
+
+```
+
+First, we're going to look at the impact of cost using the `svm` function in the `e1071` package.
+
+```{r}
+svmfit = svm(y~.,data=dat,kernel="linear",cost=10,scale=FALSE)
+plot(svmfit,dat)
+```
+
+The support vectors (data points) are on the margins or over the margins and are marked with an the "X" on this figure. 
+
+```{r}
+## Index gives the observations that are support points.
+svmfit$index
+summary(svmfit)
+```
+
+Now let's reduce the cost of being a support vector from 10 down to 0.01:
+
+```{r}
+svmfit = svm(y~.,data=dat,kernel="linear",cost=0.01,scale=FALSE)
+plot(svmfit,dat)
+summary(svmfit)
+```
+
+For the cost=0.1 almost everything is a support point (very few "O" points). More support points for lower costs.
+
+
+Now we'll check this out for a number of costs and see which works best.  For this we'll use 10-fold cross validation (which is the default for the function below), which is why we set a seed. Note that the `tune` function is part of the `e1071` package that we are using to fit SVMs
+
+```{r}
+set.seed(1) 
+tune.out <- tune(svm, y~., data=dat, kernel="linear",
+                 ranges=list(cost=c(0.001,0.01,0.1,1,5,10,100)))
+summary(tune.out)
+bestmod = tune.out$best.model
+summary(bestmod)
+ypred = predict(bestmod,testdat)
+ypred
+table(ypred,testdat$y)
+```
+
+
+Now let's look at some non-linear data.
+
+```{r}
+set.seed(1)
+x <- matrix(rnorm(200*2),ncol=2)
+x[1:100,] = x[1:100,]+2
+x[101:150,] = x[101:150,]-2
+y <- c(rep(-1,150),rep(1,50))
+dat <- data.frame(x=x,y=as.factor(y))
+plot(x,col=(3-y),xlab=expression(X[1]),ylab=expression(X[2]), pch = 19, cex = 1.5)
+
+
+set.seed(735)
+train_index <- createDataPartition(dat$y, p = 0.7, list = FALSE)
+train <- dat[train_index, ]
+test  <- dat[-train_index, ]
+
+svmfit = svm(y~., data=train, kernel="radial", cost=1, gamma=1)
+par(mfrow=c(1,2))
+plot(svmfit,train)
+summary(svmfit)
+svmfit2 = svm(y~.,data=train,kernel="radial",cost=1e4,gamma=1)
+plot(svmfit2,train)
+
+tune.out <- tune(svm, y~., data = train, kernel="radial", 
+                 ranges=list(
+                   cost=c(0.001,0.01,0.1,1,5,10,100),
+                   gamma=c(0.5,1,2,3,4)
+                   ))
+summary(tune.out)$performances %>% arrange(error) %>% filter(row_number()<10) %>% kbl2(digits = 3)
+table(true=test$y,pred=predict(tune.out$best.model,newdata=test))%>% kbl2(digits = 3)
+```
+
+Now we'll fit an SVM to some multiclass data.
+
+```{r}
+
+set.seed(1)
+y[101:150] <- 0
+par(mfrow=c(1,1))
+plot(x,col=(3-y),xlab=expression(X[1]),ylab=expression(X[2]), pch = 19, cex = 1.5)
+dat <- data.frame(x=x,y=as.factor(y)) #the as.factor is important so we don't do regression.
+svmfit = svm(y~.,data=dat,kernel="radial",cost=10,gamma=1)
+plot(svmfit,dat)
+```
+
+
+
+# Support Vector Machines for Regression
+
+We begin with the Communities and Crime dataset.  
+
+## Read in the data
+
+```{r}
+# Load Communities and Crime data 
+crime <- readRDS("community_crime.RDS")
+
+# Split into training and test sets
+set.seed(735)
+train_index <- createDataPartition(crime$ViolentCrime, p = 0.67, list = FALSE)
+train <- crime[train_index, ]
+test  <- crime[-train_index, ]
+```
+
+## Scale predictors (SVMs are sensitive to scale)
+
+**Preprocessing Recipe** Before commensing with the CV, we're going to create some functions to help us scale/center predictors. We will pass this function onto `train` below.
+
+Recipes ensure that preprocessing steps (like centering and scaling) are applied only within training folds during CV, preventing data leakage.
+
+Without recipes, scaling parameters are estimated from the full training set, potentially giving the model unfair access to information about the validation fold.
+
+
+```{r}
+crime_recipe <- recipe(ViolentCrime ~ ., data = train) %>%
+  step_center(all_predictors()) %>%
+  step_scale(all_predictors())
+
+crime_recipe
+```
+
+## Fit SVM Regression Model (Radial Kernel)
+
+We’ll use caret to handle tuning of cost (C) and gamma (RBF kernel width)
+ 
+$$ K(u,v) = \exp(|u - v|^2/\sigma)$$
+
+Were going to use the `train` function in `caret` to select our tuning parameters. This uses the `ksvm` functon in the `kernlab` package, which has a lot more options than `e1071::svm`.
+
+By default, `Caret` automatically estimates `sigma` parameter from your predictors using the `sigest()` function. This happens once before tuning, so only C (`cost`) is actually tuned. If we wanted to tune `sigma` we could give the `train` a grid of sigma and cost parameters to test.
+
+```{r}
+ctrl <- trainControl(
+  method = "cv",
+  number = 10,
+  savePredictions = "final",
+  summaryFunction = defaultSummary
+)
+
+set.seed(735)
+svm_fit <- train(
+  crime_recipe,
+  data = train,
+  method = "svmRadial",
+  trControl = ctrl,
+  tuneLength = 8,   # tries 8 different C values
+  metric = "RMSE"
+)
+
+
+svm_fit
+plot(svm_fit)
+```
+
+
+## Evaluate on the Test Set
+
+Now we’ll use the fitted model to predict Violent Crime in the test set and calculate RMSE and (R^2).
+
+```{r}
+pred_test <- predict(svm_fit, newdata = test)
+RMSE_val <- sqrt(mean((pred_test - test$ViolentCrime)^2))
+R2_val   <- cor(pred_test, test$ViolentCrime)^2
+
+tibble(
+  Metric = c("Test RMSE", "Test R²"),
+  Value = c(RMSE_val, R2_val)
+) %>% kable(digits = 4)
+```
+
+⸻
+
+## Predicted vs Observed Plot
+
+```{r}
+ggplot(data.frame(Observed = test$ViolentCrime, Predicted = pred_test),
+       aes(x = Observed, y = Predicted)) +
+  geom_point(alpha = 0.6, color = "steelblue") +
+  geom_abline(slope = 1, intercept = 0, color = "red", linetype = "dashed") +
+  labs(
+    title = "SVM Regression: Predicted vs Observed Violent Crime Rate",
+    subtitle = paste0("Test RMSE = ", round(RMSE_val, 3),
+                      ", R² = ", round(R2_val, 3)),
+    x = "Observed Violent Crime Rate",
+    y = "Predicted Violent Crime Rate"
+  ) +
+  theme_minimal(base_size = 14)
+```
+
+⸻
+
+## Variable Importance
+
+Variable importance is estimated based on the SVM model weights in the kernel space.
+
+```{r}
+varImp(svm_fit)$importance %>%
+  as.data.frame() %>%
+  rownames_to_column("Variable") %>%
+  arrange(desc(Overall)) %>%
+  head(15) %>%
+  ggplot(aes(x = reorder(Variable, Overall), y = Overall)) +
+  geom_col(fill = "darkorange") +
+  coord_flip() +
+  labs(title = "Top 15 Most Important Predictors (SVM-Radial)") +
+  theme_minimal(base_size = 13)
+```
+
+## Compare with Random Forest
+
+```{r}
+set.seed(123)
+
+# Define training control for 10-fold CV
+ctrl <- trainControl(method = "cv", number = 10)
+
+# Train random forest model with CV to tune mtry
+rf_caret <- train(ViolentCrime ~ ., 
+                  data = train,
+                  method = "rf",
+                  metric = "RMSE",  
+                  trControl = ctrl,
+                  tuneGrid = data.frame(mtry = 1:20)) # grid of mtry values
+
+pred_test_rf <- predict(rf_caret$finalModel, newdata = test)
+RMSE_val_rf <- sqrt(mean((pred_test_rf - test$ViolentCrime)^2))
+R2_val_rf   <- cor(pred_test_rf, test$ViolentCrime)^2
+
+tibble(
+  Metric = c("SVM (Radial)", "Random Forests"),
+  "Test RMSE" = c(RMSE_val,RMSE_val_rf), 
+   "Test R²" = c(R2_val, R2_val_rf)
+) %>% kable(digits = 4)
+
+rf_reg <- rf_caret$finalModel
+varImpPlot(rf_reg, main = "Variable Importance (Regression)")
+```
+
+---
+
+# SVM for Classification
+
+We now turn to the Pima Diabetes dataset.
+
+```{r}
+data(PimaIndiansDiabetes)
+df <- PimaIndiansDiabetes
+glimpse(df)
+
+# Outcome should be a factor with "neg" as reference
+df$diabetes <- factor(df$diabetes, levels = c("neg", "pos"))
+
+set.seed(735)
+train_index <- createDataPartition(df$diabetes, p = 0.8, list = FALSE)
+train <- df[train_index, ]
+test  <- df[-train_index, ]
+
+svm_recipe <- recipe(diabetes ~ ., data = train) %>%
+  step_center(all_predictors()) %>%
+  step_scale(all_predictors())
+```
+
+
+## Cross-validation to select `cost` with `sigma`
+
+
+```{r}
+ctrl <- trainControl(
+  method = "cv",
+  number = 10,
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary,  # computes ROC, Sens, Spec
+  savePredictions = "final"
+)
+
+# Define grid for both sigma and C
+svm_grid <- expand.grid(
+  sigma = 2^seq(-10, -3, length.out = 5),
+  C = 2^seq(-2, 4, length.out = 6)
+)
+
+
+set.seed(123)
+
+svm_fit <- train(
+  svm_recipe,
+  data = train,
+  method = "svmRadial",
+  tuneGrid = svm_grid,
+  trControl = ctrl,
+  metric = "ROC"
+)
+
+svm_fit$results %>% arrange(-ROC) %>% filter(row_number()<8) %>% kbl2(digits = 4)
+
+ggplot(svm_fit$results, aes(x = log2(C), y = log2(sigma), fill = ROC)) +
+  geom_tile() +
+  scale_fill_viridis_c(option = "C") +
+  labs(
+    title = "SVM Tuning Surface (5x6 Grid)",
+    x = "log2(C)",
+    y = "log2(sigma)"
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+## Variable Importance for Final Model
+
+```{r}
+varImp(svm_fit)$importance %>%
+  as.data.frame() %>%
+  rownames_to_column("Variable") %>%
+  select(Variable,neg) %>% rename(Importance = neg) %>% 
+  ggplot(aes(x = Variable %>% reorder(Importance), y = Importance)) +
+  geom_col(fill = "tomato") +
+  coord_flip() +
+  labs(title = "Variable Importance (SVM-Radial)") +
+  theme_minimal(base_size = 13)
+```
+
+## Partial Dependence Plots (Classification)
+
+```{r}
+p3 <- partial(svm_fit, pred.var = "glucose", train = train, which.class = "pos")
+autoplot(p3, main = "PDP: Glucose (Diabetes Probability)")
+
+p4 <- partial(svm_fit, pred.var = "age", train = train, which.class = "pos")
+autoplot(p4, main = "PDP: Age (Diabetes Probability)")
+```
+
+## Evaluate on Test Set
+
+```{r}
+pred_probs <- predict(svm_fit, newdata = test, type = "prob")
+pred_class <- predict(svm_fit, newdata = test)
+
+roc_obj <- roc(test$diabetes, pred_probs$pos, levels = c("neg", "pos"))
+auc_val <- auc(roc_obj)
+
+cm <- confusionMatrix(pred_class, test$diabetes, positive = "pos")
+
+tibble(
+  Metric = c("AUC", "Accuracy", "Sensitivity", "Specificity"),
+  Value = c(
+    auc_val,
+    cm$overall["Accuracy"],
+    cm$byClass["Sensitivity"],
+    cm$byClass["Specificity"]
+  )
+)
+
+plot(roc_obj, col = "steelblue", lwd = 3, main = "ROC Curve — SVM (Radial Kernel)")
+abline(a = 0, b = 1, lty = 2, col = "gray")
+```
+
+
+## Comparison to Logistic Regression and Random Forests
+
+Fit with logistic regression:
+
+```{r}
+set.seed(735)
+fit_logit <- train(
+  svm_recipe,
+  data = train,
+  method = "glm",
+  family = binomial,
+  trControl = ctrl,
+  metric = "ROC"
+)
+
+summary(fit_logit$finalModel)
+```
+
+Fit with Random Forest:
+
+```{r}
+set.seed(735)
+fit_rf <- train(
+  svm_recipe,
+  data = train,
+  method = "rf",
+  trControl = ctrl,
+  tuneLength = 5,
+  metric = "ROC"
+)
+
+fit_rf
+plot(fit_rf)
+```
+
+
+### Compare performance using CV
+
+```{r}
+res <- resamples(list(
+  Logistic = fit_logit,
+  SVM = svm_fit,
+  RF = fit_rf
+))
+
+# Boxplot comparison of AUC, Sens, Spec
+bwplot(res, metric = "ROC", main = "Cross-Validated AUC Comparison")
+```
+
+
+### Compare performance using the Test Set
+
+```{r}
+predict_and_eval <- function(model, name) {
+  prob <- predict(model, newdata = test, type = "prob")[, "pos"]
+  pred <- predict(model, newdata = test)
+  roc_obj <- roc(test$diabetes, prob, levels = c("neg", "pos"))
+  auc_val <- auc(roc_obj)
+  cm <- confusionMatrix(pred, test$diabetes, positive = "pos")
+  tibble(
+    Model = name,
+    AUC = auc_val,
+    Accuracy = cm$overall["Accuracy"],
+    Sensitivity = cm$byClass["Sensitivity"],
+    Specificity = cm$byClass["Specificity"]
+  )
+}
+
+logit_res <- predict_and_eval(fit_logit, "Logistic Regression")
+svm_res <- predict_and_eval(svm_fit, "SVM (RBF)")
+rf_res <- predict_and_eval(fit_rf, "Random Forest")
+
+
+rbind(logit_res, svm_res, rf_res) %>%
+  mutate(across(-Model, round, 3)) %>%
+  knitr::kable(caption = "Test Set Performance Comparison")
+```
+
+
+# Discussion
+
+**Model	Strengths	Limitations**
+
+- **Logistic Regression:**	Simple, interpretable, fast. Misses non-linearities and interactions.
+- **SVM (RBF):**	Captures nonlinear boundaries, good for medium data (*not too small* and *not too large*).	Less interpretable, sensitive to tuning.
+- **Random Forest:** Captures interactions, robust, easy variable importance. Can overfit, less interpretable.
+
+Interpretation:
+
+-	SVM and Random Forest often outperform Logistic Regression when nonlinear relationships exist.
+-	Logistic Regression remains valuable for interpretability.
+-	Cross-validation ensures fair, unbiased comparison.
+
+

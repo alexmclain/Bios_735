@@ -11,7 +11,7 @@
 
 <meta name="author" content="Alexander McLain" />
 
-<meta name="date" content="2025-11-06" />
+<meta name="date" content="2025-11-10" />
 
 <title>Interpretable ML</title>
 
@@ -576,7 +576,7 @@ display: none;
 
 <h1 class="title toc-ignore">Interpretable ML</h1>
 <h4 class="author">Alexander McLain</h4>
-<h4 class="date">2025-11-06</h4>
+<h4 class="date">2025-11-10</h4>
 
 </div>
 
@@ -671,10 +671,22 @@ glimpse(df)</code></pre>
 ## 500 268</code></pre>
 <p><strong>Outcome:</strong> <code>diabetes</code> (factor:
 <code>&quot;pos&quot;</code> vs <code>&quot;neg&quot;</code>).<br />
-<strong>Predictors:</strong> numeric risk factors (e.g.,
-<code>glucose</code>, <code>pregnant</code>, <code>age</code>,
-<code>mass</code> (BMI), <code>pressure</code> (BP), etc.).<br />
-There are some missing values, requiring imputation.</p>
+<strong>Predictors:</strong></p>
+<ul>
+<li><p><strong>pregnant</strong>: Number of times pregnant</p></li>
+<li><p><strong>glucose</strong>: Plasma glucose concentration (glucose
+tolerance test)</p></li>
+<li><p><strong>pressure</strong>: Diastolic blood pressure (mm
+Hg)</p></li>
+<li><p><strong>triceps</strong>: Triceps skin fold thickness
+(mm)</p></li>
+<li><p><strong>insulin</strong>: 2-Hour serum insulin (mu U/ml)</p></li>
+<li><p><strong>mass</strong>: Body mass index</p></li>
+<li><p><strong>pedigree</strong>: Diabetes pedigree function</p></li>
+<li><p><strong>age</strong>: Age (years)</p></li>
+<li><p><strong>diabetes</strong>: Class variable (test for
+diabetes)</p></li>
+</ul>
 </div>
 <div id="traintest-split-and-preprocessing" class="section level1" number="4">
 <h1><span class="header-section-number">4</span> Train/Test Split and
@@ -916,7 +928,267 @@ sh_values &lt;- fastshap::explain(
   nsim          = 50
 )
 
-# Compute global importance: mean(|SHAP|)
+# Looking at local importance with SHAP values
+X_test[1:200, , drop = FALSE] %&gt;% 
+  bind_cols(
+    as_tibble(sh_values[,1:3]) %&gt;% rename_with(~paste0(.x,&quot;_sh&quot;))
+    ) %&gt;% 
+  # See who has high predictions due to their glucose
+  arrange(-glucose_sh) %&gt;% 
+  head() %&gt;% 
+  kbl2(digits = 3) </code></pre>
+<table class="table" style="width: auto !important; margin-left: auto; margin-right: auto;">
+<thead>
+<tr>
+<th style="text-align:left;">
+pregnant
+</th>
+<th style="text-align:right;">
+glucose
+</th>
+<th style="text-align:right;">
+pressure
+</th>
+<th style="text-align:right;">
+triceps
+</th>
+<th style="text-align:right;">
+insulin
+</th>
+<th style="text-align:right;">
+mass
+</th>
+<th style="text-align:right;">
+pedigree
+</th>
+<th style="text-align:left;">
+age
+</th>
+<th style="text-align:right;">
+pregnant_sh
+</th>
+<th style="text-align:right;">
+glucose_sh
+</th>
+<th style="text-align:right;">
+pressure_sh
+</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align:left;">
+-0.240
+</td>
+<td style="text-align:right;">
+2.388
+</td>
+<td style="text-align:right;">
+-0.196
+</td>
+<td style="text-align:right;">
+0.240
+</td>
+<td style="text-align:right;">
+-0.175
+</td>
+<td style="text-align:right;">
+0.362
+</td>
+<td style="text-align:right;">
+-0.734
+</td>
+<td style="text-align:left;">
+-0.692
+</td>
+<td style="text-align:right;">
+0.003
+</td>
+<td style="text-align:right;">
+0.325
+</td>
+<td style="text-align:right;">
+0.002
+</td>
+</tr>
+<tr>
+<td style="text-align:left;">
+-1.124
+</td>
+<td style="text-align:right;">
+1.523
+</td>
+<td style="text-align:right;">
+-0.035
+</td>
+<td style="text-align:right;">
+0.009
+</td>
+<td style="text-align:right;">
+-0.175
+</td>
+<td style="text-align:right;">
+-0.014
+</td>
+<td style="text-align:right;">
+1.200
+</td>
+<td style="text-align:left;">
+-0.282
+</td>
+<td style="text-align:right;">
+-0.005
+</td>
+<td style="text-align:right;">
+0.315
+</td>
+<td style="text-align:right;">
+0.024
+</td>
+</tr>
+<tr>
+<td style="text-align:left;">
+-0.240
+</td>
+<td style="text-align:right;">
+1.656
+</td>
+<td style="text-align:right;">
+-0.035
+</td>
+<td style="text-align:right;">
+0.472
+</td>
+<td style="text-align:right;">
+-0.058
+</td>
+<td style="text-align:right;">
+0.130
+</td>
+<td style="text-align:right;">
+-0.870
+</td>
+<td style="text-align:left;">
+-0.774
+</td>
+<td style="text-align:right;">
+-0.005
+</td>
+<td style="text-align:right;">
+0.304
+</td>
+<td style="text-align:right;">
+0.000
+</td>
+</tr>
+<tr>
+<td style="text-align:left;">
+1.233
+</td>
+<td style="text-align:right;">
+2.155
+</td>
+<td style="text-align:right;">
+1.417
+</td>
+<td style="text-align:right;">
+0.703
+</td>
+<td style="text-align:right;">
+0.997
+</td>
+<td style="text-align:right;">
+0.304
+</td>
+<td style="text-align:right;">
+-0.146
+</td>
+<td style="text-align:left;">
+0.291
+</td>
+<td style="text-align:right;">
+0.027
+</td>
+<td style="text-align:right;">
+0.297
+</td>
+<td style="text-align:right;">
+-0.002
+</td>
+</tr>
+<tr>
+<td style="text-align:left;">
+-1.124
+</td>
+<td style="text-align:right;">
+2.554
+</td>
+<td style="text-align:right;">
+-0.519
+</td>
+<td style="text-align:right;">
+0.356
+</td>
+<td style="text-align:right;">
+1.572
+</td>
+<td style="text-align:right;">
+1.289
+</td>
+<td style="text-align:right;">
+0.110
+</td>
+<td style="text-align:left;">
+-0.446
+</td>
+<td style="text-align:right;">
+-0.001
+</td>
+<td style="text-align:right;">
+0.293
+</td>
+<td style="text-align:right;">
+0.016
+</td>
+</tr>
+<tr>
+<td style="text-align:left;">
+0.939
+</td>
+<td style="text-align:right;">
+2.488
+</td>
+<td style="text-align:right;">
+1.417
+</td>
+<td style="text-align:right;">
+0.009
+</td>
+<td style="text-align:right;">
+-0.175
+</td>
+<td style="text-align:right;">
+1.071
+</td>
+<td style="text-align:right;">
+-0.055
+</td>
+<td style="text-align:left;">
+0.619
+</td>
+<td style="text-align:right;">
+0.023
+</td>
+<td style="text-align:right;">
+0.293
+</td>
+<td style="text-align:right;">
+-0.018
+</td>
+</tr>
+</tbody>
+</table>
+<pre class="r"><code># Compute global importance: mean(|SHAP|)
 shap_importance &lt;- data.frame(
   Variable = colnames(sh_values),
   Importance = apply(abs(sh_values), 2, mean)

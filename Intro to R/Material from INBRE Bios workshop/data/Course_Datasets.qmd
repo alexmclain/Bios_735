@@ -1,0 +1,452 @@
+---
+title: "Course Datasets"
+subtitle: "SC INBRE Biostatistics Summer Intensive 2026"
+date: today
+format:
+  html:
+    toc: true
+    toc-location: left
+    toc-depth: 3
+    number-sections: true
+    smooth-scroll: true
+    theme: cosmo
+    code-fold: false
+    highlight-style: github
+    embed-resources: true
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+```{r}
+#| echo: false
+library(tidyverse)
+library(this.path)
+setwd(this.dir())
+```
+
+# Overview
+
+This document describes the datasets used throughout the course. Each entry
+includes a description, the relevant course days, a load test, exploratory
+checks, and notes on any cleaning steps needed before analysis.
+
+All datasets are either built into R (no file needed), available through an R
+package, or stored as `.csv` files in the `data/` folder of the course
+repository.
+
+---
+
+# Framingham Heart Study
+
+## Source
+
+The Framingham Heart Study is a landmark longitudinal cohort study of
+cardiovascular disease risk factors, initiated in 1948 in Framingham,
+Massachusetts. The teaching dataset used here is a publicly available
+subset widely used in statistics education.
+
+**File:** `data/framingham.csv` (in the course GitHub repository)
+
+**Relevant course days:** Days 2--10 (used as the primary dataset
+throughout Weeks 1 and 2)
+
+## Description
+
+The dataset contains demographic and cardiovascular risk factor information
+on 4,240 participants. The primary outcome of interest is the 10-year risk
+of coronary heart disease (`TenYearCHD`).
+
+| Variable | Type | Description |
+|---|---|---|
+| `male` | Binary | Sex (0 = Female, 1 = Male) |
+| `age` | Continuous | Age in years |
+| `education` | Categorical | 1 = Some HS, 2 = HS Diploma, 3 = Some College, 4 = College Degree |
+| `currentSmoker` | Binary | Current smoker (0 = No, 1 = Yes) |
+| `cigsPerDay` | Continuous | Cigarettes smoked per day |
+| `BPMeds` | Binary | On blood pressure medication (0 = No, 1 = Yes) |
+| `prevalentStroke` | Binary | Prior stroke (0 = No, 1 = Yes) |
+| `prevalentHyp` | Binary | Prevalent hypertension (0 = No, 1 = Yes) |
+| `diabetes` | Binary | Diabetes status (0 = No, 1 = Yes) |
+| `totChol` | Continuous | Total cholesterol (mg/dL) |
+| `sysBP` | Continuous | Systolic blood pressure (mmHg) |
+| `diaBP` | Continuous | Diastolic blood pressure (mmHg) |
+| `BMI` | Continuous | Body mass index (kg/m²) |
+| `heartRate` | Continuous | Heart rate (beats per minute) |
+| `glucose` | Continuous | Blood glucose level (mg/dL) |
+| `TenYearCHD` | Binary | 10-year coronary heart disease event (0 = No, 1 = Yes) |
+
+## Load
+
+```{r}
+framingham <- read_csv("framingham.csv") |>
+  mutate(
+    male          = factor(male,          levels = c(0,1), labels = c("Female","Male")),
+    currentSmoker = factor(currentSmoker, levels = c(0,1), labels = c("Non-smoker","Smoker")),
+    BPMeds        = factor(BPMeds,        levels = c(0,1), labels = c("No","Yes")),
+    prevalentStroke = factor(prevalentStroke, levels = c(0,1), labels = c("No","Yes")),
+    prevalentHyp  = factor(prevalentHyp,  levels = c(0,1), labels = c("No","Yes")),
+    diabetes      = factor(diabetes,      levels = c(0,1), labels = c("No","Yes")),
+    TenYearCHD    = factor(TenYearCHD,    levels = c(0,1), labels = c("No","Yes")),
+    education     = factor(education,     levels = 1:4,
+                           labels = c("Some HS","HS Diploma","Some College","College Degree"))
+  )
+
+glimpse(framingham)
+```
+
+## Exploratory Checks
+
+```{r}
+summary(framingham)
+```
+
+```{r}
+# Missing values per column
+colSums(is.na(framingham))
+```
+
+```{r}
+# Missing as a percentage
+round(colSums(is.na(framingham)) / nrow(framingham) * 100, 1)
+```
+
+## Cleaning Notes
+
+- The binary and categorical variables are stored as integers in the raw file
+  and must be converted to factors using `mutate()` before analysis. The load
+  code above does this automatically.
+- Missing values are present in seven variables: `education`, `cigsPerDay`,
+  `BPMeds`, `totChol`, `BMI`, `heartRate`, and `glucose`. Always use
+  `na.rm = TRUE` in summary functions and be aware of how your modeling
+  function handles missing data (most will drop rows with any `NA` by default).
+- After applying the `filter(!is.na(...))` approach used in the Day 7 lab,
+  the complete-case sample is approximately 3,658 participants.
+
+---
+
+# Airway (RNA-Seq)
+
+## Source
+
+Bioconductor package: `airway`
+
+Himes et al. (2014). *RNA-Seq Transcriptome Profiling Identifies CRISPLD2 as
+a Glucocorticoid Responsive Gene that Modulates Cytokine Function in Airway
+Smooth Muscle Cells.* PLOS ONE.
+
+**Relevant course days:** Days 11--14 (genomics, differential expression,
+multiple testing, dimensionality reduction)
+
+## Description
+
+This dataset contains read counts from an RNA-sequencing experiment on human
+airway smooth muscle cell lines. Four cell lines were treated with
+dexamethasone (a corticosteroid) and four were untreated controls.
+
+| Component | Description |
+|---|---|
+| Dimensions | 63,677 genes × 8 samples |
+| Samples | 4 treated (dexamethasone) + 4 untreated controls |
+| Format | `RangedSummarizedExperiment` object |
+| Count matrix | Access with `assay(airway)` |
+| Sample metadata | Access with `colData(airway)` |
+| Gene metadata | Access with `rowData(airway)` |
+
+## Install and Load
+
+```{r}
+#| eval: false
+# Install Bioconductor and the airway package (run once)
+if (!requireNamespace("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+BiocManager::install("airway")
+```
+
+```{r}
+library(airway)
+data(airway)
+airway
+```
+
+## Exploratory Checks
+
+```{r}
+# Dimensions: genes x samples
+dim(airway)
+
+# Sample metadata
+colData(airway)
+```
+
+```{r}
+# First few rows of the count matrix
+airway_counts <- assay(airway)
+head(airway_counts)
+```
+
+```{r}
+# Missing values (should be none in count data)
+sum(is.na(airway_counts))
+```
+
+```{r}
+# Distribution of counts for the first sample
+summary(airway_counts[, 1])
+```
+
+## Cleaning Notes
+
+- `assay(airway)` extracts the raw integer count matrix. Sample metadata
+  (`colData`) and gene metadata (`rowData`) must be extracted separately if
+  needed as plain data frames.
+- Many genes have zero counts across all samples. DESeq2 handles this
+  automatically through its filtering steps and does not require manual
+  removal of zero-count genes.
+- The `dex` column in `colData(airway)` records treatment status: `"trt"`
+  (dexamethasone treated) vs. `"untrt"` (control). This is the grouping
+  variable used in the Day 12 differential expression analysis.
+
+---
+
+# InsectSprays
+
+## Source
+
+Built-in base R dataset (`datasets` package --- no install required)
+
+**Relevant course days:** Day 8 (GLMs --- Poisson regression for count
+outcomes)
+
+## Description
+
+This dataset records the effectiveness of six different insecticide sprays
+(A through F) applied to agricultural experimental units. It is a classic
+example for count data analysis using Poisson or negative binomial
+regression.
+
+| Variable | Type | Description |
+|---|---|---|
+| `count` | Integer | Number of insects in each experimental unit |
+| `spray` | Factor | Insecticide type (A, B, C, D, E, or F) |
+
+72 observations total (12 per spray type).
+
+## Load
+
+```{r}
+data(InsectSprays)
+head(InsectSprays)
+```
+
+## Exploratory Checks
+
+```{r}
+str(InsectSprays)
+summary(InsectSprays)
+```
+
+```{r}
+# Counts per spray type
+InsectSprays |>
+  group_by(spray) |>
+  summarize(
+    n        = n(),
+    mean     = mean(count),
+    sd       = sd(count),
+    min      = min(count),
+    max      = max(count)
+  )
+```
+
+```{r}
+# Visualize
+ggplot(InsectSprays, aes(x = spray, y = count, fill = spray)) +
+  geom_boxplot(alpha = 0.7, show.legend = FALSE) +
+  labs(x = "Insecticide", y = "Insect count",
+       title = "InsectSprays: Count by Insecticide Type") +
+  theme_minimal()
+```
+
+```{r}
+# Missing values
+colSums(is.na(InsectSprays))
+```
+
+## Cleaning Notes
+
+No missing values. No factor conversion needed --- `spray` is already
+stored as a factor with six levels (A through F). Spray type C, D, and E
+appear to be substantially more effective (lower counts) than A, B, and F,
+making this a clear case for demonstrating group comparisons with count
+outcomes.
+
+---
+
+# sleepstudy (Longitudinal)
+
+## Source
+
+Package: `lme4`
+
+Belenky et al. (2003). *Patterns of performance degradation and restoration
+during sleep restriction and subsequent recovery: A sleep dose-response
+study.* Journal of Sleep Research.
+
+**Relevant course days:** Day 10 (mixed models for repeated/clustered data)
+
+## Description
+
+This dataset contains average reaction times from a psychomotor vigilance
+test recorded daily from 18 subjects over 10 days in a sleep deprivation
+study. On Day 0, subjects had a normal night of sleep. Beginning that night,
+they were restricted to 3 hours of sleep per night for 9 consecutive nights.
+
+| Variable | Type | Description |
+|---|---|---|
+| `Reaction` | Continuous | Average reaction time (milliseconds) |
+| `Days` | Integer | Number of days of sleep deprivation (0--9) |
+| `Subject` | Factor | Subject identifier (18 subjects) |
+
+180 observations total (18 subjects × 10 days).
+
+## Load
+
+```{r}
+library(lme4)
+data("sleepstudy")
+head(sleepstudy, 12)
+```
+
+## Exploratory Checks
+
+```{r}
+str(sleepstudy)
+summary(sleepstudy)
+```
+
+```{r}
+# Reaction time trajectories per subject
+ggplot(sleepstudy, aes(x = Days, y = Reaction, group = Subject,
+                       color = Subject)) +
+  geom_line(alpha = 0.7, show.legend = FALSE) +
+  geom_point(alpha = 0.5, show.legend = FALSE) +
+  labs(x = "Days of sleep deprivation",
+       y = "Reaction time (ms)",
+       title = "Reaction Time over Sleep Deprivation by Subject") +
+  theme_minimal()
+```
+
+```{r}
+# Missing values
+colSums(is.na(sleepstudy))
+```
+
+## Cleaning Notes
+
+No missing values. `Subject` is already stored as a factor. The key feature
+of this dataset for Day 10 is that each subject has a different baseline
+reaction time (random intercept) and a different rate of decline with sleep
+deprivation (random slope) --- making it an ideal demonstration of the
+random intercept-and-slope mixed model.
+
+---
+
+# lung (Survival Analysis)
+
+## Source
+
+Package: `survival`
+
+Data from the North Central Cancer Treatment Group (NCCTG). Originally
+published in Loprinzi et al. (1994). *Prospective evaluation of prognostic
+variables from patient-completed questionnaires.* Journal of Clinical
+Oncology.
+
+**Relevant course days:** Day 9 (survival analysis --- Kaplan-Meier,
+log-rank test, Cox proportional hazards)
+
+## Description
+
+This dataset contains clinical and performance data from 228 patients with
+advanced-stage lung cancer. The primary outcome is time to death, with some
+patients censored (lost to follow-up or alive at end of study).
+
+| Variable | Type | Description |
+|---|---|---|
+| `inst` | Integer | Institution code |
+| `time` | Integer | Survival time (days) |
+| `status` | Binary | Censoring status (1 = censored, 2 = dead) |
+| `age` | Integer | Age in years |
+| `sex` | Binary | Sex (1 = Male, 2 = Female) |
+| `ph.ecog` | Integer | ECOG performance score (0 = good, 4 = bedridden) |
+| `ph.karno` | Integer | Karnofsky score rated by physician (0--100) |
+| `pat.karno` | Integer | Karnofsky score rated by patient (0--100) |
+| `meal.cal` | Integer | Calories consumed at meals |
+| `wt.loss` | Integer | Weight loss in past 6 months (lbs) |
+
+::: {.callout-note}
+In the `lung` dataset, `status = 1` means **censored** and `status = 2`
+means **dead**. This is the opposite of the convention used in many other
+survival datasets, where 1 = event. The `survival` package handles this
+correctly when you use `Surv(time, status == 2)`.
+:::
+
+## Load
+
+```{r}
+library(survival)
+head(lung)
+```
+
+## Exploratory Checks
+
+```{r}
+str(lung)
+summary(lung)
+```
+
+```{r}
+# Missing values per column
+colSums(is.na(lung))
+round(colSums(is.na(lung)) / nrow(lung) * 100, 1)
+```
+
+```{r}
+# Event rate
+table(lung$status)
+prop.table(table(lung$status))
+```
+
+```{r}
+# Quick Kaplan-Meier curve
+km_fit <- survfit(Surv(time, status == 2) ~ sex, data = lung)
+plot(km_fit, col = c("steelblue", "firebrick"),
+     xlab = "Days", ylab = "Survival probability",
+     main = "Kaplan-Meier: Survival by Sex")
+legend("topright", legend = c("Male", "Female"),
+       col = c("steelblue", "firebrick"), lty = 1)
+```
+
+## Cleaning Notes
+
+- Missing values are present in `inst`, `ph.ecog`, `ph.karno`, `pat.karno`,
+  `meal.cal`, and `wt.loss`. These are handled automatically by `survfit()`
+  and `coxph()`, which use complete cases for each model.
+- `sex` is coded 1 = Male and 2 = Female --- convert to a factor with
+  informative labels for plots: `mutate(sex = factor(sex, levels = c(1,2), labels = c("Male","Female")))`.
+- The `status` coding (1 = censored, 2 = dead) is non-standard. Always use
+  `Surv(time, status == 2)` to define the survival object correctly.
+
+---
+
+# Summary Table
+
+| Dataset | Source | Rows | Columns | Primary Use | Days |
+|---|---|---|---|---|---|
+| `framingham` | CSV file | 4,240 | 16 | Linear/logistic regression, EDA | 2--10 |
+| `airway` | Bioconductor | 63,677 genes × 8 samples | --- | RNA-seq, DESeq2, PCA | 11--14 |
+| `InsectSprays` | Base R | 72 | 2 | Poisson regression, count data | 8 |
+| `sleepstudy` | `lme4` | 180 | 3 | Mixed models, longitudinal data | 10 |
+| `lung` | `survival` | 228 | 10 | Survival analysis, KM, Cox PH | 9 |

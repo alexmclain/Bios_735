@@ -1,0 +1,407 @@
+---
+title: "Day 3 (PM) Lab: Importing, Tidying, and Joining Data"
+subtitle: "SC INBRE Biostatistics Summer Intensive 2026"
+date: today
+format:
+  html:
+    toc: true
+    toc-location: left
+    toc-depth: 3
+    number-sections: true
+    smooth-scroll: true
+    theme: cosmo
+    code-fold: false
+    highlight-style: github
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+# Overview
+
+This lab covers everything from Day 3 AM:
+
+- **Importing:** reading CSV and Excel files, handling missing value codes,
+  cleaning column names, writing output
+- **Tidy data:** identifying untidy data, pivoting with `pivot_longer()` and
+  `pivot_wider()`, separating and uniting columns
+- **Joining:** keys, `left_join()`, `semi_join()`, `anti_join()`
+
+**How this lab works:**
+
+- **Part 1 (instructor demo, ~20 min):** Follow along as the instructor works
+  through a short data import and join pipeline using the Framingham and
+  `nycflights13` data.
+- **Part 2 (on your own, ~90 min):** Six exercises of increasing difficulty.
+  Create a new `.qmd` file, work through the exercises, and render when done.
+
+The **Quick Reference Card** in Section 3 has the key functions.
+
+---
+
+# Part 1: Instructor Demo
+
+## Setup
+
+```{r}
+library(tidyverse)
+library(readxl)
+library(nycflights13)
+library(this.path)
+setwd(this.dir())
+```
+
+## Reading a CSV with Non-Standard Missing Values
+
+Real data files often encode missing values in non-standard ways --- `"N/A"`,
+`"."`, `-99`, or a blank cell. Always declare these when reading in:
+
+```{r}
+#| eval: false
+# tell read_csv() that both "N/A" and blank cells should be treated as NA
+students <- read_csv("data/students.csv", na = c("N/A", ""))
+students
+```
+
+After reading, clean column names with `janitor::clean_names()` and fix
+variable types with `mutate()` --- the same workflow you used on Day 2:
+
+```{r}
+#| eval: false
+library(janitor)
+students <- students |>
+  clean_names() |>
+  mutate(meal_plan = factor(meal_plan))
+```
+
+## What Tidy Looks Like
+
+These two tables hold the same data. Only one is tidy:
+
+```{r}
+table1  # tidy: one row per country-year, one column per variable
+table2  # untidy: cases and population are stacked into one column
+```
+
+In `table1`, computing a rate per 10,000 is one line:
+
+```{r}
+table1 |> mutate(rate = cases / population * 10000)
+```
+
+In `table2`, you cannot do this directly --- you would have to separate cases
+from population first, then rejoin them. That is the cost of untidy data.
+
+## Pivoting: Wide to Long
+
+```{r}
+# table4a has years as column names --- year is a variable, not a label
+table4a
+
+table4a |>
+  pivot_longer(
+    cols      = c(`1999`, `2000`),
+    names_to  = "year",
+    values_to = "cases"
+  )
+```
+
+## A Join: Adding Airline Names to Flights
+
+```{r}
+flights2 <- flights |>
+  select(year, time_hour, origin, dest, tailnum, carrier)
+
+# left_join keeps every row in flights2 and adds the name column from airlines
+flights2 |>
+  left_join(airlines, by = "carrier") |>
+  select(carrier, name, origin, dest)
+```
+
+## An Anti-Join: Finding Data Quality Problems
+
+```{r}
+# Which tail numbers in flights have no matching record in planes?
+flights2 |>
+  anti_join(planes, by = "tailnum") |>
+  distinct(tailnum) |>
+  nrow()
+```
+
+Over 700 flights have tail numbers that don't appear in `planes`. These would
+be silently dropped by an `inner_join()`. `anti_join()` makes the problem
+visible before it causes silent data loss.
+
+---
+
+# Part 2: Exercises
+
+## Instructions
+
+**Step 1.** Open a new Quarto document: File → New File → Quarto Document.
+Title it `"Day 3 Lab"`, select HTML, click **Create**.
+
+**Step 2.** Replace the template content with this YAML and setup chunk:
+
+````markdown
+---
+title: "Day 3 Lab: Importing, Tidying, and Joining"
+subtitle: "SC INBRE Biostatistics Summer Intensive 2026"
+date: today
+format:
+  html:
+    toc: true
+    theme: cosmo
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+```{{r}}
+library(tidyverse)
+library(readxl)
+library(nycflights13)
+library(this.path)
+this.dir <- this.dir()
+setwd(this.dir)
+```
+````
+
+**Step 3.** Work through Exercises 1--6 in order. For each one:
+
+- Add a new code chunk (`Ctrl+Alt+I` / `Cmd+Option+I`)
+- Write and run your code
+- Add 1--2 sentences below the chunk describing what you found
+
+**Step 4.** When finished, click **Render** (`Ctrl+Shift+K` / `Cmd+Shift+K`)
+and fix any errors before you are done.
+
+::: {.callout-tip}
+Check the **Quick Reference Card** in Section 3 before asking for help. The
+most common issues are: (1) forgetting backticks around numeric column names
+like `` `1999` ``, (2) `by` argument mismatches in joins, and (3) `na.rm = TRUE`
+missing from summary functions.
+:::
+
+::: {.callout-note}
+Exercises 1--4 cover the core material. Exercise 5 is harder and requires
+combining joins with `group_by()` / `summarize()`. Exercise 6 is a challenge
+--- don't worry if you don't reach it.
+:::
+
+---
+
+**Exercise 1 — Reading and Cleaning.**
+Read `framingham.csv` from the `data/` folder using `read_csv()`. The dataset
+uses blank cells for missing values, which `read_csv()` handles automatically.
+After reading in:
+
+a. Use `str()` to check column types. Which variables are stored as `<dbl>` but
+   should be factors?
+b. Convert at least four binary or categorical variables to factors with
+   meaningful labels using `mutate()` and `factor()` (you did this on Day 2 ---
+   copy that block if you still have it).
+c. Write the cleaned dataset to a new file called `framingham_clean.csv` using
+   `write_csv()`.
+
+```{r}
+# your code here
+```
+
+---
+
+**Exercise 2 — Identifying Untidy Data.**
+Look at `table2` and `table4a` (built into the tidyverse).
+
+a. In plain English (1--2 sentences each), describe what makes `table2` untidy
+   and what makes `table4a` untidy. What would a tidy version of each look like?
+
+b. Tidy `table4a` using `pivot_longer()` so it has three columns: `country`,
+   `year`, and `cases`. Note: the column names `1999` and `2000` are numbers,
+   not strings --- you need to wrap them in backticks (`` `1999` ``).
+
+c. Tidy `table4b` the same way, producing columns `country`, `year`, and
+   `population`.
+
+d. Join the two tidy tables together using `left_join()` to produce a single
+   tidy table with `country`, `year`, `cases`, and `population`. Add a `rate`
+   column (cases per 10,000 population).
+
+```{r}
+# your code here
+```
+
+---
+
+**Exercise 3 — Pivoting Real Data.**
+The `who` dataset (built into the tidyverse) is a World Health Organization
+tuberculosis dataset with diagnosis counts spread across many columns:
+
+```{r}
+who
+```
+
+a. How many columns currently hold what is really the `count` variable (i.e.,
+   how many columns need to be pivoted into rows)? Use `ncol(who)` and count
+   the non-variable columns to figure this out.
+
+b. Use `pivot_longer()` to gather all columns from `new_sp_m014` through
+   `newrel_f65` into two columns: `key` (the old column name) and `count`
+   (the value). Drop rows where `count` is `NA` using `values_drop_na = TRUE`.
+
+c. How many rows does the resulting dataset have? How does this compare to the
+   original?
+
+d. The `key` column mashes together diagnosis type, sex, and age group. Use
+   `mutate()` and `str_replace()` to fix the inconsistent `"newrel"` → `"new_rel"`
+   prefix, then use `separate()` twice to split `key` into `new`, `type`, and
+   `sexage`, and then `sexage` into `sex` and `age`. What does the final tidy
+   dataset look like?
+
+```{r}
+# your code here
+```
+
+---
+
+**Exercise 4 — Left Joins.**
+Using `flights` and the other `nycflights13` tables:
+
+a. Add the full airline name (from `airlines`) to `flights`. Then compute the
+   mean departure delay by airline name. Which airline has the worst average
+   departure delay?
+
+b. Add the plane's number of seats (from `planes`) to `flights` using
+   `left_join()` with `by = "tailnum"`. What proportion of flights are missing
+   seat information (i.e., had no matching record in `planes`)?
+
+c. Add the destination airport's full name and time zone (from `airports`) to
+   `flights`. Which time zone has the most flight destinations from NYC?
+
+```{r}
+# your code here
+```
+
+---
+
+**Exercise 5 — Joins and Grouped Summaries.**
+This exercise combines joining with the `group_by()` / `summarize()` workflow
+from Day 2.
+
+a. Join `flights` with `weather` (using `origin` and `time_hour` as the
+   compound key) to add temperature (`temp`) and visibility (`visib`) to each
+   flight.
+
+b. Compute the mean arrival delay by visibility level. Round visibility to the
+   nearest integer first using `mutate(visib = round(visib))`. Sort from worst
+   to best delay. Is there a relationship between visibility and delays?
+
+c. Repeat (b) but compute separately for each origin airport. Use
+   `group_by(origin, visib)`. Describe in 1--2 sentences what you find.
+
+```{r}
+# your code here
+```
+
+---
+
+**Exercise 6 (Challenge) — Building a Spatial Dataset.**
+
+a. Create a dataset called `flight_avg_delay` by:
+
+   - Grouping `flights` by destination (`dest`)
+   - Computing the mean arrival delay (`avg_delay`) for each destination,
+     ignoring NAs
+   - Joining in the latitude (`lat`), longitude (`lon`), and full airport name
+     (`name`) from `airports` using `left_join()` with `by = c("dest" = "faa")`
+   - Dropping destinations with no matching airport record using `filter()`
+     and `!is.na(lat)`
+
+b. How many destinations have no match in `airports`? Use `anti_join()` to
+   find them before building the dataset.
+
+c. Once you have `flight_avg_delay`, run this code to plot average arrival delay
+   on a US map:
+
+```{r}
+#| eval: false
+
+# This requires the maps package.
+install.packages("maps") 
+library(maps)
+
+flight_avg_delay |>
+  ggplot(aes(lon, lat, color = avg_delay)) +
+  borders("state") +
+  geom_point(size = 2) +
+  coord_quickmap() +
+  scale_color_gradient2(low = "blue", mid = "white", high = "red",
+                        midpoint = 0) +
+  labs(title = "Average Arrival Delay by Destination Airport",
+       color  = "Avg delay (min)")
+```
+
+Which regions of the country have the worst average arrival delays?
+
+```{r}
+# your code here
+```
+
+---
+
+# Quick Reference Card
+
+## Reading Data
+
+| Function | What it does |
+|---|---|
+| `read_csv("file.csv")` | Read CSV; returns a tibble |
+| `read_csv("file.csv", na = c("N/A", ""))` | Declare missing value codes |
+| `read_csv("file.csv", skip = n)` | Skip first `n` rows |
+| `read_excel("file.xlsx", sheet = "name")` | Read specific Excel sheet |
+| `write_csv(df, "output.csv")` | Write tibble to CSV |
+| `clean_names(df)` | Convert column names to snake_case (`janitor`) |
+
+## Tidy Data
+
+| Function | What it does |
+|---|---|
+| `pivot_longer(cols, names_to, values_to)` | Wide → long |
+| `pivot_wider(names_from, values_from)` | Long → wide |
+| `separate(col, into, sep)` | Split one column into multiple |
+| `unite(new_col, col1, col2, sep)` | Merge multiple columns into one |
+| `complete(var1, var2)` | Make implicit NAs explicit |
+| `fill(col)` | Carry last non-NA value forward |
+| `values_drop_na = TRUE` | Drop NA rows inside `pivot_longer()` |
+
+## Joins
+
+| Function | Keeps |
+|---|---|
+| `left_join(x, y, by)` | All rows of `x`; NAs where no match in `y` |
+| `inner_join(x, y, by)` | Only rows with matches in both |
+| `full_join(x, y, by)` | All rows from both; NAs where no match |
+| `semi_join(x, y, by)` | Rows of `x` that have a match in `y` |
+| `anti_join(x, y, by)` | Rows of `x` that have NO match in `y` |
+
+**Specifying keys:**
+
+```r
+# Same name in both tables
+left_join(x, y, by = "key")
+
+# Different names in each table
+left_join(x, y, by = c("x_col" = "y_col"))
+
+# Compound key (multiple columns)
+left_join(x, y, by = c("col1", "col2"))
+```
+
+## Useful Reminders
+
+- Numeric column names need backticks: `` `1999` ``, `` `2000` ``
+- Check for join problems with `anti_join()` **before** your main join
+- `na.rm = TRUE` is needed in `mean()`, `sd()`, `sum()` etc. whenever NAs are present
+- After `pivot_longer()`, always check the result with `str()` and `head()`

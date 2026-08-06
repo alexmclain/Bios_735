@@ -1,0 +1,75 @@
+---
+title: "Day 1: Practice"
+subtitle: "SC INBRE Biostatistics Summer Intensive 2026"
+date: today
+format:
+  html:
+    toc: true
+    toc-location: left
+    toc-depth: 3
+    number-sections: true
+    smooth-scroll: true
+    theme: cosmo
+    code-fold: false
+    highlight-style: github
+    embed-resources: true
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+## Quarto
+
+Quarto enables you to weave together content and executable code into a finished document. To learn more about Quarto see <https://quarto.org>.
+
+## Running Code
+
+When you click the **Render** button a document will be generated that includes both content and the output of embedded code. You can embed code like this:
+
+```{r}
+1 + 1
+```
+
+You can add options to executable code like this
+
+```{r}
+#| echo: false
+2 * 2
+```
+
+The `echo: false` option disables the printing of code (only output is displayed).
+
+## Question One
+
+```{r}
+temperatures <- c( 98.6, 99.1, 97.8, 100.4, 98.2)
+mean(temperatures)
+sd(temperatures)
+range(temperatures)
+```
+
+## Question Two
+
+```{r}
+#| echo: true
+my_study <- data.frame(
+  id = 1:6,
+  treatment = c("A", "B", "A", "B", "A", "B"),
+  treatment2 = rep(c("A","B"),3),
+  response = c(2.3, 5.2, 6.1, 7.8, 4.3, 9.1)
+)
+my_study
+summary(my_study)
+print(my_study)
+```
+
+## Question Three
+
+When you type in `zebra`, you get an error message that says `Error: object 'zebra' not found`.
+
+## Question Four
+
+``` markdown
+The mean temperature is `r mean(temperatures)`!
+```

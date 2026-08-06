@@ -1,0 +1,730 @@
+---
+title: "Day 2 (AM): R Programming Fundamentals"
+subtitle: "SC INBRE Biostatistics Summer Intensive 2026"
+date: today
+format:
+  html:
+    toc: true
+    toc-location: left
+    toc-depth: 3
+    number-sections: true
+    smooth-scroll: true
+    theme: cosmo
+    code-fold: false
+    highlight-style: github
+    embed-resources: true
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+```{r}
+#| echo: false
+library(tidyverse)
+```
+
+# Overview
+
+By the end of this session you will be able to:
+
+- Recognize the main object types in R and know when each arises
+- Understand the variable types you will encounter in biological datasets
+- Manipulate and transform data using core `dplyr` verbs
+- Understand what a function is and read a simple one
+
+---
+
+# Object Types in R: A Quick Tour
+
+R has several object types. We will cover them briefly here because you will see
+them mentioned in help files and error messages. In practice, **you will almost
+always be working with tibbles** (see below), so don't worry about memorizing
+these --- just know they exist.
+
+## Vectors
+
+A vector is the simplest object: a sequence of values all of the same type.
+Everything else in R is built on top of vectors.
+
+```{r}
+nums <- c(1.5, 2.3, 7.1, 4.8)
+chars <- c("control", "treatment", "control", "treatment")
+logicals <- c(TRUE, FALSE, TRUE, TRUE)
+```
+
+## Matrices
+
+A matrix is a 2D vector --- all values must be the same type. Useful for linear
+algebra, but rarely used to store biological data directly.
+
+```{r}
+m <- matrix(1:9, nrow = 3, ncol = 3)
+m
+```
+
+## Lists
+
+A list is a collection of objects that can be of different types and lengths ---
+think of it as a container that can hold anything. Model output in R (e.g., from
+`lm()`) is returned as a list.
+
+```{r}
+my_list <- list(
+  name   = "Patient A",
+  values = c(1.2, 3.4, 5.6),
+  flag   = TRUE
+)
+my_list
+my_list$name
+my_list$values
+```
+
+## Data Frames and Tibbles
+
+A data frame is a rectangular table where each column is a vector. A **tibble**
+is the tidyverse version of a data frame with some sensible defaults: it prints
+more neatly, never converts strings to factors automatically, and gives cleaner
+error messages.
+
+::: {.callout-important}
+**This is the object type you will use for virtually everything in this course.**
+When you read in a dataset with `readr` (e.g., `read_csv()`), you get a tibble.
+When you manipulate data with `dplyr`, you get a tibble back. You will rarely
+need to think about matrices or bare lists for your data. However, R functions will commonly give back results as lists. So, knowing how to work with them is important.
+:::
+
+```{r}
+# A small tibble created by hand
+patient_data <- tibble(
+  id        = 1:5,
+  treatment = c("A", "B", "A", "B", "A"),
+  response  = c(12.1, 8.4, 14.3, 9.1, 11.7)
+)
+patient_data
+```
+
+Notice what prints above the column values: `<int>`, `<chr>`, `<dbl>`. These are
+the **variable types**, which we cover next.
+
+---
+
+# Indexing in R
+
+Indexing means extracting specific elements from an object --- a single value, a
+column, a row, or a subset. Knowing how to do this in base R is important because
+you will encounter it constantly in help files, Stack Overflow answers, and other
+people's code, even if you end up preferring tidyverse syntax for most tasks.
+
+## Indexing Vectors with `[ ]`
+
+Use single square brackets to extract elements from a vector by position:
+
+```{r}
+x <- c(10, 20, 30, 40, 50)
+
+x[1]        # first element (R is 1-indexed, not 0-indexed)
+x[3]        # third element
+x[c(1, 3)]  # first and third elements
+x[2:4]      # elements 2 through 4
+x[-1]       # everything except the first element
+```
+
+You can also index by a logical vector of the same length. Elements where the
+condition is `TRUE` are kept:
+
+```{r}
+x[x > 25]           # elements greater than 25
+x[c(TRUE, FALSE, TRUE, FALSE, TRUE)]  # explicit logical index
+```
+
+Named vectors can be indexed by name:
+
+```{r}
+bp <- c(systolic = 120, diastolic = 80)
+bp["systolic"]
+bp[c("systolic", "diastolic")]
+```
+
+## Indexing Data Frames with `[ , ]`
+
+Data frames use two-dimensional indexing: `[rows, columns]`. Leaving one
+dimension blank means "all":
+
+```{r}
+patient_data <- data.frame(
+  id        = 1:5,
+  treatment = c("A", "B", "A", "B", "A"),
+  response  = c(12.1, 8.4, 14.3, 9.1, 11.7)
+)
+patient_data             # all data
+patient_data[1, ]        # first row, all columns
+patient_data[, 2]        # all rows, second column (returns a vector)
+patient_data[1, 2]       # first row, second column (single value)
+patient_data[1:3, ]      # rows 1 through 3
+patient_data[, c(1, 3)]  # columns 1 and 3
+```
+
+Columns can also be referenced by name inside `[ ]`:
+
+```{r}
+patient_data[, "response"]
+patient_data[patient_data$treatment == "A", ]  # rows where treatment is "A"
+```
+
+## The `$` Operator
+
+`$` is the most common way to extract a single column from a data frame or
+element from a list. It returns the column as a vector:
+
+```{r}
+patient_data$response        # the response column as a vector
+patient_data$treatment       # the treatment column as a vector
+mean(patient_data$response)  # pass directly to a function
+```
+
+::: {.callout-tip}
+In RStudio, typing `patient_data$` will trigger autocomplete showing all
+available column names. This is one of the most useful features of the IDE
+for data exploration.
+:::
+
+`$` works identically on lists:
+
+```{r}
+my_list <- list(name = "Patient A", values = c(1.2, 3.4, 5.6))
+my_list$name
+my_list$values[2]  # chain indexing: second element of the values vector
+```
+
+## Double Brackets `[[ ]]`
+
+Double brackets extract a single element by position or name, stripping the
+container. The difference from `$` is subtle but matters for lists and
+programmatic access:
+
+```{r}
+patient_data[["response"]]   # same result as patient_data$response
+my_list[["values"]]          # same as my_list$values
+
+# Useful when the column name is stored in a variable
+col_name <- "response"
+patient_data[[col_name]]     # $ does not work here; [[ ]] does
+```
+
+## Putting It Together: Subsetting a Data Frame
+
+A common task is extracting a subset of rows and columns based on a condition:
+
+```{r}
+# Patients in treatment A with response above 12
+patient_data[patient_data$treatment == "A" & patient_data$response > 12, ]
+```
+
+::: {.callout-note}
+This base R approach is verbose but important to recognize. In the next section
+we will use `dplyr::filter()` and `dplyr::select()` to do the same thing more
+readably. Both approaches are valid --- you will see both in the wild.
+:::
+
+## Quick Reference
+
+| Goal | Syntax |
+|------|--------|
+| Vector element by position | `x[2]` |
+| Vector elements by condition | `x[x > 5]` |
+| Data frame column as vector | `df$col` or `df[["col"]]` |
+| Data frame rows by condition | `df[df$col == "A", ]` |
+| Data frame single cell | `df[2, 3]` |
+| List element | `lst$name` or `lst[["name"]]` |
+
+---
+
+# Variable Types
+
+The type of a variable determines what operations you can do with it and how R
+and statistical functions will treat it. Getting variable types right is one of
+the most important --- and most commonly skipped --- steps in data preparation.
+
+We will use the `flights` dataset from the `nycflights13` package throughout.
+Install it once if needed: `install.packages("nycflights13")`.
+
+```{r}
+library(nycflights13)
+flights
+```
+
+The abbreviations under each column name tell you the type:
+
+| Abbreviation | Type | Example |
+|---|---|---|
+| `<int>` | Integer | `year`, `month`, `day` |
+| `<dbl>` | Double (numeric, decimal) | `dep_delay`, `air_time` |
+| `<chr>` | Character (string) | `carrier`, `origin` |
+| `<lgl>` | Logical (TRUE/FALSE) | e.g., `is_delayed` |
+| `<fct>` | Factor (categorical with levels) | e.g., severity grades |
+| `<dttm>` | Date-time | `time_hour` |
+
+## Numeric Variables (`<dbl>`, `<int>`)
+
+Numeric variables represent measured quantities. Arithmetic and summary functions
+apply directly.
+
+```{r}
+mean(flights$dep_delay, na.rm = TRUE)
+sd(flights$dep_delay, na.rm = TRUE)
+range(flights$air_time, na.rm = TRUE)
+```
+
+::: {.callout-note}
+`na.rm = TRUE` tells R to ignore missing values when computing the summary.
+Without it, a single `NA` in the vector will return `NA` for the whole
+calculation.
+:::
+
+## Character Variables (`<chr>`)
+
+Character variables (strings) hold text. They cannot be used in arithmetic but
+can be searched, split, and recoded.
+
+```{r}
+# How many unique carriers are there?
+unique(flights$carrier)
+
+# How many flights per carrier?
+table(flights$carrier)
+```
+
+Common string operations from `stringr` (all start with `str_`):
+
+```{r}
+x <- c("Control Group", "Treatment Group A", "Treatment Group B")
+
+str_to_lower(x)          # convert to lowercase
+str_to_upper(x)          # convert to uppercase
+str_length(x)            # number of characters
+str_detect(x, "Control") # does the string contain "Control"?
+str_replace(x, "Group", "Arm") # replace a pattern
+```
+
+`str_detect()` is especially useful for filtering:
+
+```{r}
+# Keep only carriers whose code starts with "U"
+table(str_detect(flights$carrier, "^U"))
+```
+
+## Logical Variables (`<lgl>`)
+
+Logicals are `TRUE` or `FALSE`. They arise naturally from comparisons and are
+useful for filtering and counting.
+
+```{r}
+# Create a logical variable: was the flight delayed on arrival?
+table(flights$arr_delay > 0)
+```
+
+`sum()` and `mean()` treat `TRUE` as 1 and `FALSE` as 0, so you can count and
+compute proportions easily:
+
+```{r}
+sum(flights$arr_delay > 0, na.rm = TRUE)
+mean(flights$arr_delay > 0, na.rm = TRUE)*100
+```
+
+## Factors (`<fct>`)
+
+Factors represent **categorical variables with a fixed set of levels**. They are
+essential in statistical modeling --- a factor in a regression model is handled
+as a categorical predictor (with a reference level), while a character variable
+or numeric code is not.
+
+```{r}
+# Create a factor
+severity <- factor(c("mild", "severe", "moderate", "mild", "severe"),
+                   levels = c("mild", "moderate", "severe"))
+severity
+levels(severity)
+table(severity)
+```
+
+::: {.callout-important}
+**When does this matter for you?** If you code a categorical variable as a number
+(e.g., 1 = mild, 2 = moderate, 3 = severe) and put it in a model without
+converting it to a factor, R will treat it as a continuous variable and fit a
+single slope. This is almost never what you want. Always check whether your
+grouping variables are stored as factors. **This is one of the most common errors when running models in R.**
+:::
+
+Use `factor()` to convert, and `fct_recode()` from the `forcats` package
+(part of the tidyverse) to rename levels:
+
+```{r}
+flights$origin_fct = factor(flights$origin)
+flights$origin_fct[1:5]
+```
+
+The first level is the reference level, to change use `relevel` (important for model interpretation):
+
+```{r}
+severity_reref <- relevel(severity, ref = "moderate")
+levels(severity_reref)
+```
+
+### Recoding and Collapsing Levels
+
+`fct_recode()` lets you rename levels; `fct_collapse()` merges them:
+
+```{r}
+severity_recoded <- fct_recode(severity,
+  "Grade 1" = "mild",
+  "Grade 2" = "moderate",
+  "Grade 3" = "severe"
+)
+levels(severity_recoded)
+```
+
+```{r}
+# Collapse moderate and severe into a single "high" level
+fct_collapse(severity,
+  "low"  = "mild",
+  "high" = c("moderate", "severe")
+)
+```
+
+---
+
+# Data Transformations with dplyr
+
+`dplyr` is the workhorse package for data manipulation. Its functions are called
+**verbs** because each one does one thing clearly. We will cover the ones you will
+use in almost every analysis.
+
+## The Pipe
+
+The pipe (`|>`) passes the output of one function as the first argument of the
+next. Read it as "then":
+
+```{r}
+#| eval: false
+flights |>           # start with flights, then
+  filter(...) |>     # keep certain rows, then
+  mutate(...) |>     # create new columns, then
+  summarize(...)     # collapse to a summary
+```
+
+You may also see `%>%` from the `magrittr` package --- it behaves identically
+for our purposes.
+
+## Filtering Rows: `filter()`
+
+Keep rows that satisfy a condition:
+
+```{r}
+# Flights that arrived more than 2 hours late
+flights |>
+  filter(arr_delay > 120)
+
+# Flights departing in January on United or American
+flights |>
+  filter(month == 1 & 
+           carrier %in% c("UA", "AA")
+         )
+```
+
+Common operators: `>`, `>=`, `<`, `<=`, `==`, `!=`, `%in%`, `is.na()`.
+
+::: {.callout-note}
+`=` assigns a value; `==` tests for equality. Using `=` inside `filter()` is
+one of the most common beginner errors in R.
+:::
+
+```{r}
+# Flights departing in January not on United or American
+flights |>
+  filter(month == 1 & 
+           !(carrier %in% c("UA", "AA")) 
+         )
+```
+
+## Selecting and Renaming Columns: `select()` and `rename()`
+
+```{r}
+# Keep only a few columns
+flights |>
+  select(year, month, day, carrier, dep_delay, arr_delay)
+
+# Select a range of columns
+flights |>
+  select(year:dep_time)
+
+# Rename a column (**new name = old name**)
+flights |>
+  rename(tail_number = tailnum) |>
+  select(tail_number, carrier)
+```
+
+Useful helpers inside `select()`: `starts_with()`, `ends_with()`,
+`contains()`, `where(is.numeric)`.
+
+```{r}
+# Keep only columns that contain "time"
+flights |>
+  select(contains("time"))
+```
+
+## Creating and Modifying Columns: `mutate()`
+
+`mutate()` adds new columns or overwrites existing ones:
+
+```{r}
+flights |>
+  mutate(
+    gain       = dep_delay - arr_delay,      # time made up in air
+    speed_mph  = distance / air_time * 60,   # speed in mph
+    late       = arr_delay > 0               # logical flag
+  ) |>
+  select(carrier, gain, speed_mph, late)
+```
+
+`mutate()` is also where you will do type conversions:
+
+```{r}
+flights |>
+  mutate(
+    month_fct = factor(month,
+                       ## The original month variable is 1:12.
+                       ## We tell R what the original levels are here.
+                       levels = 1:12, 
+                       labels = month.abb)  # month.abb = Jan, Feb, ... (already exists)
+  ) |>
+  count(month_fct)
+```
+
+## Recoding Variables: `if_else()` and `case_when()`
+
+Two functions come up constantly when creating new variables inside `mutate()`.
+
+`if_else()` handles a simple two-way recode:
+
+```{r}
+flights |>
+  mutate(long_flight = if_else(air_time > 300, "Long", "Short")) |>
+  count(long_flight)
+```
+
+`case_when()` handles three or more conditions. Each condition is written as
+`condition ~ value`, and `.default` catches anything not matched:
+
+```{r}
+flights |>
+  mutate(
+    delay_category = case_when(
+      dep_delay <= 0          ~ "On time or early",
+      dep_delay <= 30         ~ "Minor delay (<= 30 min)",
+      dep_delay <= 120        ~ "Moderate delay (31-120 min)",
+      .default                = "Major delay (> 120 min)"
+    )
+  ) |>
+  count(delay_category)
+```
+
+Conditions are evaluated top to bottom --- the first match wins. Make sure
+your most specific conditions come first.
+
+## Sorting: `arrange()`
+
+```{r}
+# Most delayed departures first
+flights |>
+  arrange(desc(dep_delay)) |>
+  select(carrier, origin, dest, dep_delay)
+```
+
+What days have the most flights?
+
+```{r}
+flights |>
+  mutate(
+    # Create a date variable
+    date = make_date(year = year, month = month, day = day) 
+  ) |>
+  # Calculate the number of flights per day.
+  count(date) |> 
+  # Display in decreasing order by the number of flights.
+  arrange(desc(n))
+```
+
+## Grouped Summaries: `group_by()` + `summarize()`
+
+This combination is how you compute group-level statistics:
+
+```{r}
+# Mean arrival delay by carrier
+flights |>
+  group_by(carrier) |>
+  summarize(
+    mean_delay = mean(arr_delay, na.rm = TRUE),
+    n_flights  = n()
+  ) |>
+  arrange(desc(mean_delay))
+```
+
+::: {.callout-note}
+Always include `na.rm = TRUE` inside summary functions like `mean()`, `sd()`,
+and `median()`. Missing values in the input will return `NA` for the whole
+summary otherwise.
+:::
+
+Multiple grouping variables:
+
+```{r}
+flights |>
+  group_by(origin, carrier) |>
+  summarize(
+    mean_delay = mean(arr_delay, na.rm = TRUE),
+    n          = n(),
+    .groups    = "drop"    # good practice: drop grouping after summarizing
+  )
+```
+
+## Putting It Together: A Pipeline
+
+Here is a realistic pipeline: compute the on-time arrival rate by carrier for
+flights longer than 500 miles, and keep only carriers with at least 1,000 such
+flights.
+
+```{r}
+flights |>
+  filter(distance > 500) |>
+  mutate(on_time = arr_delay <= 0) |>
+  group_by(carrier) |>
+  summarize(
+    n           = n(),
+    pct_on_time = mean(on_time, na.rm = TRUE) * 100
+  ) |>
+  filter(n >= 1000) |>
+  arrange(desc(pct_on_time))
+```
+
+---
+
+# Introduction to Functions
+
+## What Is a Function?
+
+You have been using functions since Day 1: `mean()`, `filter()`, `mutate()`.
+A function is a reusable block of code that takes **inputs** (arguments) and
+returns an **output**.
+
+Writing your own functions becomes valuable once you find yourself copying and
+pasting the same block of code more than twice. Instead of repeating code ---
+and risking subtle errors each time --- you write it once, name it, and call it.
+
+::: {.callout-note}
+**You will not be writing many functions in this workshop.** The goal here is
+to understand the concept so that you can read functions when you encounter them
+and recognize when your own code might benefit from one eventually.
+:::
+
+## Function Anatomy
+
+Every function has three parts:
+
+```{r}
+#| eval: false
+my_function <- function(argument1, argument2) {
+  # body: code that uses the arguments
+  result <- argument1 + argument2
+  result   # the last evaluated expression is returned
+}
+```
+
+A simple example --- a function that converts Fahrenheit to Celsius:
+
+```{r}
+f_to_c <- function(fahrenheit) {
+  (fahrenheit - 32) * 5 / 9
+}
+
+f_to_c(98.6)   # normal body temperature
+f_to_c(212)    # boiling point of water
+f_to_c(c(32, 72, 98.6, 104))  # works on a vector too
+```
+
+## Default Arguments
+
+Functions can have default values for arguments. The caller only needs to supply
+a value if they want to override the default:
+
+```{r}
+round_to <- function(x, digits = 2) {
+  round(x, digits)
+}
+
+round_to(3.14159)       # uses the default: 2 digits
+round_to(3.14159, 4)    # override to 4 digits
+```
+
+## A Practical Example: A Custom Summary
+
+Imagine you are computing the same set of summaries repeatedly on different
+variables. Rather than typing it out each time, you can wrap it in a function:
+
+```{r}
+quick_summary <- function(x) {
+  tibble(
+    n       = sum(!is.na(x)),
+    n_miss  = sum(is.na(x)),
+    mean    = mean(x, na.rm = TRUE),
+    sd      = sd(x, na.rm = TRUE),
+    min     = min(x, na.rm = TRUE),
+    max     = max(x, na.rm = TRUE)
+  )
+}
+
+quick_summary(flights$dep_delay)
+quick_summary(flights$air_time)
+```
+
+The same code, applied to any numeric vector, with one function call. This is
+the core benefit: write once, use many times, update in one place.
+
+## When to Write a Function
+
+A useful rule of thumb: if you have copied and pasted a block of code three
+times, it is time to write a function. The benefits are:
+
+1. **Readability** --- a well-named function makes code self-documenting
+2. **Maintainability** --- one change propagates everywhere
+3. **Fewer errors** --- no risk of updating a value in one copy but not another
+
+For now, focus on reading and understanding functions when you encounter them.
+As you get more comfortable with R, writing your own will start to feel natural.
+
+---
+
+# Exercises
+
+1. Using the `flights` dataset, create a new column called `dep_hour` that
+   extracts the hour of departure from `dep_time` (hint: integer division ---
+   `dep_time %/% 100` gives the hour). Then compute the mean departure delay
+   by hour of day. Which hour has the worst average delays?
+
+2. The `carrier` column uses two-letter codes. Use `filter()` and `%in%` to
+   keep only Delta (`"DL"`), United (`"UA"`), and American (`"AA"`). Then
+   compute the mean and standard deviation of arrival delay for each.
+
+3. Create a factor version of `month` with abbreviated month names as labels
+   (use `month.abb` as the `labels` argument to `factor()`). Count flights
+   by month and confirm the levels print in calendar order.
+
+4. Write a function called `pct_missing` that takes a vector `x` and returns
+   the percentage of values that are `NA`. Test it on `flights$dep_delay` and
+   `flights$arr_delay`.
+
+5. Build a single pipeline on `flights` that: (a) keeps only flights in the
+   summer months (June, July, August), (b) creates a logical column indicating
+   whether the flight was more than 30 minutes late on arrival, (c) computes
+   the percentage of such flights by origin airport, and (d) sorts the result
+   from worst to best.

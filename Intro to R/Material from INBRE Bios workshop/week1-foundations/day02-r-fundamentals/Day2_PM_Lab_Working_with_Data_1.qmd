@@ -1,0 +1,409 @@
+---
+title: "Day 2 (PM) Lab: Working with Data in R"
+subtitle: "SC INBRE Biostatistics Summer Intensive 2026"
+date: today
+format:
+  html:
+    toc: true
+    toc-location: left
+    toc-depth: 3
+    number-sections: true
+    smooth-scroll: true
+    theme: cosmo
+    code-fold: false
+    highlight-style: github
+    embed-resources: true
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+# Overview
+
+This lab draws on everything covered so far:
+
+- **Day 1:** R basics, object types, indexing with `$` and `[ ]`, mathematical
+  functions, reading data, inspecting with `str()` / `summary()` / `head()`
+- **Day 2 AM:** Variable types, factors, strings, `dplyr` verbs (`filter()`,
+  `mutate()`, `select()`, `arrange()`, `group_by()`, `summarize()`), and pipes
+
+The dataset is the **Framingham Heart Study**, a landmark longitudinal study of
+cardiovascular disease risk factors. The file `framingham.csv` is in the `data/`
+folder. It contains 4,240 participants and 16 variables.
+
+**How this lab works:**
+
+- **Part 1 (instructor demo, ~25 min):** Follow along as the instructor works
+  through the setup, data inspection, and variable type correction. Run the
+  code on your own machine as you go.
+- **Part 2 (on your own, ~90 min):** Complete the exercises independently. The
+  quick reference card at the bottom of this document has the key functions you
+  need. The instructor is in the room for questions.
+
+---
+
+# Part 1: Instructor Demo
+
+## Setup
+
+```{r}
+#| echo: false
+library(tidyverse)
+library(this.path)
+
+this.dir <- this.dir()
+setwd(this.dir)
+
+
+
+framingham <- read_csv('../../data/framingham.csv')
+```
+
+```{r}
+#| eval: false
+library(tidyverse)
+library(rstudioapi) ## you may need to install
+this.dir <- dirname(rstudioapi::getSourceEditorContext()$path)
+setwd(this.dir)
+
+# The following does the same and sometimes works better with .qmd
+# library(this.path) 
+# this.dir <- this.dir()
+# setwd(this.dir)
+
+framingham <- read_csv("../../data/framingham.csv")
+```
+
+::: {.callout-note}
+We use `read_csv()` (tidyverse) rather than base R's `read.csv()`. It returns
+a tibble, prints more cleanly, and never silently converts strings to factors.
+:::
+
+## Getting to Know the Data
+
+```{r}
+dim(framingham)     # rows and columns
+names(framingham)   # variable names
+```
+
+```{r}
+head(framingham)    # first 6 rows
+```
+
+```{r}
+str(framingham)     # structure: type of every variable + example values
+```
+
+```{r}
+summary(framingham) # five-number summary for numeric; NA counts visible here
+```
+
+```{r}
+#| eval: false
+View(framingham)    # open full spreadsheet in RStudio viewer
+```
+
+**Look for:** Which variables have `NA` counts? Which numeric variables are
+clearly categorical (e.g., coded 0/1 or 1--4)?
+
+### Missing data
+
+```{r}
+colSums(is.na(framingham))                                  # count per column
+round(colSums(is.na(framingham)) / nrow(framingham) * 100, 1) # percent missing
+```
+
+## Fixing Variable Types
+
+Several variables are stored as numbers but represent categories. Left as-is,
+a regression model will treat them as continuous --- almost always wrong.
+
+| Variable | Coding |
+|---|---|
+| `male` | 0 = Female, 1 = Male |
+| `currentSmoker` | 0 = Non-smoker, 1 = Smoker |
+| `BPMeds` | 0 = No, 1 = Yes |
+| `prevalentStroke` | 0 = No, 1 = Yes |
+| `prevalentHyp` | 0 = No, 1 = Yes |
+| `diabetes` | 0 = No, 1 = Yes |
+| `TenYearCHD` | 0 = No event, 1 = CHD within 10 years |
+| `education` | 1 = Some HS, 2 = HS Diploma, 3 = Some College, 4 = College Degree |
+
+```{r}
+framingham <- framingham |>
+  mutate(
+    male            = factor(male,            levels = c(0, 1),
+                                              labels = c("Female", "Male")),
+    currentSmoker   = factor(currentSmoker,   levels = c(0, 1),
+                                              labels = c("Non-smoker", "Smoker")),
+    BPMeds          = factor(BPMeds,          levels = c(0, 1),
+                                              labels = c("No", "Yes")),
+    prevalentStroke = factor(prevalentStroke, levels = c(0, 1),
+                                              labels = c("No", "Yes")),
+    prevalentHyp    = factor(prevalentHyp,    levels = c(0, 1),
+                                              labels = c("No", "Yes")),
+    diabetes        = factor(diabetes,        levels = c(0, 1),
+                                              labels = c("No", "Yes")),
+    TenYearCHD      = factor(TenYearCHD,      levels = c(0, 1),
+                                              labels = c("No", "Yes")),
+    education       = factor(education,       levels = 1:4,
+                                              labels = c("Some HS", "HS Diploma",
+                                                         "Some College",
+                                                         "College Degree"))
+  )
+```
+
+Run `str()` again to confirm the columns now show as `<fct>`, and `summary()`
+to see that categorical variables now show counts per level:
+
+```{r}
+str(framingham)
+summary(framingham)
+```
+
+## One Worked Example
+
+Here is a complete pipeline combining what we have done. Read each step before
+running:
+
+```{r}
+# Among participants NOT on BP medication,
+# compute mean systolic BP and CHD rate by hypertension status and sex
+framingham |>
+  filter(BPMeds == "No") |>
+  group_by(prevalentHyp, male) |>
+  summarize(
+    n          = n(),
+    mean_sysBP = mean(sysBP, na.rm = TRUE),
+    sd_sysBP   = sd(sysBP, na.rm = TRUE),
+    chd_pct    = mean(TenYearCHD == "Yes", na.rm = TRUE) * 100,
+    .groups    = "drop"
+  ) |>
+  arrange(desc(chd_pct))
+```
+
+::: {.callout-tip}
+This is the template for most of the exercises below: `filter()` to narrow the
+data, `mutate()` to create new variables, `group_by()` + `summarize()` to
+compute group statistics, then `arrange()` to sort the result.
+:::
+
+---
+
+# Part 2: Exercises
+
+## Instructions
+
+The demo is over --- this part is yours. Here is how to get started:
+
+**Step 1.** Open a new Quarto document: File → New File → Quarto Document.
+Give it a title like `"Day 2 Lab"` and select HTML. Click **Create**.
+
+**Step 2.** Delete the template content that Quarto pre-fills and replace it
+with a YAML header and setup chunk matching the one from Part 1:
+
+````markdown
+---
+title: "Day 2 Lab: Working with Data"
+subtitle: "SC INBRE Biostatistics Summer Intensive 2026"
+date: today
+format:
+  html:
+    toc: true
+    theme: cosmo
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+```{{r}}
+library(tidyverse)
+library(this.path) 
+this.dir <- this.dir()
+setwd(this.dir)
+
+framingham <- read_csv("../../data/framingham.csv")
+```
+````
+
+**Step 3.** Re-run the variable type correction block from Part 1 in your new
+document. All six exercises depend on the factor conversions being in place ---
+if you skip this, your code will not behave as expected.
+
+**Step 4.** Work through Exercises 1--6 in order. For each one:
+
+- Add a new code chunk (`Ctrl+Alt+I` / `Cmd+Option+I`)
+- Write and run your code
+- Add a sentence or two below the chunk describing what you found in plain
+  language --- not just what the numbers are, but what they mean
+
+**Step 5.** When you have finished all exercises, click **Render**
+(`Ctrl+Shift+K` / `Cmd+Shift+K`) and confirm the document compiles to HTML
+without errors. Fix any errors before moving on.
+
+::: {.callout-tip}
+**Before asking for help**, check two things: (1) the **Quick Reference Card**
+in the next section of this document, and (2) whether you have `na.rm = TRUE` where
+needed --- this is the most common reason summaries return `NA` unexpectedly.
+:::
+
+::: {.callout-note}
+It is fine if you do not finish all six exercises during the session. Exercises
+1--5 cover the core material. Exercise 6 is a challenge problem for those who
+finish early. Prioritize understanding over speed --- a working solution you can
+explain is worth more than a finished document you cannot.
+:::
+
+---
+
+**Exercise 1.** Using `filter()` and `summarize()`, compute the mean, standard
+deviation, and median of total cholesterol (`totChol`) separately for diabetic
+and non-diabetic participants. Do diabetic participants tend to have higher
+cholesterol?
+
+```{r}
+# your code here
+```
+
+---
+
+**Exercise 2.** Create two new variables using `mutate()`:
+
+- `pulse_pressure`: systolic BP minus diastolic BP (`sysBP - diaBP`)
+- `bmi_category`: a factor with four levels using `case_when()`:
+  `"Underweight"` (BMI < 18.5), `"Normal"` (18.5--24.9),
+  `"Overweight"` (25--29.9), `"Obese"` (≥ 30)
+
+After creating these, compute the mean pulse pressure by BMI category.
+
+```{r}
+# your code here
+```
+
+---
+
+**Exercise 3.** Using **base R indexing** (`$` and `[ ]`), extract the subset
+of participants who are female, non-smokers, and over age 55. How many are
+there? What is their mean glucose level? Now repeat using `filter()` and
+confirm you get the same row count.
+
+```{r}
+# base R version
+
+# dplyr version
+```
+
+---
+
+**Exercise 4.** Among current smokers only, use `summarize()` to compute the
+mean, standard deviation, and range of `cigsPerDay`. Then use `mutate()` to
+add a logical variable `heavy_smoker` (TRUE if `cigsPerDay > 20`) to the full
+dataset and count how many heavy smokers there are.
+
+```{r}
+# your code here
+```
+
+---
+
+**Exercise 5.** Compute the 10-year CHD rate (percentage with
+`TenYearCHD == "Yes"`) by education level. Sort from highest to lowest rate.
+Does education appear to be associated with CHD risk?
+
+```{r}
+# your code here
+```
+
+---
+
+**Exercise 6 (Challenge).** Build a single pipeline that:
+
+(a) Keeps only participants aged 40--65
+(b) Creates a new variable `hyp_smoker`: `"Yes"` if the participant has
+    prevalent hypertension **and** is a current smoker, `"No"` otherwise
+    (use `if_else()` or `case_when()`)
+(c) Computes, for each combination of `hyp_smoker` and `male`: number of
+    participants, mean systolic BP, and 10-year CHD rate
+(d) Keeps only groups with at least 50 participants
+(e) Sorts by CHD rate descending
+
+What combination of characteristics is associated with the highest CHD risk
+in this age group?
+
+```{r}
+# your code here
+```
+
+---
+
+# Quick Reference Card
+
+Use this while working on the exercises. For more detail, check the Day 1 and
+Day 2 AM documents.
+
+## Reading and Inspecting Data
+
+| Function | What it does |
+|---|---|
+| `read_csv("file.csv")` | Read a CSV file; returns a tibble |
+| `dim(df)` | Number of rows and columns |
+| `names(df)` | Column names |
+| `str(df)` | Structure: type and example values of every column |
+| `summary(df)` | Summary statistics; shows NA counts |
+| `head(df, n)` | First `n` rows (default 6) |
+| `View(df)` | Open spreadsheet viewer in RStudio |
+| `colSums(is.na(df))` | Count of missing values per column |
+
+## Indexing (Base R)
+
+| Syntax | What it does |
+|---|---|
+| `df$col` | Extract column as a vector |
+| `df[i, ]` | Row `i`, all columns |
+| `df[, j]` | All rows, column `j` |
+| `df[condition, ]` | Rows where condition is TRUE |
+| `df[["col"]]` | Extract column by name (useful when name is in a variable) |
+
+## Variable Types
+
+| Function | What it does |
+|---|---|
+| `factor(x, levels, labels)` | Convert to factor with named levels |
+| `levels(f)` | Show the levels of a factor |
+| `class(x)` | Check the type of an object |
+| `is.na(x)` | Logical vector: TRUE where values are missing |
+
+## dplyr Verbs
+
+| Function | What it does |
+|---|---|
+| `filter(df, condition)` | Keep rows where condition is TRUE |
+| `select(df, col1, col2)` | Keep specified columns |
+| `mutate(df, new = expr)` | Add or modify columns |
+| `arrange(df, col)` | Sort rows; `desc(col)` for descending |
+| `group_by(df, col)` | Group rows for subsequent summaries |
+| `summarize(df, stat = expr)` | Collapse groups to summary rows |
+| `n()` | Count rows (use inside `summarize()`) |
+
+## Useful Expressions Inside mutate / summarize
+
+| Expression | What it does |
+|---|---|
+| `mean(x, na.rm = TRUE)` | Mean, ignoring NAs |
+| `sd(x, na.rm = TRUE)` | Standard deviation |
+| `median(x, na.rm = TRUE)` | Median |
+| `sum(x, na.rm = TRUE)` | Sum |
+| `min(x, na.rm = TRUE)` / `max(x, na.rm = TRUE)` | Min / max |
+| `sum(is.na(x))` | Count missing values |
+| `mean(var == "Yes")` | Proportion where condition is TRUE |
+| `case_when(cond1 ~ val1, cond2 ~ val2, TRUE ~ val3)` | Recode with multiple conditions |
+| `if_else(condition, true_val, false_val)` | Simple two-way recode |
+
+## Pipes
+
+```r
+df |> filter(...) |> mutate(...) |> summarize(...)
+# read as: "take df, then filter, then mutate, then summarize"
+```

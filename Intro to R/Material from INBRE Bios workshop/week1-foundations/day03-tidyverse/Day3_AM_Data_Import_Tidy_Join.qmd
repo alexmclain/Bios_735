@@ -1,0 +1,668 @@
+---
+title: "Day 3 (AM): Importing, Tidying, and Joining Data"
+subtitle: "SC INBRE Biostatistics Summer Intensive 2026"
+date: today
+format:
+  html:
+    toc: true
+    toc-location: left
+    toc-depth: 3
+    number-sections: true
+    smooth-scroll: true
+    theme: cosmo
+    code-fold: false
+    highlight-style: github
+    embed-resources: true
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+```{r}
+#| echo: false
+library(tidyverse)
+library(nycflights13)
+```
+
+# Overview
+
+By the end of this session you will be able to:
+
+- Read CSV, Excel, and other file formats into R
+- Understand what "tidy data" means and why it matters
+- Pivot data between wide and long formats using `pivot_longer()` and `pivot_wider()`
+- Separate and unite columns
+- Understand explicit vs. implicit missing values
+- Join two data frames together using mutating and filtering joins
+
+---
+
+# Importing Data
+
+## Key Terms
+
+Before reading data into R, three concepts matter:
+
+- **Header:** The first row of a file is usually variable names. R needs to know
+  whether to treat it as names or as data values.
+- **Delimiter:** The character that separates entries in each row (comma in `.csv`,
+  tab in `.tsv`, etc.). R uses this to know where one value ends and the next begins.
+- **Missing value:** How your file represents missingness. R recognizes `NA`, but
+  files often use `.`, `""`, `N/A`, `999`, or other codes that need to be declared.
+
+## Reading CSV Files with `readr`
+
+```{r}
+#| eval: false
+library(tidyverse)  # loads readr
+library(readxl)     # for Excel files
+library(haven)      # for SAS, Stata, SPSS files
+```
+
+`readr` is the tidyverse package for reading rectangular data. The most common
+functions:
+
+| Function | Reads |
+|---|---|
+| `read_csv()` | Comma-separated (`.csv`) |
+| `read_csv2()` | Semicolon-separated (common in Europe) |
+| `read_tsv()` | Tab-separated |
+| `read_delim()` | Any delimiter you specify |
+
+All have the same interface --- once you know `read_csv()` the rest are trivial.
+
+## Working Directories and File Paths
+
+R looks for files relative to the **working directory**. Check yours with `getwd()`:
+
+```{r}
+getwd()
+```
+
+Rather than hard-coding a full file path (which breaks on other people's machines),
+use `rstudioapi` or `this.path` to set the working directory to wherever the script lives. Note, `rstudioapi` only works inside of RStudio and can give error messages when used with .qmd files (and in other situations). `this.path` is usually safer.
+
+```{r}
+#| eval: false
+library(rstudioapi)
+this.dir <- dirname(rstudioapi::getSourceEditorContext()$path)
+setwd(this.dir)
+
+library(this.path) 
+this.dir <- this.dir()
+setwd(this.dir)
+```
+
+Then reference files with short relative paths: `"data/myfile.csv"` rather than
+`"/Users/yourname/Documents/.../myfile.csv"`. 
+
+You can use `"../data/framingham.csv"` to tell R to go back one folder, find the data folder, and then look for framingham.csv. We used this in the previous lab with:
+
+```{r}
+#| eval: false
+framingham <- read_csv("../../data/framingham.csv")
+```
+
+which said go back two folders, find the data folder, and then look for framingham.csv.
+
+::: {.callout-tip}
+**Windows users:** File paths use `\` in Windows Explorer, but R requires `/` or
+`\\`. Copy a path from Explorer and replace each `\` with `/` before using it in R.
+:::
+
+## Reading a CSV
+
+```{r}
+#| eval: false
+students <- read_csv("data/students.csv")
+```
+
+When you run `read_csv()` it prints a message showing the number of rows and
+columns, the delimiter used, and how each column was parsed. This is useful for
+catching problems early.
+
+### Common Arguments
+
+**Skipping rows** --- useful when files have metadata at the top:
+
+```{r}
+#| message: false
+read_csv("The first line of metadata
+  The second line of metadata
+  x,y,z
+  1,2,3", skip = 2)
+```
+
+**No column names** --- tell R to generate them:
+
+```{r}
+#| message: false
+read_csv("1,2,3
+         4,5,6", col_names = FALSE)
+```
+
+**Supply your own column names:**
+
+```{r}
+#| message: false
+read_csv("1,2,3
+         4,5,6", col_names = c("id", "weight", "height"))
+```
+
+**Declare missing value codes** --- files often use `.` or `N/A` instead of `NA`:
+
+```{r}
+#| message: false
+read_csv("a,b,c
+         1,2,.", na = ".")
+```
+
+### Post-Import Cleaning
+
+After reading data in, two immediate tasks often arise:
+
+**1. Fix column names with spaces.** Column names with spaces require backtick
+quoting (`\`Full Name\``) which is error-prone. Use `janitor::clean_names()` to
+convert everything to snake_case automatically:
+
+```{r}
+library(janitor)
+x <- data.frame(caseID = 1, DOB = 2, Other = 3)
+x |> 
+  clean_names()
+
+# if you prefer camelCase variable names:
+x %>%
+  clean_names(., "lower_camel")
+```
+
+Or rename specific columns with `rename()`:
+
+```{r}
+x |> rename(case_id = `caseID`, dob = DOB, other = Other)
+```
+
+**2. Fix variable types.** `read_csv()` guesses column types from the data. Always
+check with `str()` and correct anything that was misread (e.g., a numeric column
+read as character because of a stray word like `"five"`).
+
+## Reading Excel Files
+
+Use `readxl::read_excel()`. You can specify which sheet to read:
+
+```{r}
+#| eval: false
+library(readxl)
+data_xl <- read_excel("data/myfile.xlsx", sheet = "data")
+dict_xl <- read_excel("data/myfile.xlsx", sheet = "dictionary")
+```
+
+The same arguments apply: `col_names`, `na`, `skip`.
+
+## Writing Data
+
+```{r}
+#| eval: false
+write_csv(students, "data/students_clean.csv")
+```
+
+::: {.callout-note}
+**Important:** When you write a tibble to CSV and read it back, factor levels and
+other type information are lost --- the file only stores plain text. If you need to
+preserve types across sessions, use `saveRDS()` / `readRDS()` to save as an R
+binary file instead.
+:::
+
+## Other Formats
+
+The `haven` package reads SAS (`.sas7bdat`), Stata (`.dta`), and SPSS (`.sav`)
+files with the same interface:
+
+```{r}
+#| eval: false
+library(haven)
+spss_data <- read_sav("data/myfile.sav") #SPSS data
+sas_data  <- read_sas("data/myfile.sas7bdat") #SAS data
+stata_data <- read_dta("data/myfile.dta") #Stata data
+```
+
+SPSS and Stata files often carry variable labels and value labels that `haven`
+preserves as attributes --- useful when you are handed someone else's data and
+need to understand the coding.
+
+::: {.callout-tip}
+You can read in SAS data, you can even write SAS data (using `write_sas`), but SAS data exported from R will not properly be read into SAS. Exported SPSS (`write_sav`) and Stata (`write_dta`) files can be read into their respected software programs.  
+:::
+
+
+SPSS data has particularly nice features:
+
+```{r}
+library(haven)
+x2 <- labelled_spss(
+  1:10,
+  c(Good = 1, Okay = 4, Bad = 8),
+  na_range = c(9, Inf),
+  label = "Quality rating"
+)
+x2
+is.na(x2)
+```
+
+SPSS data (with labels) can be read into SPSS or to Stata. To read into SAS you have to export to Stata, export from Stata, and then import into SAS.
+
+---
+
+# Tidy Data
+
+## What Does "Tidy" Mean?
+
+The same underlying data can be represented in many different ways. Consider these
+four representations of the same TB case data:
+
+```{r}
+table1  # tidy
+table2  # observation spread across two rows
+table3  # two variables crammed into one column
+table4a # cases only, years as columns
+table4b # population only, years as columns
+```
+
+Only `table1` is **tidy**. Tidy data follows three rules:
+
+1. Each variable is a column; each column is a variable
+2. Each observation is a row; each row is an observation
+3. Each value is a cell; each cell is a single value
+
+<!-- FIGURE: Diagram showing the three tidy data rules visually
+     (variables = columns, observations = rows, values = cells) -->
+
+Why tidy? Because every function in the tidyverse --- `ggplot2`, `dplyr`,
+`tidyr`, modeling functions --- expects tidy data. When your data is tidy, tools
+work naturally. When it is not, you spend your time fighting the data instead of
+analyzing it.
+
+Here is how naturally `table1` works once it is tidy:
+
+```{r}
+# Compute rate per 10,000
+table1 |>
+  mutate(rate = cases / population * 10000)
+
+# Cases per year
+table1 |>
+  count(year, wt = cases)
+```
+
+## Pivoting: Wide to Long with `pivot_longer()`
+
+Real data is often **wide**: observations spread across many columns, with column
+names encoding a variable rather than labeling it. The `billboard` dataset is a
+classic example --- 76 columns (`wk1` through `wk76`) where each column is
+really a value of the variable `week`:
+
+```{r}
+billboard
+```
+
+`pivot_longer()` collapses these columns into rows. Three key arguments:
+
+- `cols`: which columns to pivot (uses `select()` syntax)
+- `names_to`: what to call the new column that holds the old column names
+- `values_to`: what to call the new column that holds the values
+
+```{r}
+billboard |>
+  pivot_longer(
+    cols        = starts_with("wk"),
+    names_to    = "week",
+    values_to   = "rank",
+    values_drop_na = TRUE   # drop rows where the song wasn't charting
+  )
+```
+
+::: {.callout-note}
+`values_drop_na = TRUE` removes rows that only exist because of the wide
+structure --- songs that weren't charting in a given week don't have a meaningful
+`NA`, they simply weren't ranked.
+:::
+
+## Pivoting: Long to Wide with `pivot_wider()`
+
+`pivot_wider()` is the inverse --- it spreads rows into columns. Use it when an
+observation is scattered across multiple rows, as in `table2`:
+
+```{r}
+table2
+```
+
+Each country-year observation is split across two rows (one for `cases`, one for
+`population`). Fix it with:
+
+```{r}
+table2 |>
+  pivot_wider(names_from = type, values_from = count)
+```
+
+`pivot_wider()` is also useful for creating **display tables** --- not tidy, but
+human-readable:
+
+```{r}
+diamonds |>
+  count(clarity, color) |>
+  pivot_wider(names_from = color, values_from = n)
+```
+
+## Separating and Uniting Columns
+
+### Separating Columns
+
+`separate_wider_delim()` splits a column on a delimiter character.
+
+```{r}
+table3  # rate column contains "cases/population"
+
+table3 |>
+  separate_wider_delim(rate, delim = "/", names = c("cases", "population"))
+```
+
+The resulting columns are character by default. Pipe into `mutate()` to
+convert types after splitting:
+
+```{r}
+table3 |>
+  separate_wider_delim(rate, delim = "/", names = c("cases", "population")) |>
+  mutate(cases = as.integer(cases), population = as.integer(population))
+```
+
+`separate_wider_position()` splits at a fixed character position. Supply a
+named integer vector where the name becomes the column name and the integer is
+the field width. Unnamed entries are dropped silently:
+
+```{r}
+# Split the 4-digit year into century (first 2 chars) and year (last 2 chars)
+table3 |>
+  separate_wider_position(year, widths = c(century = 2, year = 2))
+```
+
+Combine both to split `rate` by delimiter and `year` by position in one
+pipeline:
+
+```{r}
+table3 |>
+  separate_wider_delim(rate, delim = "/", names = c("cases", "population")) |>
+  mutate(cases = as.integer(cases), population = as.integer(population)) |>
+  separate_wider_position(year, widths = c(century = 2, year = 2))
+```
+
+
+### Uniting Columns
+
+`unite()` is the inverse --- it combines multiple columns into one:
+
+```{r}
+# Rebuild the year column from century + year
+table3 |>
+  separate(rate, into = c("cases", "population"), convert = TRUE) |>
+  separate(year, into = c("century", "year"), sep = 2) |>
+  unite(full_year, century, year, sep = "")
+```
+
+## Missing Values: Explicit vs. Implicit
+
+A value can be missing in two distinct ways:
+
+- **Explicit:** the cell exists and contains `NA`
+- **Implicit:** the row simply does not exist in the data
+
+```{r}
+stocks <- tibble(
+  year   = c(2015, 2015, 2015, 2015, 2016, 2016, 2016),
+  qtr    = c(   1,    2,    3,    4,    2,    3,    4),
+  return = c(1.88, 0.59, 0.35,   NA, 0.92, 0.17, 2.66)
+)
+stocks
+```
+
+The return for Q4 2015 is explicitly missing (`NA`). The return for Q1 2016 is
+implicitly missing --- the row does not exist at all.
+
+Pivoting can make implicit missings explicit:
+
+```{r}
+stocks |>
+  pivot_wider(names_from = year, values_from = return)
+```
+
+Use `complete()` to make implicit missing values explicit while keeping long
+format:
+
+```{r}
+stocks |>
+  complete(year, qtr)
+```
+
+Use `fill()` when missing values mean "same as the previous row" (last
+observation carried forward):
+
+```{r}
+treatment <- tribble(
+  ~person,            ~treatment, ~response,
+  "Derrick Whitmore", 1,          7,
+  NA,                 2,          10,
+  NA,                 3,          9,
+  "Katherine Burke",  1,          4
+)
+
+treatment |> fill(person)
+```
+
+---
+
+# Joining Data
+
+## Why Join?
+
+It is rare that all the information you need lives in a single data frame.
+Relational data --- data spread across multiple linked tables --- is the norm in
+practice. Joins let you combine them.
+
+We will use the `nycflights13` package, which has five related tables:
+
+```{r}
+library(nycflights13)
+```
+
+- `flights`: every flight departing NYC in 2013
+- `airlines`: carrier codes and full names
+- `airports`: airport codes and metadata
+- `planes`: plane metadata by tail number
+- `weather`: hourly weather at each NYC airport
+
+<!-- FIGURE: Relationship diagram showing how the five nycflights13 tables
+     connect to each other via shared key variables -->
+
+## Keys
+
+A **primary key** uniquely identifies each row in a table. A **foreign key** is
+the matching variable in another table that refers back to the primary key.
+
+```{r}
+airlines  # primary key: carrier
+airports  # primary key: faa
+planes    # primary key: tailnum
+```
+
+`weather` has a **compound key** --- you need both `origin` and `time_hour`
+together to uniquely identify a row:
+
+```{r}
+weather
+```
+
+Always verify that a claimed primary key actually uniquely identifies rows:
+
+```{r}
+# Confirm tailnum is unique in planes
+planes |>
+  count(tailnum) |>
+  filter(n > 1)
+
+# Confirm the compound key in weather
+weather |>
+  count(origin, time_hour) |>
+  filter(n > 1)
+```
+
+Empty results confirm both keys are valid.
+
+## Mutating Joins
+
+A **mutating join** adds columns from one table to another by matching on a key.
+We will work with a slim version of `flights`:
+
+```{r}
+flights2 <- flights |>
+  select(year, time_hour, origin, dest, tailnum, carrier)
+flights2
+```
+
+### `left_join()` — the join you will use 90% of the time
+
+`left_join(x, y)` keeps every row in `x` and fills in matching columns from `y`.
+Rows in `x` with no match in `y` get `NA` for the new columns.
+
+Add full carrier names:
+
+```{r}
+flights2 |>
+  left_join(airlines)
+```
+
+Add weather conditions at departure:
+
+```{r}
+flights2 |>
+  left_join(weather |> select(origin, time_hour, temp, wind_speed))
+```
+
+Add plane size:
+
+```{r}
+flights2 |>
+  left_join(planes |> select(tailnum, type, engines, seats))
+```
+
+::: {.callout-important}
+**Why `left_join()` almost always?** Because it preserves every row in your
+primary dataset. You will not silently lose observations the way `inner_join()`
+can. If a join key is missing from `y`, you get `NA` --- which is visible and
+diagnosable. If `inner_join()` drops rows, you may not notice.
+:::
+
+### Specifying the Join Key
+
+By default, `left_join()` joins on all columns with matching names. This is
+called a **natural join** and works well when column names are consistent across
+tables. When they are not, use `by`:
+
+```{r}
+# both tables have a "year" column but mean different things
+# only join on tailnum
+flights2 |>
+  left_join(planes, by = "tailnum")
+```
+
+When the key has different names in each table, use `by = c("x_name" = "y_name")`:
+
+```{r}
+# join flights destination to airport metadata
+flights2 |>
+  left_join(airports, by = c("dest" = "faa"))
+
+# join flights origin to airport metadata
+flights2 |>
+  left_join(airports, by = c("origin" = "faa"))
+```
+
+### Other Mutating Joins
+
+| Join | Keeps |
+|---|---|
+| `left_join(x, y)` | All rows of `x`; fills NAs where no match in `y` |
+| `right_join(x, y)` | All rows of `y`; fills NAs where no match in `x` |
+| `inner_join(x, y)` | Only rows with matches in **both** `x` and `y` |
+| `full_join(x, y)` | All rows from both; NAs where no match on either side |
+
+In practice: use `left_join()` as your default. Use `inner_join()` only when
+you explicitly want to drop non-matching rows and have verified that is safe.
+
+## Filtering Joins
+
+Filtering joins do not add columns --- they use `y` to decide which rows of `x`
+to keep or drop.
+
+### `semi_join()` — keep rows in `x` that have a match in `y`
+
+```{r}
+# Keep only airports that appear as origins in flights
+airports |>
+  semi_join(flights2, by = c("faa" = "origin"))
+```
+
+### `anti_join()` — keep rows in `x` that have NO match in `y`
+
+`anti_join()` is the most useful diagnostic tool for join problems. It finds
+rows that would be silently dropped by an inner join.
+
+```{r}
+# Which destination codes in flights have no matching airport entry?
+flights2 |>
+  anti_join(airports, by = c("dest" = "faa")) |>
+  distinct(dest)
+```
+
+```{r}
+# Which tail numbers in flights have no plane record?
+flights2 |>
+  anti_join(planes, by = "tailnum") |>
+  distinct(tailnum) |>
+  nrow()
+```
+
+::: {.callout-tip}
+**Always run `anti_join()` before a major join.** If it returns rows you did not
+expect to drop, you have a data quality problem to investigate before proceeding
+with the analysis.
+:::
+
+---
+
+# Exercises
+
+**Exercise 1.** Read the `framingham.csv` file from the `data/` folder using
+`read_csv()`. Check `str()` and `summary()`. How many variables were read in as
+the wrong type? Use `mutate()` to correct at least three of them.
+
+**Exercise 2.** The `table4a` dataset has years as column names. Use
+`pivot_longer()` to convert it to tidy format with columns `country`, `year`,
+and `cases`. Then join it with the tidy version of `table4b` (population data)
+using `left_join()` to create a single tidy table with `country`, `year`,
+`cases`, and `population`.
+
+**Exercise 3.** Using `flights` and `airlines`, add the full airline name to the
+flights dataset. Then compute the mean arrival delay by airline name (not code)
+and sort from worst to best.
+
+**Exercise 4.** Add weather data (temperature and wind speed) to `flights2`
+using `left_join()`. Then: how many flights are missing weather data? Use
+`anti_join()` to identify which `origin`-`time_hour` combinations in `flights2`
+have no match in `weather`.
+
+**Exercise 5 (Challenge).** Start with `flights`. Join in plane information
+(`planes`) and airport names for both `origin` and `dest` (requires two separate
+joins to `airports`, using different `by` arguments and different suffixes).
+Then compute, for each origin airport name and aircraft engine type, the mean
+air time. Keep only groups with at least 500 flights and sort by mean air time
+descending.

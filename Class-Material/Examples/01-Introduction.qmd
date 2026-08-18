@@ -1,0 +1,1152 @@
+---
+title: "01 - Introduction to R"
+subtitle: "Biostatistics 735 — Machine Learning in Public Health"
+author: "Alexander McLain"
+date: today
+format:
+  html:
+    toc: true
+    toc-location: left
+    toc-depth: 3
+    number-sections: true
+    smooth-scroll: true
+    theme: cosmo
+    code-fold: false
+    highlight-style: github
+    embed-resources: true
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+```{r}
+#| include: false
+library(tidyverse)
+library(nycflights13)
+library(janitor)
+library(ggrepel)
+library(haven)
+library(this.path)
+setwd(this.dir())
+
+framingham <- read_csv("framingham.csv") |>
+  mutate(
+    male          = factor(male,          levels = c(0,1), labels = c("Female","Male")),
+    currentSmoker = factor(currentSmoker, levels = c(0,1), labels = c("Non-smoker","Smoker")),
+    prevalentHyp  = factor(prevalentHyp,  levels = c(0,1), labels = c("No","Yes")),
+    diabetes      = factor(diabetes,      levels = c(0,1), labels = c("No","Yes")),
+    TenYearCHD    = factor(TenYearCHD,    levels = c(0,1), labels = c("No","Yes")),
+    education     = factor(education,     levels = 1:4,
+                           labels = c("Some HS","HS Diploma","Some College","College Degree"))
+  )
+```
+
+# Overview
+
+By the end of this document you will be able to:
+
+- Install and load R packages
+- Set the working directory directly and with `this.path`
+- Read CSV, Excel, and other common file formats into R
+- Recognize the main variable types in R and convert between them
+- Manipulate and transform data using core `dplyr` verbs
+- Combine data frames using mutating and filtering joins
+- Build exploratory and publication-ready plots with `ggplot2`
+- Create and render a Quarto document
+
+---
+
+# Packages
+
+Base R is powerful, but most of what we will do in this course uses **packages**
+— collections of functions contributed by the R community. There are over
+20,000 available.
+
+**Install once** (downloads to your machine):
+
+```{r}
+#| eval: false
+install.packages("tidyverse")
+```
+
+**Load at the start of every session** (makes functions available):
+
+```{r}
+library(tidyverse)
+```
+
+::: {.callout-important}
+`install.packages()` and `library()` do different things. Installing downloads
+the package; loading activates it. You only install once, but you load every
+session.
+
+Also: use straight quotes (`"tidyverse"`), not curly/smart quotes. Smart quotes
+will cause an error.
+:::
+
+`tidyverse` loads several packages at once:
+
+| Package | Purpose |
+|---------|---------|
+| `ggplot2` | Data visualization |
+| `dplyr` | Data manipulation |
+| `tidyr` | Reshaping data |
+| `readr` | Reading/writing files |
+| `stringr` | Working with text |
+| `forcats` | Working with categorical variables |
+
+We will use all of these throughout the course. Additional packages used in this
+document:
+
+```{r}
+#| eval: false
+install.packages(c("nycflights13", "janitor", "ggrepel", "haven", "this.path"))
+```
+
+---
+
+# Working Directory
+
+## Setting It Directly
+
+R looks for files relative to the **working directory**. Check yours with `getwd()`:
+
+```{r}
+getwd()
+```
+
+You can set it manually with `setwd()`:
+
+```{r}
+#| eval: false
+setwd("/Users/yourname/Documents/my-project")
+```
+
+Hard-coded paths like this break on other people's machines, so they should be
+avoided whenever possible.
+
+## Using `this.path`
+
+Rather than hard-coding a full file path, use `this.path` to set the working
+directory to wherever the script lives. Note, `rstudioapi` only works inside of
+RStudio and can give error messages when used with `.qmd` files (and in other
+situations). `this.path` is usually safer.
+
+```{r}
+#| eval: false
+library(rstudioapi)
+this.dir <- dirname(rstudioapi::getSourceEditorContext()$path)
+setwd(this.dir)
+
+library(this.path)
+this.dir <- this.dir()
+setwd(this.dir)
+```
+
+Then reference files with short relative paths: `"data/myfile.csv"` rather than
+`"/Users/yourname/Documents/.../myfile.csv"`.
+
+You can use `"../data/framingham.csv"` to tell R to go back one folder, find the
+data folder, and then look for `framingham.csv`.
+
+::: {.callout-tip}
+**Windows users:** File paths use `\` in Windows Explorer, but R requires `/` or
+`\\`. Copy a path from Explorer and replace each `\` with `/` before using it in R.
+:::
+
+---
+
+# Reading in Data
+
+## Key Terms
+
+Before reading data into R, three concepts matter:
+
+- **Header:** The first row of a file is usually variable names. R needs to know
+  whether to treat it as names or as data values.
+- **Delimiter:** The character that separates entries in each row (comma in `.csv`,
+  tab in `.tsv`, etc.). R uses this to know where one value ends and the next begins.
+- **Missing value:** How your file represents missingness. R recognizes `NA`, but
+  files often use `.`, `""`, `N/A`, `999`, or other codes that need to be declared.
+
+## Reading CSV Files with `readr`
+
+`readr` is the tidyverse package for reading rectangular data. The most common
+functions:
+
+| Function | Reads |
+|---|---|
+| `read_csv()` | Comma-separated (`.csv`) |
+| `read_csv2()` | Semicolon-separated (common in Europe) |
+| `read_tsv()` | Tab-separated |
+| `read_delim()` | Any delimiter you specify |
+
+All have the same interface — once you know `read_csv()` the rest are trivial.
+
+```{r}
+#| eval: false
+library(this.path)
+setwd(this.dir())
+framingham <- read_csv("framingham.csv")
+```
+
+When you run `read_csv()` it prints a message showing the number of rows and
+columns, the delimiter used, and how each column was parsed. This is useful for
+catching problems early.
+
+### Common Arguments
+
+**Skipping rows** — useful when files have metadata at the top:
+
+```{r}
+#| message: false
+read_csv("The first line of metadata
+  The second line of metadata
+  x,y,z
+  1,2,3", skip = 2)
+```
+
+**No column names** — tell R to generate them:
+
+```{r}
+#| message: false
+read_csv("1,2,3
+         4,5,6", col_names = FALSE)
+```
+
+**Declare missing value codes** — files often use `.` or `N/A` instead of `NA`:
+
+```{r}
+#| message: false
+read_csv("a,b,c
+         1,2,.", na = ".")
+```
+
+### Post-Import Cleaning
+
+After reading data in, two immediate tasks often arise:
+
+**1. Fix column names with spaces.** Column names with spaces require backtick
+quoting (`` `Full Name` ``) which is error-prone. Use `janitor::clean_names()` to
+convert everything to snake_case automatically:
+
+```{r}
+library(janitor)
+x <- data.frame(caseID = 1, DOB = 2, Other = 3)
+x |>
+  clean_names()
+```
+
+Or rename specific columns with `rename()`:
+
+```{r}
+x |> rename(case_id = `caseID`, dob = DOB, other = Other)
+```
+
+**2. Fix variable types.** `read_csv()` guesses column types from the data. Always
+check with `str()` and correct anything that was misread (e.g., a numeric column
+read as character because of a stray word like `"five"`).
+
+## Reading Excel Files
+
+Use `readxl::read_excel()`. You can specify which sheet to read:
+
+```{r}
+#| eval: false
+library(readxl)
+data_xl <- read_excel("data/myfile.xlsx", sheet = "data")
+dict_xl <- read_excel("data/myfile.xlsx", sheet = "dictionary")
+```
+
+The same arguments apply: `col_names`, `na`, `skip`.
+
+## Writing Data
+
+```{r}
+#| eval: false
+write_csv(framingham, "framingham_clean.csv")
+```
+
+::: {.callout-note}
+**Important:** When you write a tibble to CSV and read it back, factor levels and
+other type information are lost — the file only stores plain text. If you need to
+preserve types across sessions, use `saveRDS()` / `readRDS()` to save as an R
+binary file instead.
+:::
+
+## Other Formats
+
+The `haven` package reads SAS (`.sas7bdat`), Stata (`.dta`), and SPSS (`.sav`)
+files with the same interface:
+
+```{r}
+#| eval: false
+library(haven)
+spss_data  <- read_sav("data/myfile.sav")
+sas_data   <- read_sas("data/myfile.sas7bdat")
+stata_data <- read_dta("data/myfile.dta")
+```
+
+SPSS and Stata files often carry variable labels and value labels that `haven`
+preserves as attributes — useful when you are handed someone else's data and
+need to understand the coding.
+
+::: {.callout-tip}
+You can read in SAS data, you can even write SAS data (using `write_sas`), but SAS
+data exported from R will not properly be read into SAS. Exported SPSS
+(`write_sav`) and Stata (`write_dta`) files can be read into their respective
+software programs.
+:::
+
+---
+
+# Variable Types (Brief)
+
+The type of a variable determines what operations you can do with it and how R
+and statistical functions will treat it. Getting variable types right is one of
+the most important — and most commonly skipped — steps in data preparation.
+
+We will use the `flights` dataset from the `nycflights13` package throughout.
+
+```{r}
+library(nycflights13)
+flights
+```
+
+The abbreviations under each column name tell you the type:
+
+| Abbreviation | Type | Example |
+|---|---|---|
+| `<int>` | Integer | `year`, `month`, `day` |
+| `<dbl>` | Double (numeric, decimal) | `dep_delay`, `air_time` |
+| `<chr>` | Character (string) | `carrier`, `origin` |
+| `<lgl>` | Logical (TRUE/FALSE) | e.g., `is_delayed` |
+| `<fct>` | Factor (categorical with levels) | e.g., severity grades |
+| `<dttm>` | Date-time | `time_hour` |
+
+## Numeric Variables (`<dbl>`, `<int>`)
+
+Numeric variables represent measured quantities. Arithmetic and summary functions
+apply directly.
+
+```{r}
+mean(flights$dep_delay, na.rm = TRUE)
+sd(flights$dep_delay, na.rm = TRUE)
+range(flights$air_time, na.rm = TRUE)
+```
+
+::: {.callout-note}
+`na.rm = TRUE` tells R to ignore missing values when computing the summary.
+Without it, a single `NA` in the vector will return `NA` for the whole
+calculation.
+:::
+
+## Character Variables (`<chr>`)
+
+Character variables (strings) hold text. They cannot be used in arithmetic but
+can be searched, split, and recoded.
+
+```{r}
+unique(flights$carrier)
+table(flights$carrier)
+```
+
+## Logical Variables (`<lgl>`)
+
+Logicals are `TRUE` or `FALSE`. They arise naturally from comparisons and are
+useful for filtering and counting. `sum()` and `mean()` treat `TRUE` as 1 and
+`FALSE` as 0, so you can count and compute proportions easily:
+
+```{r}
+sum(flights$arr_delay > 0, na.rm = TRUE)
+mean(flights$arr_delay > 0, na.rm = TRUE) * 100
+```
+
+## Factors (`<fct>`)
+
+Factors represent **categorical variables with a fixed set of levels**. They are
+essential in statistical modeling — a factor in a regression model is handled
+as a categorical predictor (with a reference level), while a character variable
+or numeric code is not.
+
+```{r}
+severity <- factor(c("mild", "severe", "moderate", "mild", "severe"),
+                   levels = c("mild", "moderate", "severe"))
+severity
+levels(severity)
+table(severity)
+```
+
+::: {.callout-important}
+**When does this matter for you?** If you code a categorical variable as a number
+(e.g., 1 = mild, 2 = moderate, 3 = severe) and put it in a model without
+converting it to a factor, R will treat it as a continuous variable and fit a
+single slope. This is almost never what you want. Always check whether your
+grouping variables are stored as factors. **This is one of the most common errors when running models in R.**
+:::
+
+The first level is the reference level. To change it use `relevel` (important for
+model interpretation):
+
+```{r}
+severity_reref <- relevel(severity, ref = "moderate")
+levels(severity_reref)
+```
+
+`fct_recode()` lets you rename levels; `fct_collapse()` merges them:
+
+```{r}
+severity_recoded <- fct_recode(severity,
+  "Grade 1" = "mild",
+  "Grade 2" = "moderate",
+  "Grade 3" = "severe"
+)
+levels(severity_recoded)
+```
+
+```{r}
+fct_collapse(severity,
+  "low"  = "mild",
+  "high" = c("moderate", "severe")
+)
+```
+
+---
+
+# Data Transformations with dplyr
+
+`dplyr` is the workhorse package for data manipulation. Its functions are called
+**verbs** because each one does one thing clearly. We will cover the ones you will
+use in almost every analysis.
+
+## The Pipe
+
+The pipe (`|>`) passes the output of one function as the first argument of the
+next. Read it as "then":
+
+```{r}
+#| eval: false
+flights |>           # start with flights, then
+  filter(...) |>     # keep certain rows, then
+  mutate(...) |>     # create new columns, then
+  summarize(...)     # collapse to a summary
+```
+
+You may also see `%>%` from the `magrittr` package — it behaves identically
+for our purposes.
+
+## Filtering Rows: `filter()`
+
+Keep rows that satisfy a condition:
+
+```{r}
+flights |>
+  filter(arr_delay > 120)
+
+flights |>
+  filter(month == 1 &
+           carrier %in% c("UA", "AA")
+         )
+```
+
+Common operators: `>`, `>=`, `<`, `<=`, `==`, `!=`, `%in%`, `is.na()`.
+
+::: {.callout-note}
+`=` assigns a value; `==` tests for equality. Using `=` inside `filter()` is
+one of the most common beginner errors in R.
+:::
+
+## Selecting and Renaming Columns: `select()` and `rename()`
+
+```{r}
+flights |>
+  select(year, month, day, carrier, dep_delay, arr_delay)
+
+flights |>
+  rename(tail_number = tailnum) |>
+  select(tail_number, carrier)
+```
+
+Useful helpers inside `select()`: `starts_with()`, `ends_with()`,
+`contains()`, `where(is.numeric)`.
+
+```{r}
+flights |>
+  select(contains("time"))
+```
+
+## Creating and Modifying Columns: `mutate()`
+
+`mutate()` adds new columns or overwrites existing ones:
+
+```{r}
+flights |>
+  mutate(
+    gain       = dep_delay - arr_delay,
+    speed_mph  = distance / air_time * 60,
+    late       = arr_delay > 0
+  ) |>
+  select(carrier, gain, speed_mph, late)
+```
+
+`mutate()` is also where you will do type conversions:
+
+```{r}
+flights |>
+  mutate(
+    month_fct = factor(month,
+                       levels = 1:12,
+                       labels = month.abb)
+  ) |>
+  count(month_fct)
+```
+
+## Recoding Variables: `if_else()` and `case_when()`
+
+`if_else()` handles a simple two-way recode:
+
+```{r}
+flights |>
+  mutate(long_flight = if_else(air_time > 300, "Long", "Short")) |>
+  count(long_flight)
+```
+
+`case_when()` handles three or more conditions. Each condition is written as
+`condition ~ value`, and `.default` catches anything not matched:
+
+```{r}
+flights |>
+  mutate(
+    delay_category = case_when(
+      dep_delay <= 0   ~ "On time or early",
+      dep_delay <= 30  ~ "Minor delay (<= 30 min)",
+      dep_delay <= 120 ~ "Moderate delay (31-120 min)",
+      .default         = "Major delay (> 120 min)"
+    )
+  ) |>
+  count(delay_category)
+```
+
+Conditions are evaluated top to bottom — the first match wins.
+
+## Sorting: `arrange()`
+
+```{r}
+flights |>
+  arrange(desc(dep_delay)) |>
+  select(carrier, origin, dest, dep_delay)
+```
+
+## Grouped Summaries: `group_by()` + `summarize()`
+
+This combination is how you compute group-level statistics:
+
+```{r}
+flights |>
+  group_by(carrier) |>
+  summarize(
+    mean_delay = mean(arr_delay, na.rm = TRUE),
+    n_flights  = n()
+  ) |>
+  arrange(desc(mean_delay))
+```
+
+::: {.callout-note}
+Always include `na.rm = TRUE` inside summary functions like `mean()`, `sd()`,
+and `median()`. Missing values in the input will return `NA` for the whole
+summary otherwise.
+:::
+
+Multiple grouping variables:
+
+```{r}
+flights |>
+  group_by(origin, carrier) |>
+  summarize(
+    mean_delay = mean(arr_delay, na.rm = TRUE),
+    n          = n(),
+    .groups    = "drop"
+  )
+```
+
+## Putting It Together: A Pipeline
+
+Compute the on-time arrival rate by carrier for flights longer than 500 miles,
+keeping only carriers with at least 1,000 such flights:
+
+```{r}
+flights |>
+  filter(distance > 500) |>
+  mutate(on_time = arr_delay <= 0) |>
+  group_by(carrier) |>
+  summarize(
+    n           = n(),
+    pct_on_time = mean(on_time, na.rm = TRUE) * 100
+  ) |>
+  filter(n >= 1000) |>
+  arrange(desc(pct_on_time))
+```
+
+---
+
+# Joining Data
+
+## Why Join?
+
+It is rare that all the information you need lives in a single data frame.
+Relational data — data spread across multiple linked tables — is the norm in
+practice. Joins let you combine them.
+
+We will use the `nycflights13` package, which has five related tables:
+
+- `flights`: every flight departing NYC in 2013
+- `airlines`: carrier codes and full names
+- `airports`: airport codes and metadata
+- `planes`: plane metadata by tail number
+- `weather`: hourly weather at each NYC airport
+
+## Keys
+
+A **primary key** uniquely identifies each row in a table. A **foreign key** is
+the matching variable in another table that refers back to the primary key.
+
+```{r}
+airlines  # primary key: carrier
+airports  # primary key: faa
+planes    # primary key: tailnum
+```
+
+Always verify that a claimed primary key actually uniquely identifies rows:
+
+```{r}
+planes |>
+  count(tailnum) |>
+  filter(n > 1)
+
+weather |>
+  count(origin, time_hour) |>
+  filter(n > 1)
+```
+
+Empty results confirm both keys are valid.
+
+## Mutating Joins
+
+A **mutating join** adds columns from one table to another by matching on a key.
+
+```{r}
+flights2 <- flights |>
+  select(year, time_hour, origin, dest, tailnum, carrier)
+flights2
+```
+
+### `left_join()` — the join you will use 90% of the time
+
+`left_join(x, y)` keeps every row in `x` and fills in matching columns from `y`.
+Rows in `x` with no match in `y` get `NA` for the new columns.
+
+```{r}
+flights2 |>
+  left_join(airlines)
+
+flights2 |>
+  left_join(weather |> select(origin, time_hour, temp, wind_speed))
+
+flights2 |>
+  left_join(planes |> select(tailnum, type, engines, seats))
+```
+
+::: {.callout-important}
+**Why `left_join()` almost always?** Because it preserves every row in your
+primary dataset. You will not silently lose observations the way `inner_join()`
+can. If a join key is missing from `y`, you get `NA` — which is visible and
+diagnosable. If `inner_join()` drops rows, you may not notice.
+:::
+
+### Specifying the Join Key
+
+By default, `left_join()` joins on all columns with matching names. When key
+names differ across tables, use `by`:
+
+```{r}
+flights2 |>
+  left_join(airports, by = c("dest" = "faa"))
+
+flights2 |>
+  left_join(airports, by = c("origin" = "faa"))
+```
+
+### Other Mutating Joins
+
+| Join | Keeps |
+|---|---|
+| `left_join(x, y)` | All rows of `x`; fills NAs where no match in `y` |
+| `right_join(x, y)` | All rows of `y`; fills NAs where no match in `x` |
+| `inner_join(x, y)` | Only rows with matches in **both** `x` and `y` |
+| `full_join(x, y)` | All rows from both; NAs where no match on either side |
+
+In practice: use `left_join()` as your default. Use `inner_join()` only when
+you explicitly want to drop non-matching rows and have verified that is safe.
+
+## Filtering Joins
+
+Filtering joins do not add columns — they use `y` to decide which rows of `x`
+to keep or drop.
+
+### `semi_join()` — keep rows in `x` that have a match in `y`
+
+```{r}
+airports |>
+  semi_join(flights2, by = c("faa" = "origin"))
+```
+
+### `anti_join()` — keep rows in `x` that have NO match in `y`
+
+`anti_join()` is the most useful diagnostic tool for join problems. It finds
+rows that would be silently dropped by an inner join.
+
+```{r}
+flights2 |>
+  anti_join(airports, by = c("dest" = "faa")) |>
+  distinct(dest)
+
+flights2 |>
+  anti_join(planes, by = "tailnum") |>
+  distinct(tailnum) |>
+  nrow()
+```
+
+::: {.callout-tip}
+**Always run `anti_join()` before a major join.** If it returns rows you did not
+expect to drop, you have a data quality problem to investigate before proceeding
+with the analysis.
+:::
+
+---
+
+# Data Visualization
+
+We use the **Framingham Heart Study** dataset throughout this section.
+
+```{r}
+library(this.path)
+setwd(this.dir())
+
+framingham <- read_csv("framingham.csv") |>
+  mutate(
+    male          = factor(male,          levels = c(0,1), labels = c("Female","Male")),
+    currentSmoker = factor(currentSmoker, levels = c(0,1), labels = c("Non-smoker","Smoker")),
+    prevalentHyp  = factor(prevalentHyp,  levels = c(0,1), labels = c("No","Yes")),
+    diabetes      = factor(diabetes,      levels = c(0,1), labels = c("No","Yes")),
+    TenYearCHD    = factor(TenYearCHD,    levels = c(0,1), labels = c("No","Yes")),
+    education     = factor(education,     levels = 1:4,
+                           labels = c("Some HS","HS Diploma","Some College","College Degree"))
+  )
+str(framingham)
+```
+
+## The Grammar of Graphics
+
+`ggplot2` is built on the idea that every plot can be described by the same
+small set of components:
+
+| Component | What it controls |
+|---|---|
+| **Data** | The tibble you are visualizing |
+| **Aesthetics** (`aes()`) | How variables map to visual properties (x, y, color, size, shape) |
+| **Geoms** | The geometric objects that represent the data (points, lines, bars, boxes) |
+| **Scales** | How data values map to aesthetic values (axis limits, color palettes) |
+| **Facets** | Splitting the plot into small multiples by a grouping variable |
+| **Theme** | Non-data appearance (fonts, background, grid lines) |
+
+Every `ggplot2` plot follows the same template:
+
+```{r}
+#| eval: false
+ggplot(data = <DATA>) +
+  <GEOM>(mapping = aes(<MAPPINGS>)) +
+  <SCALES> +
+  <FACETS> +
+  <THEME>
+```
+
+## Visualizing Distributions
+
+### Continuous Variables: Histograms
+
+A histogram bins a continuous variable and counts observations per bin. Always
+try several `binwidth` values — the pattern can change substantially.
+
+```{r}
+ggplot(framingham, aes(x = sysBP)) +
+  geom_histogram(binwidth = 5, fill = "steelblue", color = "white") +
+  labs(x = "Systolic Blood Pressure (mmHg)", y = "Count",
+       title = "Distribution of Systolic Blood Pressure")
+```
+
+### Continuous Variables: Density Plots
+
+A density plot is a smoothed histogram. It is better than a histogram for
+overlaying multiple groups because lines are easier to compare than bars.
+
+```{r}
+ggplot(framingham, aes(x = sysBP, fill = male)) +
+  geom_density(alpha = 0.4) +
+  labs(x = "Systolic Blood Pressure (mmHg)", y = "Density",
+       fill = "Sex",
+       title = "Systolic BP Distribution by Sex")
+```
+
+### Categorical Variables: Bar Charts
+
+```{r}
+ggplot(framingham, aes(x = education)) +
+  geom_bar(fill = "steelblue") +
+  labs(x = "Education Level", y = "Count",
+       title = "Education Distribution in Framingham Cohort") +
+  theme(axis.text.x = element_text(angle = 20, hjust = 1))
+```
+
+To plot proportions rather than counts, compute them first with `dplyr` and
+use `geom_col()`:
+
+```{r}
+framingham |>
+  count(education) |>
+  mutate(pct = n / sum(n) * 100) |>
+  ggplot(aes(x = education, y = pct)) +
+  geom_col(fill = "steelblue") +
+  labs(x = "Education Level", y = "Percent (%)",
+       title = "Education Distribution (%)") +
+  theme(axis.text.x = element_text(angle = 20, hjust = 1))
+```
+
+## Visualizing Covariation
+
+### Continuous + Categorical: Boxplots
+
+Boxplots show the median, IQR, and outliers compactly. They are ideal for
+comparing a continuous variable across groups.
+
+```{r}
+ggplot(framingham, aes(x = male, y = sysBP)) +
+  geom_boxplot(fill = "steelblue", alpha = 0.7) +
+  labs(x = "Sex", y = "Systolic BP (mmHg)",
+       title = "Systolic Blood Pressure by Sex")
+```
+
+When you have many groups, order them by the median to make comparisons easier:
+
+```{r}
+ggplot(framingham, aes(x = reorder(education, sysBP, FUN = median),
+                       y = sysBP)) +
+  geom_boxplot(fill = "steelblue", alpha = 0.7) +
+  labs(x = "Education Level",
+       y = "Systolic BP (mmHg)",
+       title = "Systolic BP by Education Level",
+       subtitle = "Groups ordered by median BP") +
+  theme(axis.text.x = element_text(angle = 20, hjust = 1))
+```
+
+### Continuous + Categorical: Violin Plots
+
+A violin plot shows the full distribution shape, not just the summary statistics.
+Combine with a boxplot overlay for the best of both:
+
+```{r}
+ggplot(framingham, aes(x = male, y = sysBP)) +
+  geom_violin(fill = "steelblue", alpha = 0.5) +
+  geom_boxplot(width = 0.1, fill = "white", outlier.size = 0.8) +
+  labs(x = "Sex", y = "Systolic BP (mmHg)",
+       title = "Systolic BP by Sex: Violin + Boxplot")
+```
+
+### Two Continuous Variables: Scatterplots
+
+```{r}
+ggplot(framingham, aes(x = age, y = sysBP)) +
+  geom_point(alpha = 0.3) +
+  labs(x = "Age (years)", y = "Systolic BP (mmHg)",
+       title = "Systolic BP vs. Age")
+```
+
+Add a smooth trend line with `geom_smooth()`:
+
+```{r}
+#| message: false
+ggplot(framingham, aes(x = age, y = sysBP)) +
+  geom_point(alpha = 0.2) +
+  geom_smooth(method = "loess", color = "firebrick", se = TRUE) +
+  labs(x = "Age (years)", y = "Systolic BP (mmHg)",
+       title = "Systolic BP vs. Age with Loess Smoother")
+```
+
+Map a third variable to color:
+
+```{r}
+#| message: false
+ggplot(framingham, aes(x = age, y = sysBP, color = male)) +
+  geom_point(alpha = 0.3) +
+  geom_smooth(method = "lm", se = FALSE) +
+  labs(x = "Age (years)", y = "Systolic BP (mmHg)",
+       color = "Sex",
+       title = "Systolic BP vs. Age by Sex")
+```
+
+## Faceting
+
+Faceting splits a plot into small multiples by a variable — often cleaner than
+color coding when there are many groups.
+
+```{r}
+#| message: false
+ggplot(framingham, aes(x = age, y = sysBP)) +
+  geom_point(alpha = 0.2) +
+  geom_smooth(method = "lm", se = FALSE, color = "firebrick") +
+  facet_wrap(~ male) +
+  labs(x = "Age", y = "Systolic BP (mmHg)",
+       title = "Systolic BP vs. Age, by Sex")
+```
+
+`facet_grid()` facets on two variables simultaneously:
+
+```{r}
+#| message: false
+ggplot(framingham, aes(x = age, y = sysBP)) +
+  geom_point(alpha = 0.2, size = 0.8) +
+  geom_smooth(method = "lm", se = FALSE, color = "firebrick") +
+  facet_grid(currentSmoker ~ male) +
+  labs(x = "Age", y = "Systolic BP (mmHg)",
+       title = "Systolic BP vs. Age by Sex and Smoking Status")
+```
+
+## Labels and Annotation
+
+```{r}
+framingham |>
+  filter(!is.na(education)) |>
+  ggplot(aes(x = reorder(education, sysBP, FUN = median),
+                         y = sysBP, fill = male)) +
+  geom_boxplot(alpha = 0.7) +
+  labs(
+    title    = "Systolic Blood Pressure by Education and Sex",
+    subtitle = "Framingham Heart Study cohort",
+    caption  = "Source: Framingham Heart Study",
+    x        = "Education Level",
+    y        = "Systolic BP (mmHg)",
+    fill     = "Sex"
+  ) +
+  theme(axis.text.x = element_text(angle = 20, hjust = 1))
+```
+
+Add horizontal or vertical reference lines to mark thresholds:
+
+```{r}
+ggplot(framingham, aes(x = age, y = sysBP)) +
+  geom_point(alpha = 0.2) +
+  geom_hline(yintercept = 140, color = "blue",
+             linewidth = 1, linetype = "dashed") +
+  annotate("text", x = 35, y = 143,
+           label = "Hypertension threshold (140 mmHg)",
+           color = "blue", hjust = 0, size = 7) +
+  labs(x = "Age (years)", y = "Systolic BP (mmHg)",
+       title = "Systolic BP with Hypertension Threshold")
+```
+
+## Scales and Themes
+
+Color scales: use ColorBrewer palettes for categorical variables and viridis
+for continuous color, both of which are colorblind-friendly:
+
+```{r}
+ggplot(framingham, aes(x = age, y = sysBP, color = education)) +
+  geom_point(alpha = 0.4) +
+  scale_color_brewer(palette = "Set2") +
+  labs(x = "Age", y = "Systolic BP", color = "Education")
+
+ggplot(framingham, aes(x = age, y = sysBP, color = BMI)) +
+  geom_point(alpha = 0.5) +
+  scale_color_viridis_c(option = "plasma") +
+  labs(x = "Age", y = "Systolic BP", color = "BMI")
+```
+
+Themes control all non-data elements: background, grid lines, fonts, and text size:
+
+```{r}
+#| message: false
+base <- ggplot(framingham, aes(x = age, y = sysBP, color = male)) +
+  geom_point(alpha = 0.3) +
+  geom_smooth(method = "lm", se = FALSE) +
+  labs(x = "Age", y = "Systolic BP", color = "Sex")
+
+base + theme_bw()
+base + theme_minimal()
+base + theme_classic()
+```
+
+## Saving Plots
+
+Use `ggsave()` to write the most recent plot to disk. Always specify `width` and
+`height` for reproducibility:
+
+```{r}
+#| eval: false
+ggplot(framingham, aes(x = age, y = sysBP, color = male)) +
+  geom_point(alpha = 0.3) +
+  geom_smooth(method = "lm", se = FALSE) +
+  theme_minimal() +
+  labs(x = "Age (years)", y = "Systolic BP (mmHg)", color = "Sex")
+
+ggsave("figures/sysBP_vs_age.png", width = 7, height = 5, dpi = 300)
+ggsave("figures/sysBP_vs_age.pdf", width = 7, height = 5)
+```
+
+::: {.callout-tip}
+Use `.pdf` for vector graphics (scalable, best for publication) and `.png` for
+raster graphics (best for slides and web). Always set `dpi = 300` for `.png`
+to ensure print quality.
+:::
+
+## A Publication-Ready Figure
+
+Here is a complete example building a figure from scratch with all the elements
+covered above:
+
+```{r}
+#| message: false
+#| fig-width: 8
+#| fig-height: 5
+framingham |>
+  filter(!is.na(education)) |>
+  ggplot(aes(x = age, y = sysBP, color = education)) +
+  geom_point(alpha = 0.15, size = 0.8) +
+  geom_smooth(method = "lm", se = FALSE, linewidth = 1) +
+  geom_hline(yintercept = 140, linetype = "dashed",
+             color = "gray40", linewidth = 0.8) +
+  annotate("text", x = 32, y = 143,
+           label = "Hypertension threshold", color = "gray40",
+           hjust = 0, size = 3) +
+  scale_color_brewer(palette = "Set2") +
+  scale_y_continuous(breaks = seq(80, 300, by = 40)) +
+  facet_wrap(~ male) +
+  theme_minimal() +
+  theme(
+    legend.position  = "bottom",
+    panel.grid.minor = element_blank(),
+    strip.text       = element_text(face = "bold")
+  ) +
+  labs(
+    title    = "Systolic Blood Pressure vs. Age by Sex and Education Level",
+    subtitle = "Framingham Heart Study cohort — linear trends per education group",
+    caption  = "Dashed line indicates hypertension threshold (140 mmHg)",
+    x        = "Age (years)",
+    y        = "Systolic BP (mmHg)",
+    color    = "Education level"
+  )
+```
+
+---
+
+# Introduction to Quarto
+
+## What Is Quarto?
+
+A **Quarto document** (`.qmd`) combines prose and R code in a single file.
+When you **render** it, R runs all the code and produces a polished HTML, PDF,
+or Word document with your text, code, and output together.
+
+This is the foundation of **reproducible research**: your analysis and your
+write-up live in the same place, and results update automatically if your data
+or code changes.
+
+::: {.callout-note}
+**R Markdown (`.Rmd`) vs. Quarto (`.qmd`):** Quarto is the successor to R
+Markdown. The syntax is nearly identical. If you have seen `.Rmd` files before,
+everything you know transfers directly. We use `.qmd` in this course.
+:::
+
+## Anatomy of a Quarto Document
+
+**1. YAML header** — at the very top, between `---` lines. Controls title,
+format, and options:
+
+```yaml
+---
+title: "My Analysis"
+format: html
+---
+```
+
+**2. Prose** written in Markdown:
+
+```markdown
+# Heading 1
+## Heading 2
+
+Regular paragraph text.
+
+**bold**   *italic*   `inline code`
+
+- bullet item
+- another item
+```
+
+**3. Code chunks** — R code between triple backticks:
+
+````markdown
+```{{r}}
+1 + 1
+mean(c(4, 7, 2))
+```
+````
+
+## Creating and Rendering Your First Document
+
+**Step 1.** File → New File → Quarto Document. Give it a title, keep HTML
+selected, click **Create**.
+
+**Step 2.** Click **Render** in the editor toolbar (or `Ctrl+Shift+K` /
+`Cmd+Shift+K`). The output opens in your browser or the Viewer pane.
+
+**Step 3.** Try making a change — edit the title, add a line of prose, change
+a number in a code chunk — then render again.
+
+## Key Chunk Options
+
+Control how each chunk behaves with options inside `#|` comments:
+
+```{r}
+#| echo: true      # show the code in the output (default)
+#| eval: true      # run the code (default)
+#| warning: false  # suppress warnings
+#| message: false  # suppress messages like package loading notes
+
+2 + 2
+```
+
+| Option | Default | Effect |
+|--------|---------|--------|
+| `echo` | `true` | Show the code in the rendered output |
+| `eval` | `true` | Actually run the code |
+| `warning` | `true` | Show/hide R warnings |
+| `message` | `true` | Show/hide messages (e.g., from `library()`) |
+
+Set options globally for the whole document in the YAML `execute:` block —
+individual chunk options override the global defaults.
+
+## Inline Code
+
+Embed R results directly in prose:
+
+```markdown
+The mean age in the Framingham cohort is `{{r}} round(mean(framingham$age, na.rm = TRUE), 3)` years.
+```
+This renders as the following:
+
+
+```markdown
+The mean age in the Framingham cohort is `{r} round(mean(framingham$age, na.rm = TRUE), 3)` years.
+```
+
+The document and updates automatically if the data changes.

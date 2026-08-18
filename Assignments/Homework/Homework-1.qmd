@@ -1,0 +1,184 @@
+---
+title: "Homework One"
+subtitle: "Biostatistics 735 — Machine Learning in Public Health"
+date: August 18, 2026 
+format:
+  html:
+    toc: true
+    toc-location: left
+    toc-depth: 3
+    number-sections: true
+    smooth-scroll: true
+    theme: cosmo
+    code-fold: false
+    highlight-style: github
+    embed-resources: true
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+
+# Instructions
+
+This homework is **due August 31, 2026**. Here is how to get started:
+
+**Step 1.** Open a new Quarto document: File → New File → Quarto Document.
+Give it a title like `"Homework 1"` and select HTML. Click **Create**.
+
+**Step 2.** Delete the template content that Quarto pre-fills and replace it
+with a YAML header and setup chunk matching the one from Part 1:
+
+````markdown
+---
+title: "Homework One"
+subtitle: "Biostatistics 735 — Machine Learning in Public Health"
+date: today
+format:
+  html:
+    toc: true
+    theme: cosmo
+    embed-resources: true
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+```{{r}}
+library(tidyverse)
+library(this.path) 
+this.dir <- this.dir()
+setwd(this.dir)
+
+framingham <- read_csv("framingham.csv")
+```
+````
+
+
+**Step 3.** Work through Exercises 1--4 in order. For each one:
+
+- Add a new code chunk (`Ctrl+Alt+I` / `Cmd+Option+I`)
+- Write and run your code
+- Add a sentence or two below the chunk describing what you found in plain
+  language --- not just what the numbers are, but what they mean
+
+**Step 4.** When you have finished all exercises, click **Render**
+(`Ctrl+Shift+K` / `Cmd+Shift+K`) and confirm the document compiles to HTML
+without errors. Fix any errors before moving on.
+
+---
+
+# Exercises
+
+**Exercise 1.**
+Read `framingham.csv` using `read_csv()`. The dataset uses blank cells for missing values, which `read_csv()` handles automatically.After reading in:
+
+a. Use `str()` to check column types. Which variables are stored as `<dbl>` but
+   should be factors?
+b. Convert at least four binary or categorical variables to factors with
+   meaningful labels using `mutate()` and `factor()`.
+c. Write the cleaned dataset to a new file called `framingham_clean.csv` using
+   `write_csv()`.
+
+```{r}
+# your code here
+```
+
+ **Exercise 2.**
+Build a single pipeline that:
+
+(a) Keeps only participants aged 40--65
+(b) Creates a new variable `hyp_smoker`: `"Yes"` if the participant has
+    prevalent hypertension **and** is a current smoker, `"No"` otherwise
+    (use `if_else()` or `case_when()`)
+(c) Computes, for each combination of `hyp_smoker` and `male`: number of
+    participants, mean systolic BP, and 10-year CHD rate
+(d) Keeps only groups with at least 50 participants
+(e) Sorts by CHD rate descending
+
+What combination of characteristics is associated with the highest CHD risk
+in this age group?
+
+```{r}
+# your code here
+```
+
+
+**Exercise 3 **
+
+a. Create a dataset called `flight_avg_delay` by:
+
+   - Grouping `flights` by destination (`dest`)
+   - Computing the mean arrival delay (`avg_delay`) for each destination,
+     ignoring NAs
+   - Joining in the latitude (`lat`), longitude (`lon`), and full airport name
+     (`name`) from `airports` using `left_join()` with `by = c("dest" = "faa")`
+   - Dropping destinations with no matching airport record using `filter()`
+     and `!is.na(lat)`
+
+b. How many destinations have no match in `airports`? Use `anti_join()` to
+   find them before building the dataset.
+
+c. Once you have `flight_avg_delay`, run this code to plot average arrival delay
+   on a US map:
+
+```{r}
+#| eval: false
+
+# This requires the maps package.
+install.packages("maps") 
+library(maps)
+
+flight_avg_delay |>
+  ggplot(aes(lon, lat, color = avg_delay)) +
+  borders("state") +
+  geom_point(size = 2) +
+  coord_quickmap() +
+  scale_color_gradient2(low = "blue", mid = "white", high = "red",
+                        midpoint = 0) +
+  labs(title = "Average Arrival Delay by Destination Airport",
+       color  = "Avg delay (min)")
+```
+
+Which regions of the country have the worst average arrival delays?
+
+```{r}
+# your code here
+```
+
+
+
+**Exercise 4 **
+
+Build a single polished figure that answers this question: **How does the
+10-year coronary heart disease rate in the Framingham cohort vary by age group,
+sex, and hypertension status?**
+
+Steps:
+
+a. Create an age group variable using `case_when()`:
+   "40--44", "45--49", "50--54", "55--59", "60--64", "65+"
+   (or similar grouping of your choosing). Make it a factor with levels in
+   the right order.
+
+b. Compute the CHD rate (proportion with `TenYearCHD == "Yes"`) for each
+   combination of age group, sex, and hypertension status using
+   `group_by()` and `summarize()`. Keep only groups with at least 20
+   participants.
+
+c. Plot the result. A grouped bar chart (`geom_col()` with `position = "dodge"`)
+   or a line plot (`geom_line()` + `geom_point()`) with age group on the x-axis
+   works well here. Color by hypertension status, facet by sex.
+
+d. Add a full set of labels, a meaningful color palette, and a clean theme.
+
+e. Save the figure with `ggsave()` at 300 dpi.
+
+f. Write a 3--4 sentence caption summarizing the main findings as if this were
+   going into a manuscript.
+
+```{r}
+# your code here
+```

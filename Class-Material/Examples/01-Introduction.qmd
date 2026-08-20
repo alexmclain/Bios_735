@@ -888,7 +888,7 @@ Map a third variable to color:
 #| message: false
 ggplot(framingham, aes(x = age, y = sysBP, color = male)) +
   geom_point(alpha = 0.3) +
-  geom_smooth(method = "lm", se = FALSE) +
+  geom_smooth(method = "loess", se = FALSE) +
   labs(x = "Age (years)", y = "Systolic BP (mmHg)",
        color = "Sex",
        title = "Systolic BP vs. Age by Sex")
@@ -903,7 +903,7 @@ color coding when there are many groups.
 #| message: false
 ggplot(framingham, aes(x = age, y = sysBP)) +
   geom_point(alpha = 0.2) +
-  geom_smooth(method = "lm", se = FALSE, color = "firebrick") +
+  geom_smooth(method = "loess", se = FALSE, color = "firebrick") +
   facet_wrap(~ male) +
   labs(x = "Age", y = "Systolic BP (mmHg)",
        title = "Systolic BP vs. Age, by Sex")
@@ -915,7 +915,7 @@ ggplot(framingham, aes(x = age, y = sysBP)) +
 #| message: false
 ggplot(framingham, aes(x = age, y = sysBP)) +
   geom_point(alpha = 0.2, size = 0.8) +
-  geom_smooth(method = "lm", se = FALSE, color = "firebrick") +
+  geom_smooth(method = "loess", se = FALSE, color = "firebrick") +
   facet_grid(currentSmoker ~ male) +
   labs(x = "Age", y = "Systolic BP (mmHg)",
        title = "Systolic BP vs. Age by Sex and Smoking Status")
@@ -977,7 +977,7 @@ Themes control all non-data elements: background, grid lines, fonts, and text si
 #| message: false
 base <- ggplot(framingham, aes(x = age, y = sysBP, color = male)) +
   geom_point(alpha = 0.3) +
-  geom_smooth(method = "lm", se = FALSE) +
+  geom_smooth(method = "loess", se = FALSE) +
   labs(x = "Age", y = "Systolic BP", color = "Sex")
 
 base + theme_bw()
@@ -994,7 +994,7 @@ Use `ggsave()` to write the most recent plot to disk. Always specify `width` and
 #| eval: false
 ggplot(framingham, aes(x = age, y = sysBP, color = male)) +
   geom_point(alpha = 0.3) +
-  geom_smooth(method = "lm", se = FALSE) +
+  geom_smooth(method = "loess", se = FALSE) +
   theme_minimal() +
   labs(x = "Age (years)", y = "Systolic BP (mmHg)", color = "Sex")
 
@@ -1021,7 +1021,7 @@ framingham |>
   filter(!is.na(education)) |>
   ggplot(aes(x = age, y = sysBP, color = education)) +
   geom_point(alpha = 0.15, size = 0.8) +
-  geom_smooth(method = "lm", se = FALSE, linewidth = 1) +
+  geom_smooth(method = "loess", se = FALSE, linewidth = 1) +
   geom_hline(yintercept = 140, linetype = "dashed",
              color = "gray40", linewidth = 0.8) +
   annotate("text", x = 32, y = 143,

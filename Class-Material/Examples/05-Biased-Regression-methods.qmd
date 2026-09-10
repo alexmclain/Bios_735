@@ -1,0 +1,432 @@
+---
+title: "Biased Regression Methods for Prediction"
+subtitle: "Instability of OLS, Ridge, Lasso, PLS, MCP, SCAD; Grouped & Fused Lasso"
+author: "Alexander McLain"
+date: today
+format:
+  html:
+    toc: true
+    toc-location: left
+    toc-depth: 3
+    number-sections: true
+    smooth-scroll: true
+    theme: cosmo
+    code-fold: false
+    highlight-style: github
+    embed-resources: true
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+```{r}
+#| include: false
+set.seed(735794)
+
+# Methods
+library(glmnet)   # ridge/lasso
+library(pls)      # partial least squares
+library(lars)     # diabetes data (public health: diabetes progression)
+library(ncvreg)   # MCP/SCAD
+library(grpreg)   # grouped lasso
+library(genlasso) # fused lasso / trend filtering
+
+# Core
+library(broom)
+library(rsample)
+library(yardstick)
+library(knitr)
+library(kableExtra)
+library(GGally)
+library(tidyverse) # It is good to load this last.Do
+```
+
+**Datasets used in this lab**
+
+> • **Diabetes progression** (Efron et al.) via `lars::diabetes`: outcome is a quantitative measure of disease progression one year after baseline; predictors are clinical/lab measures.
+
+> • **Air quality (Ozone)** via `airquality`: daily ozone levels in New York—used here to illustrate **fused lasso** as a denoising tool for an environmental time series.
+
+---
+
+# Data and Train/Test Split (Diabetes)
+
+```{r}
+data(diabetes, package = "lars")
+
+# X: 10 predictors (matrix), y: outcome (numeric)
+X <- diabetes$x
+y <- diabetes$y
+
+# Make a tibble with one column per predictor (no list-columns)
+df <- tibble::as_tibble(X) %>% 
+  mutate(y = as.numeric(y))
+
+## This data is formatted strangely. I had to export and import to fix.
+write.csv(df, "diabetes.csv")
+df <- read_csv("diabetes.csv")[,-1]
+names(df) <- c("age","sex","bmi","map","tc","ldl","hdl","tch","ltg","glu", "y")
+
+# correlation of predictors
+cor(df %>% dplyr::select(!starts_with("y"))) %>%
+  round(2) %>%
+  kable()
+```
+
+```{r}
+set.seed(6545)
+split <- initial_split(df, prop = 0.7, strata = NULL)
+train <- training(split)
+test  <- testing(split)
+
+X_tr <- as.matrix(select(train, -y))
+y_tr <- train$y
+X_te <- as.matrix(select(test,  -y))
+y_te <- test$y
+
+rmse <- function(truth, estimate) sqrt(mean((truth - estimate)^2))
+```
+
+---
+
+# Instability of Ordinary Least Squares (OLS)
+
+OLS can be **unstable** when predictors are correlated and $p$ is not tiny relative to $n$. We’ll bootstrap OLS to show variability in coefficients and predictions.
+
+```{r}
+# Full OLS on training
+ols <- lm(y ~ ., data = train)
+summary(ols)
+```
+
+## Bootstrap variability of coefficients
+
+```{r}
+set.seed(123)
+B <- 300
+boot_coefs <- replicate(B, {
+  idx <- sample(nrow(train), replace = TRUE)
+  coef(lm(y ~ ., data = train[idx, ]))
+})
+
+boot_df <- as_tibble(t(boot_coefs)) %>%
+  set_names(names(coef(ols))) %>%
+  pivot_longer(everything(), names_to = "term", values_to = "beta")
+
+boot_df %>%
+  filter(term != "(Intercept)") %>%
+  ggplot(aes(x = term, y = beta)) +
+  geom_violin(fill = "grey90") +
+  geom_hline(yintercept = 0, linetype = 2, color = "red") +
+  coord_flip() +
+  labs(title = "Bootstrap variability of OLS coefficients",
+       x = NULL, y = "Coefficient") +
+  theme_minimal(base_size = 12)
+```
+
+## OLS generalization error
+
+```{r}
+pred_ols <- predict(ols, newdata = test)
+ols_rmse <- rmse(y_te, pred_ols)
+tibble(Method = "OLS", Test_RMSE = ols_rmse) %>% kable(digits = 3)
+```
+
+---
+
+# Ridge Regression (L2)
+
+To fit ridge and lasso regresssion models we'll use the `glmnet` function. 
+
+
+```{r}
+set.seed(1)
+cv_ridge <- cv.glmnet(
+  X_tr, 
+  y_tr, 
+  alpha = 0, 
+  standardize = TRUE, 
+  nfolds = 10 
+)
+plot(cv_ridge)
+
+set.seed(1)
+cv_ridge <- cv.glmnet(
+  X_tr, 
+  y_tr, 
+  alpha = 0, 
+  standardize = TRUE, 
+  nfolds = 10, 
+  ## I usually don't specify lambda
+  lambda = exp(seq(-5, 5, length.out = 200)) 
+)
+plot(cv_ridge)
+
+ridge_fit_min <- glmnet(
+  X_tr, 
+  y_tr, 
+  alpha = 0, 
+  lambda = cv_ridge$lambda.min, 
+  standardize = TRUE
+  )
+
+ridge_fit_1se <- glmnet(
+  X_tr, 
+  y_tr, 
+  alpha = 0, 
+  lambda = cv_ridge$lambda.1se, 
+  standardize = TRUE
+  )
+
+pred_ridge_min <- predict(ridge_fit_min, X_te)
+pred_ridge_1se <- predict(ridge_fit_1se, X_te)
+rmse_min = rmse(y_te, pred_ridge_min) 
+rmse_1se = rmse(y_te, pred_ridge_1se)
+
+bind_cols(
+  coef_ols = coef(ols),
+  coef_ridge_min = coef(ridge_fit_min)[,1],
+  coef_ridge_1se = coef(ridge_fit_1se)[,1]
+) %>% as.matrix() %>% round(3)
+
+```
+
+---
+
+# Lasso (L1)
+
+```{r}
+set.seed(2)
+cv_lasso <- cv.glmnet(X_tr, y_tr, alpha = 1, standardize = TRUE, nfolds = 10)
+lasso_min  <- glmnet(X_tr, y_tr, alpha = 1, lambda = cv_lasso$lambda.min,  standardize = TRUE)
+lasso_1se  <- glmnet(X_tr, y_tr, alpha = 1, lambda = cv_lasso$lambda.1se,  standardize = TRUE)
+
+pred_lasso_min <- predict(lasso_min, X_te)
+pred_lasso_1se <- predict(lasso_1se, X_te)
+
+lasso_min_rmse <- rmse(y_te, pred_lasso_min)
+lasso_1se_rmse <- rmse(y_te, pred_lasso_1se)
+
+coef(lasso_min)[,1] %>% as.matrix() %>% round(3) 
+```
+
+---
+
+# Partial Least Squares (PLS)
+
+PLS builds latent components that maximize covariance between $X$ and $y$.
+
+```{r}
+set.seed(3)
+pls_fit <- plsr(y ~ ., data = train, validation = "CV")
+plot(RMSEP(pls_fit), legendpos = "topright", main = "PLS: CV RMSEP vs #components")
+
+# Choose ncomp with lowest CV error (or 1-SE rule)
+best_comp <- which.min(RMSEP(pls_fit)$val[estimate = "CV",,, drop = TRUE])
+best_comp
+
+# Extract the coefficients
+pls_coef <- coef(pls_fit, ncomp = best_comp)
+
+
+pred_pls <- predict(pls_fit, newdata = test, ncomp = best_comp)[,,1]
+pls_rmse <- rmse(y_te, pred_pls)
+```
+
+---
+
+# MCP and SCAD (Nonconvex Penalties)
+
+We use `ncvreg` for linear regression with MCP/SCAD penalties; $\lambda$ is tuned via cross-validation.
+
+```{r}
+set.seed(4)
+cv_mcp  <- cv.ncvreg(X_tr, y_tr, penalty = "MCP",  family = "gaussian", nfolds = 10)
+plot(cv_mcp)
+cv_scad <- cv.ncvreg(X_tr, y_tr, penalty = "SCAD", family = "gaussian", nfolds = 10)
+plot(cv_scad)
+
+mcp_fit  <- cv_mcp$fit
+scad_fit <- cv_scad$fit
+
+pred_mcp  <- predict(mcp_fit,  X_te)
+pred_scad <- predict(scad_fit, X_te)
+
+mcp_rmse  <- rmse(y_te, pred_mcp)
+scad_rmse <- rmse(y_te, pred_scad)
+
+
+### Beta Coefficients
+bind_cols(
+  coef_mcp = mcp_fit$beta[,cv_mcp$min],
+  coef_scad = scad_fit$beta[,cv_scad$min]
+) %>% as.matrix() %>% round(3) %>% kable()
+
+```
+
+---
+
+# Summary: Test RMSE and Sparsity
+
+```{r}
+summ <- tibble(
+  Method = c("OLS","Ridge (min)","Ridge (1SE)","Lasso (min)","Lasso (1SE)","PLS","MCP","SCAD"),
+  Test_RMSE = c(
+    ols_rmse,
+    rmse_min,
+    rmse_1se,
+    lasso_min_rmse,
+    lasso_1se_rmse,
+    pls_rmse,
+    mcp_rmse,
+    scad_rmse
+  ),
+  Nonzero = c(
+    sum(coef(ols)[-1]!=0),
+    sum(coef(ridge_fit_min )[-1]!=0),
+    sum(coef(ridge_fit_1se )[-1]!=0),
+    sum(coef(lasso_min )[-1]!=0),
+    sum(coef(lasso_1se )[-1]!=0),
+    sum(pls_coef != 0),
+    sum(mcp_fit$beta[,cv_mcp$min][-1]!=0),
+    sum(scad_fit$beta[,cv_scad$min][-1]!=0)
+  )
+) %>%
+  arrange(Test_RMSE)
+
+summ %>% kable(digits = 3, caption = "Method comparison on held-out test set") %>% kable_styling(full_width = FALSE)
+```
+
+
+
+```{r}
+summ_coef <- tibble(
+  Variable = attr(coef(ols)[-1], "names"),
+    OLS = coef(ols)[-1],
+    Ridge_min = as.vector(coef(ridge_fit_min ))[-1],
+    Ridge_1SE = as.vector(coef(ridge_fit_1se ))[-1],
+    Lasso_min = as.vector(coef(lasso_min ))[-1],
+    Lasso_1SE = as.vector(coef(lasso_1se ))[-1],
+    PLS = pls_coef[1:10],
+    MCP = mcp_fit$beta[,cv_mcp$min][-1],
+    SCAD = scad_fit$beta[,cv_scad$min][-1]
+  )
+
+summ_coef %>% kable(digits = 1, caption = "Comparison of Coefficients") %>% kable_styling(full_width = FALSE)
+```
+
+---
+
+# Grouped Lasso (Groups by Clinical Domain)
+
+The diabetes data naturally groups predictors:
+
+* **Demographics:** `age`, `sex`
+* **Anthropometrics:** `bmi`, `map`
+* **Serum markers:** `tc`–`glu`
+
+We’ll fit a **grouped lasso** to respect these groupings (encouraging selection/deselection by group).
+
+```{r}
+# Build X and groups
+X <- df %>% 
+  select(-"y")
+grp_names <- c("age","sex","bmi","map","tc","ldl","hdl","tch","ltg","glu")
+stopifnot(all(grp_names %in% names(X)))
+
+gvec <- c(1,1, 2,2, 3,3,3,3,3,3)  # (age,sex)=1; (bmi,bp)=2; (tc..glu)=3
+groups <- factor(gvec, labels = c("demo","anthro","serum"))
+
+X_tr_g <- as.matrix(X_tr[, grp_names])
+X_te_g <- as.matrix(X_te[, grp_names])
+
+set.seed(5)
+cv_grp <- cv.grpreg(X_tr_g, y_tr, group = gvec, penalty = "grLasso", nfolds = 10, family = "gaussian")
+grp_fit <- grpreg(X_tr_g, y_tr, group = gvec, penalty = "grLasso", lambda = cv_grp$lambda.min)
+
+pred_grp <- predict(grp_fit, X_te_g)
+grp_rmse <- rmse(y_te, pred_grp)
+grp_rmse
+```
+
+Inspect which **groups** entered:
+
+```{r}
+beta_grp <- coef(grp_fit)[-1]  # drop intercept
+tibble(var = grp_names, beta = as.numeric(beta_grp),
+       group = groups) %>%
+  group_by(group) %>%
+  summarise(any_selected = any(beta != 0), n_nonzero = sum(beta != 0)) %>%
+  kable(caption = "Grouped-lasso selection by group")
+```
+
+---
+
+# Fused Lasso (Environmental Time Series Denoising)
+
+Fused lasso encourages **piecewise-constant** signals by penalizing the sum of
+absolute differences between adjacent coefficients (a total-variation penalty).
+Unlike generalized trend filtering, this is the original fused lasso estimator
+(Tibshirani et al., 2005), fit directly with `genlasso::fusedlasso1d()`. We
+denoise **daily Ozone** (public health air quality) from the `airquality`
+dataset.
+
+```{r}
+
+
+oz <- airquality %>%
+  mutate(date = as.Date(sprintf("1973-%02d-%02d", Month, Day))) %>%
+  arrange(date) %>%
+  select(date, Ozone) %>%
+  drop_na()
+
+plot(oz$date, oz$Ozone, type = "l", xlab = "Date", ylab = "Ozone (ppb)",
+     main = "Daily Ozone (New York, 1973)")
+```
+
+Fit the fused lasso path and inspect it to choose a reasonable amount of
+smoothing:
+
+```{r}
+y <- oz$Ozone
+
+# Bona fide fused lasso: penalizes sum(|beta_i - beta_{i-1}|)
+fl <- fusedlasso1d(y)
+
+plot(fl, main = "Fused lasso solution path")
+
+# Pick a moderately smooth fit along the path (adjust after visual inspection)
+lambda_choice <- fl$lambda[50]
+beta_hat <- coef(fl, lambda = lambda_choice)$beta
+```
+
+```{r}
+plot(oz$date, y, type = "l", col = "gray40",
+     xlab = "Date", ylab = "Ozone (ppb)",
+     main = "Fused Lasso Fit to Daily Ozone")
+lines(oz$date, beta_hat, col = "red", lwd = 2)
+legend("topright", legend = c("Observed", "Fused lasso fit"),
+       col = c("gray40", "red"), lty = 1, lwd = c(1, 2))
+```
+
+> **Interpretation:** the fused lasso identifies **regime shifts/plateaus** in
+ozone levels — stretches of days the model treats as a stable pollution
+level, separated by abrupt jumps. This is useful for environmental health
+monitoring and change-point detection, and unlike a moving average or spline
+smoother, it does not blur across a genuine jump in the underlying signal.
+---
+
+# Takeaways
+
+* **OLS** can be unstable with correlated predictors; bootstrap variability shows why shrinkage helps.
+* **Ridge** shrinks coefficients (lower variance), **Lasso/MCP/SCAD** add sparsity for interpretability.
+* **PLS** is strong when predictors are highly collinear and signal is low-dimensional in the latent space.
+* **Grouped lasso** encodes domain structure (e.g., demographics vs labs), selecting groups coherently.
+* **Fused lasso** is powerful for ordered structures (time, space, genomic position), producing interpretable plateaus.
+
+---
+
+```{r}
+sessionInfo()
+```

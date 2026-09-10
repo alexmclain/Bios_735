@@ -1,0 +1,547 @@
+---
+title: "02 - Data Preprocessing"
+subtitle: "Biostatistics 735 — Machine Learning in Public Health"
+author: "Alexander McLain"
+date: today
+format:
+  html:
+    toc: true
+    toc-location: left
+    toc-depth: 3
+    number-sections: true
+    smooth-scroll: true
+    theme: cosmo
+    code-fold: false
+    highlight-style: github
+    embed-resources: true
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+```{r}
+#| include: false
+library(tidyverse)
+library(janitor)
+library(naniar)
+library(rsample)
+library(this.path)
+setwd(this.dir())
+
+framingham <- read_csv("framingham.csv") |>
+  mutate(
+    male          = factor(male,          levels = c(0,1), labels = c("Female","Male")),
+    currentSmoker = factor(currentSmoker, levels = c(0,1), labels = c("Non-smoker","Smoker")),
+    prevalentHyp  = factor(prevalentHyp,  levels = c(0,1), labels = c("No","Yes")),
+    diabetes      = factor(diabetes,      levels = c(0,1), labels = c("No","Yes")),
+    TenYearCHD    = factor(TenYearCHD,    levels = c(0,1), labels = c("No","Yes")),
+    education     = factor(education,     levels = 1:4,
+                           labels = c("Some HS","HS Diploma","Some College","College Degree"))
+  )
+```
+
+# Overview
+
+Raw data is almost never ready to feed into a model. Before you fit anything —
+a linear model, a penalized regression, a tree — you need to decide how to
+handle missing values, unusual observations, imbalanced outcomes, and variables
+that are on the wrong scale or in the wrong format. These decisions are not
+optional housekeeping; they change your results, and doing them incorrectly is
+one of the most common sources of invalid machine learning results.
+
+By the end of this document you will be able to:
+
+- Diagnose and handle missing data
+- Detect and reason about outliers
+- Recognize class imbalance and know the basic strategies for addressing it
+- Engineer and encode features so they are usable by a wide range of models
+- Split data into training and test sets using the `rsample` package, and
+  explain why this has to happen before (or alongside) the steps above
+
+This document sits between **01 - Introduction to R** and **03 - Cross
+Validation**. Everything here uses tools from document 1 (`dplyr`, `ggplot2`,
+factors). The train/test split introduced at the end is the exact tool used at
+the start of document 3 — read that section carefully, because we will not
+re-explain `initial_split()` when it reappears there.
+
+---
+
+# Packages
+
+```{r}
+#| eval: false
+install.packages(c("naniar", "rsample"))
+```
+
+| Package | Purpose |
+|---|---|
+| `naniar` | Summarizing and visualizing missing data |
+| `rsample` | Creating train/test splits and (later) cross-validation folds |
+
+We continue to use the cleaned `framingham` data frame from document 1
+(binary/categorical variables already converted to factors).
+
+---
+
+# Why Preprocessing Matters
+
+Classical statistical models (like `lm()`) are often forgiving: they will run
+with missing data silently dropped, with outliers pulling a coefficient, with
+a rare outcome class, and give you an answer — just possibly a misleading one.
+Many machine learning methods are less forgiving in a different way: some
+simply **fail** on missing data (`glmnet`, most tree ensembles via certain
+implementations), some are **sensitive to scale** (penalized regression,
+k-nearest neighbors, neural networks), and some are **sensitive to class
+imbalance** in ways that are easy to miss (a model can achieve 98% accuracy by
+always predicting "no disease" if disease is rare).
+
+::: {.callout-important}
+Preprocessing decisions should be made **before** you look at how they affect
+model performance on your test set. Deciding how to impute missing data, or
+which outliers to remove, based on what improves your test-set score is itself
+a form of data leakage — a topic covered in depth in document 3.
+:::
+
+---
+
+# Missing Data
+
+## Diagnosing Missingness
+
+Start by quantifying how much is missing, and where.
+
+```{r}
+framingham |>
+  summarize(across(everything(), ~ mean(is.na(.)) * 100)) |>
+  pivot_longer(everything(), names_to = "variable", values_to = "pct_missing") |>
+  filter(pct_missing > 0) |>
+  arrange(desc(pct_missing))
+```
+
+`naniar` gives a quick visual of the same information:
+
+```{r}
+gg_miss_var(framingham, show_pct = TRUE)
+```
+
+## Missingness Mechanisms (Briefly)
+
+You do not need the full technical machinery to make reasonable decisions, but
+it helps to know the vocabulary:
+
+| Mechanism | Meaning | Example |
+|---|---|---|
+| **MCAR** — Missing Completely at Random | Missingness is unrelated to any variable, observed or not | A lab sample is dropped due to a shipping error |
+| **MAR** — Missing at Random | Missingness depends on *observed* variables | Older participants are less likely to complete a cognitive test |
+| **MNAR** — Missing Not at Random | Missingness depends on the *unobserved* value itself | Participants with very high blood pressure skip the BP reading |
+
+::: {.callout-note}
+Most simple imputation methods (mean/median imputation, complete-case
+analysis) assume something close to MCAR. If missingness looks related to
+other variables in your data (check this with `naniar::gg_miss_fct()` or by
+comparing summary statistics between complete and incomplete cases), simple
+methods can introduce bias. This course does not require formal MAR/MNAR
+modeling — just be aware of the assumption you are making.
+:::
+
+## Handling Missing Data
+
+**Option 1: Complete-case analysis (listwise deletion).** Drop any row with a
+missing value in a variable you plan to use.
+
+```{r}
+framingham_cc <- framingham |>
+  drop_na(totChol, BMI, heartRate, glucose)
+
+nrow(framingham); nrow(framingham_cc)
+```
+
+This is simple and always valid under MCAR, but it throws away data — often a
+lot of it, if missingness is spread across many variables — and can bias
+results if missingness is not MCAR.
+
+**Option 2: Simple imputation.** Replace missing values with a summary
+statistic, most commonly the mean or median for numeric variables and the mode
+for categorical variables.
+
+```{r}
+framingham_imp <- framingham |>
+  mutate(
+    glucose  = if_else(is.na(glucose),  median(glucose,  na.rm = TRUE), glucose),
+    heartRate = if_else(is.na(heartRate), median(heartRate, na.rm = TRUE), heartRate)
+  )
+```
+
+::: {.callout-important}
+**The mean/median you impute with must come from the training data only.**
+If you compute it on the full dataset (train + test) before splitting, or on
+the test set itself, information from the test set leaks into your training
+process. The correct order is: split first, then compute imputation values on
+`train`, then apply those same values to both `train` and `test`. We will
+split the data at the end of this document, and document 3 shows exactly this
+pattern for centering and scaling.
+:::
+
+**Option 3: Model-based imputation.** Methods like k-nearest-neighbor
+imputation or multiple imputation (`mice`, `VIM` packages) predict each
+missing value from other variables rather than using a single summary
+statistic. These are more accurate but add complexity and are beyond the scope
+of this course; mean/median imputation or complete-case analysis will be
+sufficient for our homework and projects unless stated otherwise.
+
+---
+
+# Outliers
+
+## Detecting Outliers
+
+Two common rules of thumb for a single numeric variable:
+
+- **IQR rule:** flag values below $Q_1 - 1.5 \times \text{IQR}$ or above
+  $Q_3 + 1.5 \times \text{IQR}$ (this is what `geom_boxplot()` flags as points).
+- **Z-score rule:** flag values more than 3 (or so) standard deviations from
+  the mean.
+
+```{r}
+ggplot(framingham, aes(y = totChol)) +
+  geom_boxplot(fill = "steelblue", alpha = 0.7) +
+  labs(y = "Total Cholesterol (mg/dL)",
+       title = "Boxplot Flags Extreme Total Cholesterol Values")
+```
+
+```{r}
+framingham |>
+  mutate(
+    q1 = quantile(totChol, 0.25, na.rm = TRUE),
+    q3 = quantile(totChol, 0.75, na.rm = TRUE),
+    iqr = q3 - q1,
+    outlier_iqr = totChol < (q1 - 1.5 * iqr) | totChol > (q3 + 1.5 * iqr)
+  ) |>
+  count(outlier_iqr)
+```
+
+## Deciding What to Do
+
+Flagging an outlier is not the same as knowing what to do with it. Ask:
+
+- **Is it a data-entry error?** (e.g., height of 7 feet, age of 200) — fix or
+  remove it.
+- **Is it a real, extreme observation?** (e.g., a genuinely very high
+  cholesterol reading) — this may be exactly the kind of patient your model
+  needs to learn about. Removing it can hurt generalizability.
+- **Is it distorting a distance- or scale-sensitive model** (k-NN, penalized
+  regression, neural networks) without being an error? Consider a
+  transformation (e.g., `log()`) or **winsorizing** (capping extreme values at
+  a percentile) rather than deleting the observation.
+
+```{r}
+framingham |>
+  mutate(
+    totChol_capped = pmin(pmax(totChol, quantile(totChol, 0.01, na.rm = TRUE)),
+                                quantile(totChol, 0.99, na.rm = TRUE))
+  ) |>
+  select(totChol, totChol_capped) |>
+  summary()
+```
+
+::: {.callout-tip}
+As with missing data, if you cap or remove outliers using percentiles
+computed on the full dataset, you again risk leaking test information into
+your training process. Compute the thresholds on `train` only.
+:::
+
+---
+
+# Class Imbalance
+
+`TenYearCHD` — whether a participant developed coronary heart disease within
+10 years — is the outcome we will use in several classification examples this
+semester. It is **imbalanced**: most participants did not develop CHD.
+
+```{r}
+framingham |>
+  count(TenYearCHD) |>
+  mutate(pct = n / sum(n) * 100)
+```
+
+## Why This Is a Problem
+
+A classifier that always predicts "No" will be correct roughly 85% of the
+time on this data — a high accuracy that tells you nothing useful. Imbalance
+affects both **model fitting** (many algorithms implicitly optimize overall
+accuracy and will lean toward the majority class) and **model evaluation**
+(accuracy is the wrong metric to trust; sensitivity, specificity, and
+precision-recall become important — covered later in the course).
+
+## Basic Strategies
+
+**Downsampling** the majority class:
+
+```{r}
+set.seed(1)
+min_n <- framingham |> count(TenYearCHD) |> pull(n) |> min()
+
+framingham_down <- framingham |>
+  group_by(TenYearCHD) |>
+  slice_sample(n = min_n) |>
+  ungroup()
+
+framingham_down |> count(TenYearCHD)
+```
+
+**Upsampling** the minority class (sampling with replacement):
+
+```{r}
+set.seed(1)
+max_n <- framingham |> count(TenYearCHD) |> pull(n) |> max()
+
+framingham_up <- framingham |>
+  group_by(TenYearCHD) |>
+  slice_sample(n = max_n, replace = TRUE) |>
+  ungroup()
+
+framingham_up |> count(TenYearCHD)
+```
+
+More sophisticated approaches (e.g., SMOTE, which generates synthetic
+minority-class observations rather than duplicating real ones) are available
+through packages like `themis`, but are not required for this course.
+
+::: {.callout-important}
+**Resampling for class balance is fit-time-only and train-only.** Never
+downsample or upsample your test set — you want the test set to reflect the
+real-world class distribution you will actually be predicting on. Balancing
+happens on the training data, after the split, exactly like imputation and
+outlier handling above.
+:::
+
+---
+
+# Feature Engineering
+
+## Transformations
+
+Right-skewed variables (common in lab measurements, income, counts) often
+benefit from a log transformation, especially for models sensitive to scale
+and linearity.
+
+```{r}
+ggplot(framingham, aes(x = glucose)) +
+  geom_histogram(bins = 40, fill = "steelblue", color = "white") +
+  labs(title = "Glucose: Right-Skewed")
+
+framingham |>
+  mutate(log_glucose = log(glucose)) |>
+  ggplot(aes(x = log_glucose)) +
+  geom_histogram(bins = 40, fill = "steelblue", color = "white") +
+  labs(title = "log(Glucose): More Symmetric")
+```
+
+## Centering and Scaling
+
+Penalized regression, k-NN, and neural networks are sensitive to the *scale*
+of predictors — a variable measured in the thousands will dominate a variable
+measured in single digits, independent of its actual importance. Standardizing
+(subtract the mean, divide by the standard deviation) puts variables on a
+common scale.
+
+```{r}
+#| eval: false
+framingham |>
+  mutate(sysBP_z = as.numeric(scale(sysBP)))
+```
+
+::: {.callout-important}
+Exactly like imputation: compute the mean and SD **on the training set**, and
+apply those same values to both training and test data. Document 3 walks
+through a full worked example of this — including what goes wrong when you
+scale train and test independently — in its "Data Leakage" section.
+:::
+
+## Encoding Categorical Variables
+
+`lm()` and similar formula-based functions handle factors automatically. Many
+machine learning functions (`glmnet`, `xgboost`, k-NN implementations) instead
+require a numeric matrix, so categorical variables need to be converted to
+**dummy (one-hot) variables** first.
+
+```{r}
+model.matrix(~ education - 1, data = framingham) |> head()
+```
+
+Each level of `education` becomes its own 0/1 column. The `- 1` removes the
+intercept column so that all levels are shown; when a model needs a reference
+level instead (as `lm()` does automatically), drop one column.
+
+Compare this to:
+
+```{r}
+model.matrix(~ education, data = framingham) |> head()
+```
+
+---
+
+# Splitting Data: Training and Test Sets
+
+Every preprocessing decision above — which imputation value to use, which
+outlier thresholds to apply, how to balance classes, how to center and scale —
+must be based on the **training data only**, then applied unchanged to the
+**test data**. That guarantees the test set behaves like genuinely new,
+unseen data, which is the entire point of having it.
+
+This means the split has to happen early — conceptually, right after you've
+decided what your outcome and candidate predictors are, and before you finalize
+any of the steps above.
+
+## The `rsample` Package
+
+`rsample` (part of the `tidymodels` ecosystem) creates reproducible train/test
+splits.
+
+```{r}
+set.seed(42)
+split <- initial_split(framingham, prop = 0.6, strata = NULL)
+train <- training(split)
+test  <- testing(split)
+
+dim(train); dim(test)
+```
+
+- `initial_split()` creates a **split object** that records which rows belong
+  to training vs. test — it does not create two new data frames by itself.
+- `prop = 0.6` means 60% of rows go to training, 40% to test. (Common choices
+  range from 0.6–0.8 for training, depending on how much data you have.)
+- `training(split)` and `testing(split)` extract the actual data frames.
+- Setting `set.seed()` before splitting makes the split reproducible — you and
+  a classmate running the same code will get the same rows in `train`.
+
+::: {.callout-note}
+This is exactly the code you will see reused at the start of document 3, where
+`dat` replaces `framingham` as the data frame being split. Nothing new happens
+there — if the code above makes sense, so will that.
+:::
+
+## The `strata` Argument
+
+`initial_split()` has a `strata` argument, left as `NULL` above. When you
+supply a variable to `strata`, the split preserves that variable's
+distribution across both the training and test sets — the same logic as
+stratified sampling anywhere else in statistics.
+
+This matters most for **imbalanced outcomes**. Compare an unstratified split...
+
+```{r}
+set.seed(42)
+split_plain <- initial_split(framingham, prop = 0.6, strata = NULL)
+training(split_plain) |> count(TenYearCHD) |> mutate(pct = n / sum(n) * 100)
+testing(split_plain)  |> count(TenYearCHD) |> mutate(pct = n / sum(n) * 100)
+```
+
+...to a stratified one:
+
+```{r}
+set.seed(42)
+split_strat <- initial_split(framingham, prop = 0.6, strata = TenYearCHD)
+training(split_strat) |> count(TenYearCHD) |> mutate(pct = n / sum(n) * 100)
+testing(split_strat)  |> count(TenYearCHD) |> mutate(pct = n / sum(n) * 100)
+```
+
+With a rare outcome and a modest sample size, an unstratified split can, by
+chance, leave the test set with a noticeably different event rate than the
+training set. Stratifying removes that source of noise.
+
+::: {.callout-tip}
+Default to `strata = <your outcome variable>` for classification problems,
+especially with class imbalance. For regression, `rsample` also accepts a
+continuous variable for `strata` (it bins it internally) — document 3
+introduces this in its cross-validation section.
+:::
+
+## Centering and Scaling Split Data
+
+When centering and scaling training and test data, the most natural way to do it may seem like it is:
+
+```{r}
+vars_to_scale <- c("age", "sysBP", "totChol", "BMI", "heartRate", "glucose")
+
+train_scaled <- scale(train[vars_to_scale]) 
+test_scaled  <- scale(test[vars_to_scale]) 
+
+summary(train_scaled)
+summary(test_scaled)
+```
+
+**DO NOT DO THIS!!**
+
+Centering and scaling your data based on the training data is important. Why? Consider a situation where you only had one covariate (say `age`) and the test data only had one subject. If you centered the test data individually, the mean would be the subjects value. So, they would have `age_z=0` no matter what. **Always center and scale based on the training data.**
+
+Here's how we can do this:
+
+```{r}
+## Center and scale numeric predictors: fit on train, apply to test
+
+vars_to_scale <- c("age", "sysBP", "totChol", "BMI", "heartRate", "glucose")
+
+scaled_train <- scale(train[vars_to_scale]) # computes mean/SD from train
+
+str(scaled_train)
+
+# Extract the mean and sd from the scaled_train
+mu <- attr(scaled_train, "scaled:center")
+sdv <- attr(scaled_train, "scaled:scale")
+
+train_scaled <- train
+test_scaled  <- test
+train_scaled[vars_to_scale] <- scaled_train
+test_scaled[vars_to_scale]  <- scale(test[vars_to_scale], center = mu, scale = sdv)
+
+summary(train_scaled[vars_to_scale])
+summary(test_scaled[vars_to_scale])
+```
+
+
+
+The test data does not exactly have mean zero and that is okay. It shouldn't. The test data is supposed to represent what we could see in practice, and it will not exactly match the training data.
+
+## What Comes Next
+
+Once `train` and `test` exist, every step from this document gets applied in
+order: diagnose and handle missingness, check outliers, address imbalance,
+engineer and encode features, and center/scale — fit on `train`, applied to
+both. Document 3 extends this same idea one level further, splitting `train`
+itself repeatedly via cross-validation (`vfold_cv()`) to tune models honestly
+without ever touching `test` until the very end.
+
+---
+
+# Preprocessing Checklist
+
+1. Split into training and test sets (`strata` on the outcome if imbalanced).
+2. Diagnose missingness in the training set; choose complete-case analysis or
+   an imputation strategy and compute any imputation values from `train` only.
+3. Check for outliers; decide fix, cap, transform, or leave, based on domain
+   knowledge, not on what improves test performance.
+4. Check for class imbalance in the outcome; decide whether to up/downsample
+   `train` (never `test`).
+5. Engineer features: transformations, interactions, encoding categorical
+   variables as needed for the model you plan to use.
+6. Center/scale numeric predictors if using a scale-sensitive model, fit on
+   `train`, applied to `test`.
+7. Apply every choice from steps 2–6 to `test` using values learned from
+   `train` — never recompute them on `test`.
+
+---
+
+# Summary
+
+- Missing data, outliers, and class imbalance are the norm in public health
+  data, not the exception — diagnose before deciding how to handle them.
+- Every preprocessing choice that involves estimating something from data
+  (an imputation value, an outlier threshold, a centering/scaling parameter)
+  must be estimated on the training set only.
+- `rsample::initial_split()`, `training()`, and `testing()` create the
+  train/test split that makes this possible, and `strata` protects you from
+  an unlucky split when the outcome is imbalanced.
+- This train/test split is the first line of code in document 3 — everything
+  from here forward assumes you know what it does.

@@ -1,0 +1,310 @@
+---
+title: "06 - Splines and Smoothing"
+subtitle: "Biostatistics 735 — Machine Learning in Public Health"
+author: "Alexander McLain"
+date: today
+format:
+  html:
+    toc: true
+    toc-location: left
+    toc-depth: 3
+    number-sections: true
+    smooth-scroll: true
+    theme: cosmo
+    code-fold: false
+    highlight-style: github
+    embed-resources: true
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+```{r}
+#| include: false
+set.seed(735794)
+library(tidyverse)
+library(car)      # crPlots()
+library(mgcv)     # gam(), s()
+library(refund)   # functional regression, DTI data
+```
+
+# Overview
+
+Splines and GAMs show up in this course in two practical situations, and we
+will take each in turn:
+
+1. **Checking the functional form of a predictor.** You already have a
+   regression model with ordinary scalar predictors (age, BMI, blood
+   pressure...). The question is whether each predictor should enter linearly,
+   or whether the relationship is curved enough that a linear term is
+   misspecifying the model.
+2. **A predictor that is genuinely a curve, not a number.** Sometimes a single
+   observation's "predictor" is an entire function — a growth curve, a
+   biomarker trajectory, an imaging tract profile — measured at many points.
+   This is not a functional-form question; the covariate itself is functional.
+
+Both situations are handled with `mgcv::gam()` and its `s()` smooth-term
+syntax. We will not construct spline basis matrices by hand — `gam()` does
+that internally, chooses the smoothing parameter for you (via REML/ML), and
+gives you confidence bands and significance tests directly.
+
+---
+
+# Checking Functional Form in a Linear Model
+
+We use the body fat data, predicting `bodyfat` from `abdomen`, `height`, and
+`age`.
+
+```{r}
+bf_df <- read_csv("bodyfat2.csv") |>
+  select(bodyfat, abdomen, height, age)
+
+head(bf_df)
+```
+
+This is the standard exploratory workflow for deciding whether a predictor
+needs anything beyond a linear term: start with marginal plots, move to
+partial-residual plots once other covariates are in the model, then let a GAM
+tell you directly whether curvature is actually needed.
+
+## Step 1: Marginal Scatterplots
+
+```{r}
+bf_df |>
+  pivot_longer(c(abdomen, height, age), names_to = "predictor", values_to = "x") |>
+  ggplot(aes(x, bodyfat)) +
+  geom_point(alpha = 0.4) +
+  geom_smooth(se = FALSE, color = "firebrick") +
+  facet_wrap(~ predictor, scales = "free_x") +
+  theme_minimal(base_size = 13) +
+  labs(x = NULL, y = "Body Fat (%)",
+       title = "Marginal Relationship Between Each Predictor and Body Fat")
+```
+
+::: {.callout-important}
+A scatterplot like this shows the **marginal** relationship between one
+predictor and the outcome — it ignores every other variable in the model.
+Curvature (or the lack of it) here is a starting point, not a final answer:
+once `abdomen`, `height`, and `age` are all in the same model together, the
+apparent shape for any one of them can change.
+:::
+
+## Step 2: Partial-Residual Plots (`car::crPlots`)
+
+Fit the ordinary linear model first, with every predictor entered linearly:
+
+```{r}
+lm_fit <- lm(bodyfat ~ abdomen + height + age, data = bf_df)
+summary(lm_fit)
+```
+
+`car::crPlots()` gives **component-plus-residual (partial-residual) plots** —
+for each predictor, the relationship with the outcome *after adjusting for*
+the other predictors in the model. This is the same tool we used earlier in
+the course for checking linearity assumptions.
+
+```{r}
+crPlots(lm_fit)
+```
+
+Each panel shows a dashed line (the fitted linear term) against a solid loess
+line (a smooth fit to the partial residuals). When the two lines track closely,
+a linear term is reasonable. When the loess line bows away from the dashed
+line, that predictor's relationship with the outcome is probably not linear —
+`abdomen` is the one to watch here.
+
+## Step 3: Let `gam()` Decide
+
+Rather than eyeballing the crPlots, fit a GAM with a smooth term for each
+predictor and let `mgcv` estimate how much curvature the data actually
+support.
+
+```{r}
+gam_fit <- gam(bodyfat ~ s(abdomen) + s(height) + s(age),
+               data = bf_df, method = "REML")
+summary(gam_fit)
+```
+
+Two things to read from the summary table:
+
+- **`edf`** (effective degrees of freedom): `edf ≈ 1` means the smooth term
+  has effectively collapsed to a straight line — no evidence of curvature.
+  `edf` noticeably above 1 means the model is using real curvature to fit
+  that predictor.
+- **The p-value** for each smooth term tests whether that term contributes
+  anything beyond a flat/no effect — not specifically whether it's nonlinear.
+
+```{r}
+plot(gam_fit, pages = 1, shade = TRUE, residuals = TRUE, pch = 1, cex = 0.5)
+```
+
+These plots are the GAM analogue of the crPlots above: partial effect of each
+predictor (adjusted for the others) with a confidence band and the partial
+residuals overlaid.
+
+## Step 4: Linear vs. Smooth — a Direct Comparison
+
+To formally check whether the smooth terms are earning their keep, compare a
+fully linear model to the GAM (both fit with `method = "ML"` so the
+comparison is valid):
+
+```{r}
+lm_ml   <- gam(bodyfat ~ abdomen + height + age, data = bf_df, method = "ML")
+gam_ml  <- gam(bodyfat ~ s(abdomen) + s(height) + s(age), data = bf_df, method = "ML")
+
+anova(lm_ml, gam_ml, test = "F")
+```
+
+::: {.callout-tip}
+**Practical takeaway.** If `edf` is close to 1 for a predictor and the
+linear-vs-smooth comparison doesn't favor the GAM, drop the smooth and use the
+plain linear term — it's simpler and just as good. Reserve `s()` for the
+predictors that actually show curvature, like `abdomen` here. You do not need
+to smooth every predictor just because you smoothed one.
+:::
+
+---
+
+
+
+# A Genuinely Functional Covariate
+
+The example above still has ordinary, scalar predictors — the only question
+was the *shape* of their effect. Here the predictor itself is a curve: at each
+observation, we don't observe a single abdomen measurement, we observe an
+entire profile measured across many positions.
+
+We'll use a Diffusion Tensor Imaging (DTI) dataset from the `refund` package: diffusion tensor
+imaging data from a study of multiple sclerosis. For each subject/visit, we
+have **fractional anisotropy (FA),** FA is a number from 0 to 1 that measures how much water molecules move in a specific direction versus all directions. 
+
+- *High FA (closer to 1):* Shows healthy, dense, and well-organized white matter tracks.
+- *Low FA (closer to 0):* Shows damaged, less dense, or disorganized fibers, often caused by aging, injury, or diseases like multiple sclerosis and depression. 
+
+Here, we have FA measured at 93 positions along the corpus callosum — a white-matter tract profile — along with a cognitive processing
+score, `pasat` (Paced Auditory Serial Addition Test).
+
+```{r}
+data(DTI)
+str(DTI)
+```
+
+`DTI$cca` is a matrix: one row per observation, one column per tract position.
+That whole row — not any single number from it — is the predictor.
+
+```{r}
+dti0 <- DTI |>
+  filter(visit == 1, !is.na(pasat), rowSums(is.na(cca)) == 0)
+
+matplot(t(dti0$cca), type = "l", lty = 1,
+        col = adjustcolor("steelblue", alpha.f = 0.3),
+        xlab = "Position along corpus callosum tract",
+        ylab = "Fractional anisotropy",
+        main = "CCA Tract Profiles — One Curve per Subject")
+```
+
+## Scalar-on-Function Regression
+
+We want to relate this curve to a scalar outcome (`pasat`). This is
+**scalar-on-function regression**, fit here with `refund::pfr()`, which
+extends the same `gam()` machinery to functional predictors via the `lf()`
+("linear functional") term.
+
+```{r}
+fit_func <- pfr(pasat ~ lf(cca), data = dti0)
+summary(fit_func)
+```
+
+```{r}
+plot(fit_func, shade = TRUE,
+     xlab = "Position along tract",
+     ylab = expression(beta(t)),
+     main = "Estimated Coefficient Function")
+abline(h = 0, col = "red", lty = 2)
+```
+
+::: {.callout-important}
+The plot above is not a partial-effect curve for one predictor among several
+— it **is** the model's entire estimated relationship between the tract
+profile and PASAT score. $\hat\beta(t)$ tells you, at each position $t$ along
+the tract, how strongly FA at that position is associated with the outcome.
+Where the confidence band excludes zero, that region of the tract is driving
+the association; where it doesn't, that region isn't contributing much.
+:::
+
+This is a fundamentally different use of smoothing than Part 1: there, `s()`
+let us relax a linearity assumption on an otherwise ordinary predictor. Here,
+smoothness is doing double duty — it is how we represent a predictor that has
+no natural "linear" form to begin with, since there is no single number to
+enter into a regression.
+
+::: {.callout-note}
+**Connection to the fused lasso.** The scalar-on-function regression above
+estimates $\hat\beta(t)$ by imposing a *smoothness* penalty (roughness of the
+coefficient curve, via the spline basis in `pfr()`). The fused lasso example
+from the penalized-regression material imposes a different kind of structure:
+instead of penalizing curvature, it penalizes $\sum_t |\beta_t - \beta_{t-1}|$,
+which encourages $\hat\beta(t)$ to be **piecewise constant** rather than
+smoothly varying.
+
+Both are reasonable choices for a coefficient that's indexed by an ordered
+position (here, location along the tract) rather than a arbitrary variable:
+
+| | Smoothing spline / GAM (`pfr`) | Fused lasso |
+|---|---|---|
+| Assumes | $\beta(t)$ varies smoothly | $\beta(t)$ is flat within regions, with abrupt jumps between them |
+| Penalty | On curvature (2nd derivative) | On adjacent differences ($\ell_1$) |
+| Estimated shape | Smooth curve | Step function / plateaus |
+| Best suited to | Gradual biological gradients | Genuine regime changes — e.g., a tract segment that matters and a neighboring segment that doesn't |
+| Coefficients can be exactly zero? | Only approximately, over a whole smooth region | Yes — the $\ell_1$ penalty can zero out entire flat segments |
+
+For the DTI tract data, a smooth $\hat\beta(t)$ is the more natural
+assumption — anatomy doesn't usually have sharp discontinuities. But if you
+believed only a specific, contiguous stretch of the tract mattered and the
+rest was truly irrelevant, a fused lasso on $\beta(t)$ (fusing adjacent
+positions, with an $\ell_1$ penalty that can drive whole segments to exactly
+zero) would recover that block structure more directly than a smoother would.
+:::
+
+---
+
+
+# Using two-dimensional tensor regression
+
+We'll now look at an example which fits a multidimensional smoothing spline using _tensor product basis_.  This action will be performed using the \texttt{mgcv} package we discussed in the last example.  
+
+```{r printr.help.sections=c('description', 'usage', 'arguments','details')}
+#| comment: ''
+#| tidy: false
+#| error: false
+
+#Fit an ANOVA type tensor product interaction
+b2 <- gam(bodyfat~ ti(abdomen) + ti(height) + ti(abdomen,height),
+          data=bf_df, 
+          method = "REML")
+summary(b2)
+#Estimated smoothing parameters for the model.
+b2$sp
+
+#Plot the results.
+vis.gam(b2, theta = 50);title("tensor anova")
+```
+
+
+---
+
+# Summary
+
+- Use marginal scatterplots for a first look, but remember they ignore every
+  other covariate in the model.
+- `car::crPlots()` gives the partial-residual view once other predictors are
+  accounted for — the tool we've already been using for linearity checks.
+- `mgcv::gam()` with `s()` terms lets the data decide how much curvature is
+  needed; check `edf` and compare linear vs. smooth models with `anova()`
+  rather than smoothing every predictor by default.
+- When the predictor itself is a curve (a tract profile, a growth trajectory,
+  a biomarker measured densely over time), that's a different problem —
+  scalar-on-function regression (`refund::pfr()` with `lf()`) — not a
+  functional-form question about a scalar predictor.
+- There's nothing written in the sky saying that the relationship between variables and outcomes will be simple. There can be two- and even three-way non-linear interactions. 

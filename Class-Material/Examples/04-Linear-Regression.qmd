@@ -1,0 +1,770 @@
+---
+title: "04 - CV and Linear Regression"
+subtitle: "Biostatistics 735 — Machine Learning in Public Health (R)"
+author: "Alexander McLain"
+date: today
+format:
+  html:
+    toc: true
+    toc-location: left
+    toc-depth: 3
+    number-sections: true
+    smooth-scroll: true
+    theme: cosmo
+    code-fold: false
+    highlight-style: github
+    embed-resources: true
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+```{css, echo=FALSE}
+table, th, td {
+  padding: 6px 15px;   /* applies only for HTML output */
+}
+```
+
+```{r}
+#| include: false
+set.seed(735794)
+```
+
+**Loading in packages**
+
+```{r}
+library(tidyverse)
+library(printr)
+library(knitr)
+library(kableExtra)
+library(tibble)
+
+# modeling & selection
+library(leaps)
+library(MASS)
+library(lars)
+library(rsample)     # vfold_cv, analysis()/assessment()
+library(yardstick)   # rmse
+
+# diagnostics
+library(broom)     # augment for residuals, leverage, cooks distance
+library(lmtest)    # bptest for heteroscedasticity
+library(car)       # vif, component+residual plots
+
+# have R use the select function from dplyr by default
+# otherwise it could use the select function from MASS
+select <- dplyr::select 
+```
+
+**Reading in the Data**
+
+This example uses the **body fat** data from the textbook. Here's a link to some info about it [here](https://rstudio-pubs-static.s3.amazonaws.com/65314_c0d1e5696cdd4e93a3784ea67f9e3d34.html).  We’ll import and briefly inspect. 
+
+```{r}
+bf_dat <- read.csv("bodyfat2.csv")
+bf_df  <- as.data.frame(bf_dat)
+
+head(bf_df)
+
+bf_df <- bf_df[ , -1]   # remove density since it is equivalent to bodyfat
+glimpse(bf_df)
+```
+
+
+---
+
+# CV Supplement
+
+Cross-validation is a way to estimate how well a model is likely to perform on new data. The key point is that the role of cross-validation depends on what we are trying to do.
+
+- For a **single pre-specified model**, cross-validation can be used to estimate prediction error.
+- For **multiple candidate models**, cross-validation can be used to select the model with the best estimated performance.
+- If we use cross-validation to select among multiple models, the resulting CV error is optimistic as an estimate of the final selected model's performance. However, the error of the final selected model's performance is **often** reported in practice.
+
+To both **select the best model** and **estimate its prediction error**, we need a separate layer of evaluation. Two common approaches are:
+
+1. Use **nested cross-validation**, where the inner loop selects the model and the outer loop estimates prediction error.
+2. Use **cross-validation for model selection** and then evaluate the final selected model on a held-out **test dataset**.
+
+```{r}
+#| include: false
+cv_summary <- tribble(
+  ~Goal, ~Approach, ~Interpretation,
+  "Estimate error for one pre-specified model",
+  "Cross-validation",
+  "CV error estimates the prediction error for that model",
+
+  "Select among multiple candidate models",
+  "Cross-validation",
+  "CV can identify the model with the best estimated performance",
+
+  "Select a model and estimate final prediction error",
+  "Nested CV or CV + held-out test set",
+  "A separate evaluation step is needed to avoid overly optimistic error estimates"
+)
+
+cv_summary
+```
+
+
+For illustration, everything below we’ll use the following **single linear model**:
+
+$$
+\text{bodyfat} \sim \text{weight} + \text{abdomen} +  \text{forearm} + \text{wrist}
+$$
+
+
+## Stratified K-fold Cross-Validation
+
+The following example shows: 
+
+(1) standard K-fold CV, 
+(2) **stratified** K-fold CV for a **continuous** outcome by binning `bodyfat` into quantiles, and 
+(3) compares fold balance and RMSE. 
+
+
+```{r}
+form <- bodyfat ~ weight + abdomen + forearm + wrist
+```
+
+Here, our goal will be to use CV to estimate the prediction error of this model. Since we're not comparing multiple models, the CV estimate of error is not biased.
+
+
+### Standard vs. Stratified K-fold CV
+
+For **classification**, stratification preserves class proportions per fold.
+
+For a **continuous** outcome, a common approach is to **bin** the outcome (e.g., quintiles) and stratify on those bins so each fold covers the full outcome range.
+
+### Create stratification bins (quintiles of bodyfat)
+
+```{r}
+bf <- bf_df |>
+  mutate(bodyfat_q = ntile(bodyfat, 5) |> factor())  # 5 strata by outcome level
+count(bf, bodyfat_q)
+```
+
+### Make folds
+
+```{r}
+K <- 20
+
+# (A) Standard K-fold (no stratification)
+folds_std <- vfold_cv(bf, v = K)
+
+# (B) Stratified K-fold (by bodyfat quintile)
+folds_strat <- vfold_cv(bf, v = K, strata = bodyfat_q)
+```
+
+### Check outcome balance by fold
+
+```{r}
+fold_summ <- function(folds, label){
+  map_dfr(seq_len(nrow(folds)), function(i){
+    va <- assessment(folds$splits[[i]])
+    tibble(
+      scheme = label,
+      fold   = i,
+      n      = nrow(va),
+      mean_bodyfat = mean(va$bodyfat),
+      sd_bodyfat   = sd(va$bodyfat)
+    )
+  })
+}
+
+bal_std   <- fold_summ(folds_std,  "Standard")
+bal_strat <- fold_summ(folds_strat,"Stratified")
+
+bind_rows(bal_std, bal_strat) |>
+  pivot_longer(cols = c(mean_bodyfat, sd_bodyfat),
+               names_to = "stat", values_to = "value") |>
+  ggplot(aes(x = fold, y = value, group = scheme, color = scheme)) +
+  geom_line() + geom_point() +
+  facet_wrap(~ stat, scales = "free_y") +
+  labs(title = "Outcome balance (mean & SD of bodyfat) across validation folds",
+       x = "Fold", y = NULL) +
+  theme_minimal(base_size = 13)
+```
+
+> Expect the **stratified** scheme to show more uniform `mean_bodyfat` and `sd_bodyfat` across folds.
+
+### CV Workflow & RMSE Comparison
+
+We’ll compute RMSE per validation fold and aggregate.
+
+```{r}
+rmse <- function(folds, formula){
+  map_dfr(seq_len(nrow(folds)), function(i){
+    sp <- folds$splits[[i]]
+    tr <- analysis(sp); va <- assessment(sp)
+
+    fit <- lm(formula, data = tr)
+    pred <- predict(fit, newdata = va)
+    tibble(fold = i, observed = va$bodyfat, predicted = pred)
+  }) 
+}
+
+res_std   <- rmse(folds_std,   form) |> mutate(scheme = "Standard")
+res_strat <- rmse(folds_strat, form) |> mutate(scheme = "Stratified")
+
+res <- bind_rows(res_std, res_strat)
+head(res)
+```
+
+First we'll look at a calibration plot. This will bin the predictions into 10 groups and then calculate the average observed and predicted value in each group. If the model is appropriately calibrated, these values will fall close to the `x=y` line.
+
+```{r}
+calibration_df <- res |>
+  mutate(
+    pred_centile = ntile(predicted, 10)
+  ) |>
+  group_by(scheme, pred_centile) |>
+  summarise(
+    mean_predicted = mean(predicted, na.rm = TRUE),
+    mean_observed  = mean(observed, na.rm = TRUE),
+    n = n(),
+    .groups = "drop"
+  )
+
+ggplot(calibration_df, aes(x = mean_predicted, y = mean_observed, color = scheme)) +
+  geom_point(alpha = 0.8) +
+  geom_line(alpha = 0.6) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  labs(
+    title = "Calibration Plot by Predicted-Value Centile",
+    x = "Average predicted bodyfat",
+    y = "Average observed bodyfat"
+  ) +
+  coord_equal() +
+  theme_minimal(base_size = 13)
+```
+
+
+Now, let's calculate some per-fold metrics:
+
+```{r}
+rmse_by_fold <- res |> 
+  group_by(scheme, fold) |> 
+  summarise(
+    # Calculate the rmse for each scheme by fold number
+    rmse = rmse_vec(observed, predicted), 
+    .groups = "drop"
+  ) 
+
+rmse_by_fold |> 
+  group_by(scheme) |> 
+  summarise(
+    # Calculate the mean and sd of the rmse over folds by scheme
+    mean_RMSE = mean(rmse), 
+    sd_RMSE = sd(rmse), 
+    .groups = "drop") |> 
+  dplyr::select(scheme, mean_RMSE, sd_RMSE)  |> 
+  kable(digits = 3, caption = "CV RMSE: Standard vs Stratified folds") |>
+  kable_styling(full_width = FALSE)
+```
+
+To see per-fold variability:
+
+```{r}
+ggplot(data = rmse_by_fold, aes(x = factor(fold), y = rmse, color = scheme, group = scheme)) +
+  geom_point(position = position_dodge(width = 0.3), size = 2.4) +
+  geom_line(position = position_dodge(width = 0.3)) +
+  labs(title = "Per-fold RMSE by scheme",
+       x = "Fold", y = "RMSE") +
+  theme_minimal(base_size = 13)
+```
+
+### Notes
+
+* For **continuous** outcomes, “stratified CV” means **binning** the outcome and stratifying on those bins. Here we used **quintiles** via `ntile()`. You can try deciles for larger datasets.
+* Stratification tends to **stabilize** fold performance estimates by ensuring each fold contains a comparable range of the outcome.
+* Keep **data leakage** in mind: any preprocessing that uses the outcome (e.g., supervised feature selection, target encoding) must be done **inside** each resample split.
+
+---
+
+## Group-wise Cross-Validation Error
+
+Sometimes we want to make sure the error is relatively consistent accross groups, e.g., age groups, sex, or race/ethnicity. Here, we'll re-estimate the CV error, but we'll do it separately by a categorical error. Since there are no categorical variables, we’ll create **abdomen quartiles** for group-wise evaluation. Our goal would be to ensure that our model error is relatively consistent across the different abdomen quartiles.
+
+```{r}
+bf <- bf |>
+  mutate(
+    abdomen_q = ntile(abdomen, 4),
+    abdomen_q = factor(abdomen_q, labels = paste0("Q", 1:4))
+  )
+
+bf |> count(abdomen_q)
+```
+
+We will use the same model we used above.
+
+```{r}
+form
+```
+
+### CV design
+
+We’ll do **20-fold CV** on the full dataset.
+
+To make sure every validation fold contains a good mix of **abdomen quartiles**, we’ll **stratify** the folds by `abdomen_q`. 
+
+```{r}
+K <- 20
+folds <- vfold_cv(bf, v = K, strata = abdomen_q)
+```
+
+### Function: compute per-group CV error
+
+For each fold, we will compute **RMSE by group** (abdomen quartile) on that validation set. Finally, we aggregate across folds.
+
+```{r}
+cv_pred_by_group <- function(folds, formula, group_var) {
+  # group_var as string, e.g., "abdomen_q"
+  map_dfr(seq_len(nrow(folds)), function(i) {
+    sp <- folds$splits[[i]]
+    tr <- analysis(sp)
+    va <- assessment(sp)
+
+    fit <- lm(formula, data = tr)
+    pred <- predict(fit, newdata = va)
+
+    va |>
+      mutate(
+        .pred = pred,
+        fold = i,
+        .group = .data[[group_var]]
+      ) |>
+      select(fold, .group, bodyfat, .pred)
+  })
+}
+
+```
+
+
+
+### Run CV and summarise
+
+```{r}
+cv_preds_bygrp <- cv_pred_by_group(folds, form, "abdomen_q")
+head(cv_preds_bygrp)
+
+bygrp <-   cv_preds_bygrp |>
+    group_by(fold, .group) |>
+    summarise(
+      rmse = rmse_vec(truth = bodyfat, estimate = .pred),
+      n = n(),
+      .groups = "drop"
+    )
+head(bygrp)
+```
+
+
+Aggregate across folds to get the **mean** and **SD** of RMSE for each abdomen quartile.
+
+```{r}
+summary_bygrp <- bygrp |>
+  group_by(.group) |>
+  summarise(
+    mean_RMSE = mean(rmse),
+    sd_RMSE   = sd(rmse),
+    folds     = n(),
+    .groups   = "drop"
+  ) |>
+  arrange(.group)
+
+summary_bygrp |>
+  kable(digits = 3, caption = "CV RMSE by abdomen quartile (10-fold, stratified)") |>
+  kable_styling(full_width = FALSE)
+```
+
+### Plot: per-group CV error
+
+```{r}
+ggplot(summary_bygrp, aes(x = .group, y = mean_RMSE)) +
+  geom_point() +
+  geom_errorbar(aes(ymin = mean_RMSE - sd_RMSE, ymax = mean_RMSE + sd_RMSE),
+                width = 0.15) +
+  labs(
+    title = "Cross-validated RMSE by abdomen quartile",
+    x = "Abdomen quartile",
+    y = "RMSE (body fat %)"
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+### Plot: per-group calibration
+
+```{r}
+# Calculate the average predicted and observed by predicted quintile
+calibration_bygrp <- cv_preds_bygrp |>
+  group_by(.group) |>
+  mutate(pred_group = ntile(.pred, 5)) |>
+  group_by(.group, pred_group) |>
+  summarise(
+    mean_predicted = mean(.pred, na.rm = TRUE),
+    mean_observed  = mean(bodyfat, na.rm = TRUE),
+    n = n(),
+    .groups = "drop"
+  )
+head(calibration_bygrp)
+
+ggplot(calibration_bygrp,
+       aes(x = mean_predicted, y = mean_observed, color = .group)) +
+  geom_point(size = 2.5) +
+  geom_line() +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray40") +
+  labs(
+    title = "Calibration by Abdomen Quartile",
+    subtitle = "Predictions grouped into five bins within each abdomen quartile",
+    x = "Average predicted body fat %",
+    y = "Average observed body fat %",
+    color = "Abdomen quartile"
+  ) +
+  coord_equal() +
+  theme_minimal(base_size = 13)
+```
+
+
+### Notes
+
+* This workflow **trains on all patients** but **evaluates error separately by group** (abdomen quartile) to reveal **performance heterogeneity** (e.g., model may perform worse in Q4).
+* We **stratified** folds by `abdomen_q` so each validation fold contains all quartiles—this improves stability of group-wise estimates.
+* You can swap `abdomen_q` for any other grouping (e.g., sex, age bands) and keep the same code.
+* The variable that we are grouping by doesn't have to be in the model.
+
+# Linear Regression
+
+## Model Assumptions & Diagnostics 
+
+We now check assumptions and common diagnostics for a linear model.
+
+**What we’ll examine**
+
+* **Linearity** of relationships (component + residual plots)
+* **Normality** of residuals (QQ plot)
+* **Homoscedasticity** (residuals vs fitted; Breusch–Pagan test)
+* **Multicollinearity** (VIF)
+* **Influential points** (leverage, Cook’s distance)
+
+*Note:* Independence is usually a **design** issue. If data are not time-series/clustered, we assume iid.
+
+### Augmented residual data
+
+```{r}
+lm_model <- lm(
+  bodyfat ~ weight + abdomen + forearm + wrist, 
+  data = bf_df)
+aug <- augment(lm_model) |> # augment gives us a lot of statistics that are useful.
+  mutate(.stdres = rstandard(lm_model))  # standardized residuals
+
+head(aug)
+```
+
+### 1) Linearity: Component + Residual (Partial Residual) Plots
+
+If relationships are strongly curved, consider transformations or adding terms (splines, polynomials).
+
+```{r}
+car::crPlots(lm_model)  # opens a panel of C+R plots
+```
+
+### 2) Normality of Residuals (Primarily for CIs/p-values)
+
+For prediction, normality is less critical than calibration and unbiasedness, but we inspect QQ plot.
+
+```{r}
+ggplot(aug, aes(sample = .stdres)) +
+  stat_qq() + stat_qq_line() +
+  labs(title = "QQ Plot of Standardized Residuals",
+       x = "Theoretical Quantiles", y = "Standardized Residuals") +
+  theme_minimal(base_size = 13)
+```
+
+*(You can also run a Shapiro–Wilk test for small $n$: `shapiro.test(residuals(lm_model))`.)*
+
+### 3) Homoscedasticity (Constant Error Variance)
+
+Look for funnel shapes; the red LOESS line should be roughly flat.
+
+```{r}
+ggplot(aug, aes(.fitted, .stdres)) +
+  geom_point(alpha = 0.6) +
+  geom_smooth(se = FALSE, color = "red") +
+  labs(x = "Fitted values", y = "Standardized residuals",
+       title = "Residuals vs Fitted (check for heteroscedasticity)") +
+  theme_minimal(base_size = 13)
+```
+
+Formal test: **Breusch–Pagan**
+
+```{r}
+lmtest::bptest(lm_model)
+```
+
+If significant, consider variance-stabilizing transforms (e.g., transform response), robust SEs, or modeling heteroscedasticity.
+
+### 4) Multicollinearity (VIF)
+
+High VIFs (> 5–10) suggest unstable coefficients.
+
+```{r}
+car::vif(lm_model) |> sort(decreasing = TRUE)
+```
+
+If problematic: consider removing/redefining variables, combining related measures, or penalized regression.
+
+### 5) Influence: Leverage & Cook’s Distance
+
+Identify points that overly influence the fit.
+
+```{r}
+ggplot(aug, aes(.hat, .stdres)) +
+  geom_point(alpha = 0.6) +
+  geom_smooth(se = FALSE, color = "red") +
+  labs(x = "Leverage (hat values)", y = "Standardized residuals",
+       title = "Residuals vs Leverage") +
+  theme_minimal(base_size = 13)
+```
+
+```{r}
+# Top potentially influential points by Cook's D
+aug |>
+  mutate(cook = .cooksd) |>
+  arrange(desc(cook)) |>
+  slice_head(n = 10) |>
+  dplyr::select(.fitted, .stdres, .hat, cook) |>
+  kable(digits = 3, caption = "Top 10 observations by Cook's distance")
+```
+
+
+Let's look at the data for the person with the largest Cook's distance.
+
+```{r}
+aug|>
+  mutate(cook = .cooksd) |>
+  arrange(desc(cook)) |>
+  slice_head(n = 1) |>
+  dplyr::select(bodyfat:.resid)
+```
+
+
+> If you remove an influential point, always **refit, compare, and justify**—don’t auto-drop.
+
+---
+
+## Model Selection
+
+### Best Subset Selection
+
+We perform best subset selection by fitting a separate least-squares regression for each combination of the $p$ predictors. The `regsubsets()` function identifies the best model of size $k$ (quantified via RSS).
+
+```{r}
+best_subset <- regsubsets(bodyfat ~ ., bf_df, nvmax = 10)
+results <- summary(best_subset)
+
+# quick peek at coefficients for an 8-predictor model
+round(coef(best_subset, id = 8), 4)
+```
+
+To choose the number of predictors $k$, we can compare common criteria.
+
+```{r}
+summ_results <- tibble(
+  predictors = 1:10,
+  adj_R2 = results$adjr2,
+  Cp     = abs(results$cp - 2:11), # Want Cp to be close to p+1
+  BIC    = results$bic,
+  RSS    = results$rss
+)
+
+summ_results |>
+  pivot_longer(-predictors, names_to = "stat", values_to = "value") |>
+  ggplot(aes(predictors, value, color = stat)) +
+  geom_line(show.legend = FALSE) +
+  geom_point(show.legend = FALSE) +
+  facet_wrap(~ stat, scales = "free") +
+  labs(x = "Number of predictors", y = NULL,
+       title = "Model selection criteria across subset sizes")
+```
+
+```{r}
+summ_results |> kable(digits = 3)
+```
+
+---
+
+#### Choose a Final Model (from Best Subsets)
+
+By default here, we’ll select the model that **minimizes BIC** (you can swap to adj.$R^2$ or $C_p$ if you prefer).
+
+```{r}
+k_bic <- summ_results |> slice_min(BIC, n = 1) |> pull(predictors)
+k_bic
+```
+
+We’ll extract the chosen model’s variables and refit an `lm` so we can do diagnostics easily.
+
+```{r}
+coef_chosen <- coef(best_subset, id = k_bic)
+vars_chosen <- names(coef_chosen)[-1]   # drop intercept
+
+form_chosen <- as.formula(
+  paste("bodyfat ~", paste(vars_chosen, collapse = " + "))
+)
+form_chosen
+```
+
+```{r}
+mod_final <- lm(form_chosen, data = bf_df)
+summary(mod_final)
+```
+
+---
+
+### Automated Model Selection Procedures
+
+#### Forward and Backward (AIC)
+
+```{r}
+bf_mod  <- lm(bodyfat ~ ., data = bf_df)
+back_mf <- stepAIC(bf_mod, direction = "backward")
+for_mf  <- stepAIC(bf_mod, direction = "forward", trace = 0)
+
+back_mf$coefficients
+for_mf$coefficients
+```
+
+### Forward-Stagewise Regression 
+
+
+#### Manual Stagewise Illustration
+
+
+We center and scale $X$ and center $Y$. 
+
+```{r}
+y <- bf_df$bodyfat
+M <- as.matrix(bf_df[,-1])
+
+# center/scale
+y <- y - mean(y)
+M <- scale(M)
+M_sd <- attr(M, "scaled:scale")
+
+beta <- matrix(0, ncol = ncol(M), nrow = 1)
+r    <- y
+eps  <- 0.001
+lots <- 23000
+
+for(i in 1:lots){
+  co <- t(M) %*% r
+  j  <- (1:ncol(M))[abs(co) == max(abs(co))][1]
+  delta <- eps * sign(co[j])
+  b <- beta[nrow(beta),]
+  b[j] <- b[j] + delta
+  beta <- rbind(beta, b)
+  r <- r - delta * M[, j]
+}
+
+
+matplot(beta, type = "l", lty = 1, xlab = "Step number", ylab = "beta (scaled)",
+        main = "Manual Stagewise (toy)")
+beta_mat <- rbind(beta[c(1, seq(5000, 20000, 5000), lots),])
+colnames(beta_mat) <- colnames(M)
+rownames(beta_mat) <- c(1, seq(5000, 20000, 5000), lots)
+round(beta_mat, 2)
+```
+
+Once we get the centered and scaled estimates $\hat \beta^s$, the unscaled solution and intercept are
+%
+\begin{align*}
+\hat \beta_j = \frac{\hat \beta_j ^s}{\sqrt{s_j^2}}, \ j=1,...,p,  \mbox{ and } \hat \beta_0 = \bar{y} - \sum_{j = 1}^{p} \hat \beta_j \bar{X_j}.
+\end{align*}
+%
+
+```{r}
+beta_unscaled <- sweep(beta, MARGIN = 2, STATS = M_sd, FUN = "/")
+  
+matplot(beta_unscaled, type = "l", lty = 1, xlab = "Step number", ylab = "beta",
+        main = "Manual Stagewise (toy)")
+beta_mat <- rbind(beta_unscaled[c(1, seq(5000, 20000, 5000), lots),])
+colnames(beta_mat) <- colnames(M)
+rownames(beta_mat) <- c(1, seq(5000, 20000, 5000), lots)
+round(beta_mat, 2)
+```
+
+#### Stagewise via the `lars` function
+
+```{r}
+ForStag_mf <- lars(as.matrix(bf_df[,-1]), bf_df$bodyfat,
+                   type = "forward.stagewise", trace = TRUE)
+print(ForStag_mf)
+round(coef(ForStag_mf), 2)
+plot(ForStag_mf, main = "Forward-Stagewise Coefficient Paths")
+```
+
+
+#### Stagewise with CV via the `cv.lars` function
+
+```{r}
+X <- as.matrix(bf_df[,-1])
+y <- bf_df$bodyfat
+
+# 2) K-fold CV along that path (K = 10 here)
+set.seed(735794)
+cv_out <- cv.lars(X, y, K = 10, type = "forward.stagewise", plot.it = FALSE, se = TRUE)
+
+# The CV object contains:
+# cv_out$cv        -> mean CV error at each fraction
+# cv_out$cv.error  -> (approx) SE of CV error at each fraction
+# cv_out$index     -> Abscissa values at which the CV curve is be computed. If mode="fraction" this is the fraction of the saturated |beta|. 
+
+# 3) Pick tuning by minimum CV
+i_min <- which.min(cv_out$cv)
+frac_min <- cv_out$index[i_min]
+
+# 1-SE rule: pick the simplest (largest shrinkage / smaller fraction)
+# whose CV error <= cv_min + SE_min.
+cv_min <- cv_out$cv[i_min]
+se_min <- cv_out$cv.error[i_min]
+target <- cv_min + se_min
+
+# Among all fractions with CV <= target, pick the *smallest* index that
+# still satisfies this (for lars' fraction scale, smaller fraction = less variables in the model).
+i_1se <- min(which(cv_out$cv <= target))
+frac_1se <- cv_out$index[i_1se]
+
+# 4) Inspect / plot the CV curve
+plot(cv_out$index, cv_out$cv, type = "l", lwd = 2,
+     xlab = "|beta|/max|beta|", ylab = "CV error",
+     main = "cv.lars: 10-fold CV (lasso path)")
+lines(cv_out$index, cv_out$cv + cv_out$cv.error, lty = 3)
+lines(cv_out$index, cv_out$cv - cv_out$cv.error, lty = 3)
+abline(v = c(frac_min, frac_1se), col = c("red","blue"), lty = 2)
+legend("topright",
+       c(sprintf("min-CV (%.3f)", frac_min),
+         sprintf("1-SE (%.3f)", frac_1se)),
+       col = c("red","blue"), lty = 2, bty = "n")
+
+# 5) Coefficients at chosen fraction (min-CV shown; use frac_1se similarly)
+coef_min <- predict(ForStag_mf, s = frac_min, type = "coef", mode = "fraction")$coefficients
+round(coef_min, 4)
+
+coef_1se <- predict(ForStag_mf, s = frac_1se, type = "coef", mode = "fraction")$coefficients
+round(coef_1se, 4)
+```
+
+---
+
+### Quick Wrap-Up
+
+* We ran **diagnostics** on the model selected a linear model via **best subsets (BIC)**.
+* If diagnostics flag issues (e.g., curvature, unequal variance, high VIF, influential points), iterate:
+
+  * Transform features or response,
+  * Add parsimonious nonlinearity (e.g., splines on 1–2 key terms),
+  * Consider **penalized** linear models for stability.
+
+*(In a later module we’ll revisit with cross-validation to report honest out-of-sample error and to compare against penalized methods.)*
+

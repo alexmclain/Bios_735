@@ -1,0 +1,530 @@
+---
+title: "03 - Cross Validation"
+subtitle: "Biostatistics 735/794 — Machine Learning in Public Health (R)"
+author: "Alexander McLain"
+date: today
+format:
+  html:
+    toc: true
+    toc-location: left
+    toc-depth: 3
+    number-sections: true
+    smooth-scroll: true
+    theme: cosmo
+    code-fold: false
+    highlight-style: github
+    embed-resources: true
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+```{css, echo=FALSE}
+table, th, td {
+  padding: 6px 15px;   /* applies only for HTML output */
+}
+```
+
+```{r}
+#| include: false
+set.seed(735794)
+library(printr)
+library(tidyverse)
+library(rsample)    # splitting, vfolds
+library(yardstick)  # rmse, metrics
+library(broom)      # tidy/glance
+
+library(knitr)
+library(kableExtra)
+```
+
+# Simulated public-health dataset
+
+We simulate a continuous outcome representing 6‑month change in HbA1c (`dA1c`). Predictors are baseline BMI, daily steps (thousands), age, sodium intake (g/day), plus many noise variables. The true data-generating process (unknown to the analyst) is nonlinear and includes an interaction between BMI and steps.
+
+```{r}
+set.seed(8675313)
+n <- 900
+dat <- tibble(
+  id    = 1:n,
+  age   = runif(n, 20, 80),
+  BMI   = rnorm(n, mean = 30, sd = 5) |> pmin(45) |> pmax(18),
+  steps = rlnorm(n, meanlog = log(7), sdlog = 0.4),        # thousands/day
+  sodium= rnorm(n, mean = 3.0, sd = 0.6) |> pmax(0.8)
+)
+
+# Nonlinear truth with interaction + noise features that don't matter
+f_BMI   <- 0.12*(pmax(dat$BMI - 27, 0)) + 0.02*(pmax(dat$BMI - 35, 0))
+f_steps <- -0.35*log(pmax(dat$steps, 1))                     # benefit until plateau
+f_int   <- -0.10 * (pmax(dat$BMI - 34, 0)) * (1/(1+exp(-(dat$steps-8)/2))) # diminishing returns at high BMI
+f_age   <- 0.01*(dat$age - 55)
+f_sod   <- 0.08*(dat$sodium - 3)
+
+eps     <- rnorm(n, sd = 0.5)
+
+# True RMSE (best we can do)
+sqrt(mean(eps^2)) 
+
+# Make outcome data.
+dat <- dat %>%
+  mutate(
+    dA1c = f_BMI + f_steps + f_int + f_age + f_sod + eps
+  )
+
+# Add 40 pure-noise features (look realistic)
+p_noise <- 40
+noise_mat <- replicate(p_noise, rnorm(n))
+colnames(noise_mat) <- paste0("z", 1:p_noise)
+dat <- bind_cols(dat, as_tibble(noise_mat))
+
+# Train/test split
+set.seed(42)
+split <- initial_split(dat, prop = 0.6, strata = NULL)
+train <- training(split)
+test  <- testing(split)
+
+dim(train); dim(test)
+```
+
+# Training vs Test Error as Model Complexity Increases
+
+We compare increasingly complex linear regression models (still linear in parameters) by adding higher-order terms and more interactions/noise features. Expect training error to decrease monotonically; test error may hit a U-shape and then worsen (overfitting).
+
+```{r}
+# Define model 'recipes' as formulas
+base_formula <- dA1c ~ age + BMI + steps + sodium
+
+formulas <- list(
+  m1 = base_formula,                                       # simple linear main effects
+  m2 = dA1c ~ age + BMI + steps + sodium + BMI:steps,      # add interaction
+  m3 = dA1c ~ poly(BMI,2) + poly(steps,2) + age + sodium + BMI:steps,  # add mild nonlinearity
+  m4 = dA1c ~ poly(BMI,3) + poly(steps,3) + age + sodium + BMI:steps,  # more flexible
+  m5 = dA1c ~ poly(BMI,3)*poly(steps,3) + age + sodium,  # rich poly * poly
+  # Add noise features gradually
+  m6  = dA1c ~ poly(BMI,3)*poly(steps,3) + age + sodium + z1 + z2 + z3 + z4 + z5,
+  m7  = dA1c ~ poly(BMI,3)*poly(steps,3) + age + sodium + z1 + z2 + z3 + z4 + z5 + z6:z7,
+  m8  = dA1c ~ poly(BMI,3)*poly(steps,3) + age + sodium + z1 + z2 + z3 + z4 + z5 + z6:z7 + z8 + z9 + z10,
+  m9  = dA1c ~ poly(BMI,3)*poly(steps,3) + .
+)
+
+# Fit each model and compute train/test RMSE
+get_rmse <- function(form) {
+  fit <- lm(form, data = train)
+  tibble(
+    model = deparse(form),
+    n_params = length(coef(fit)),
+    rmse_train = rmse_vec(train$dA1c, predict(fit, newdata = train)),
+    rmse_test  = rmse_vec(test$dA1c,  predict(fit, newdata = test))
+  )
+}
+
+rmse_df <- purrr::map_dfr(formulas, get_rmse) %>%
+  arrange(n_params)
+
+rmse_df %>% knitr::kable(digits = 3)
+
+rmse_long <- rmse_df %>%
+  pivot_longer(cols = starts_with("rmse"), names_to = "set", values_to = "RMSE") %>%
+  mutate(set = recode(set, rmse_train = "Training", rmse_test = "Test"))
+
+ggplot(rmse_long, aes(n_params, RMSE, color = set)) +
+  geom_line() + geom_point() +
+  scale_color_brewer(palette = "Set1") +
+  labs(x = "Number of parameters (model complexity)",
+       y = "RMSE",
+       title = "Training error keeps dropping; test error eventually rises (overfitting)") +
+  theme_minimal(base_size = 13)
+```
+
+# Standard CV, Winner’s Curse, and Nested CV
+
+We create a large candidate set of models by including different polynomial degrees for BMI/steps and varying counts of noise predictors. We then:
+
+1.  Run standard 10-fold CV on the training set across all candidates and choose the winner (min CV RMSE).
+2.  Show that the winning model’s CV error is optimistic compared to its test error (winner’s curse).
+3.  Use nested CV to get an honest estimate of the selection procedure’s performance.
+
+## Candidate model grid
+
+```{r}
+deg_grid   <- 1:4            # polynomial degrees for BMI and steps
+noise_grid <- c(0, 2, 5, 10, 20, 30)
+
+grid <- expand_grid(deg = deg_grid, nnoise = noise_grid) %>%
+  mutate(
+    # build a formula string for each candidate
+    form_str = pmap_chr(list(deg, nnoise), function(d, k){
+      # main poly terms
+      poly_terms <- paste0("poly(BMI,", d, ") + poly(steps,", d, ")")
+      mains      <- paste(c("age", "sodium", poly_terms), collapse = " + ")
+      # add top k noise variables (by name order)
+      if (k > 0) {
+        z_terms <- paste0("z", 1:k, collapse = " + ")
+        paste("dA1c ~", paste(mains, z_terms, sep = " + "))
+      } else paste("dA1c ~", mains)
+    })
+  )
+
+length(unique(grid$form_str))
+grid
+```
+
+## Standard CV (10-fold) and the winner
+
+```{r}
+set.seed(2024)
+folds <- vfold_cv(train, v = 10)
+
+cv_fit <- function(form_str, folds){
+  form <- as.formula(form_str)
+  # compute RMSE across folds
+  rmse_vals <- map_dbl(folds$splits, function(s){
+    tr <- analysis(s); va <- assessment(s)
+    fit <- lm(form, data = tr)
+    pred <- predict(fit, newdata = va)
+    rmse_vec(va$dA1c, pred) # estimates RMSE
+  })
+  tibble(cv_rmse = mean(rmse_vals), cv_sd = sd(rmse_vals))
+}
+
+cv_res <- grid %>%
+  mutate(res = map(form_str, cv_fit, folds = folds)) %>%
+  unnest(res) %>%
+  arrange(cv_rmse)
+
+cv_res %>% slice_head(n = 10) %>% knitr::kable(digits = 3, caption = "Top 10 candidates by 10-fold CV (training set only)")
+```
+
+Pick the winner and compare its CV RMSE vs true test RMSE when refit on the full training set.
+
+```{r}
+winner <- cv_res %>% slice_min(cv_rmse, n = 1)
+winner
+
+form_win <- as.formula(winner$form_str)
+fit_win  <- lm(form_win, data = train)
+
+rmse_cv_min   <- winner$cv_rmse
+rmse_test_win <- rmse_vec(test$dA1c, predict(fit_win, newdata = test))
+
+tibble(
+  metric = c("Winner's CV RMSE (training-only CV)", "Test RMSE (refit on train, eval on test)"),
+  value  = c(rmse_cv_min, rmse_test_win)
+) %>% knitr::kable(digits = 3)
+```
+
+The test RMSE is typically worse than the minimum CV RMSE, because selecting the minimum over many noisy CV estimates induces **optimism** (winner’s curse).
+
+## Nested CV (5 outer × 5 inner)
+
+Now we estimate performance **honestly** by **nesting** model selection inside outer folds. Each outer test fold is untouched by tuning.
+
+```{r}
+set.seed(2025)
+outer_folds <- vfold_cv(train, v = 5)
+
+nested_scores <- map_dbl(outer_folds$splits, function(outer_split){
+
+  tr_outer <- analysis(outer_split)
+  te_outer <- assessment(outer_split)
+
+  # inner CV on the outer training split
+  inner_folds <- vfold_cv(tr_outer, v = 5)
+
+  # run inner CV across the same grid
+  inner_cv_res <- grid %>%
+    mutate(res = map(form_str, ~{
+      form <- as.formula(.x)
+      rmse_vals <- map_dbl(inner_folds$splits, function(s){
+        tr_in <- analysis(s); va_in <- assessment(s)
+        fit_in <- lm(form, data = tr_in)
+        rmse_vec(va_in$dA1c, predict(fit_in, newdata = va_in))
+      })
+      tibble(cv_rmse = mean(rmse_vals))
+    })) %>%
+    unnest(res) %>%
+    arrange(cv_rmse)
+
+  # choose best by inner CV
+  best_form <- as.formula(inner_cv_res$form_str[1])
+
+  # refit on tr_outer, evaluate on te_outer (outer hold-out)
+  fit_outer <- lm(best_form, data = tr_outer)
+  rmse_vec(te_outer$dA1c, predict(fit_outer, newdata = te_outer))
+})
+
+nested_cv_rmse <- mean(nested_scores)
+nested_cv_sd   <- sd(nested_scores)
+
+tibble(
+  Estimate = c("Nested CV RMSE (outer)", "Winner's CV RMSE", "Test RMSE of winner"),
+  Value    = c(nested_cv_rmse, rmse_cv_min, rmse_test_win)
+) %>% knitr::kable(digits = 3)
+```
+
+Nested CV targets the performance of the whole selection procedure. It is usually closer to the true generalization error than the optimistic winner’s CV. However, even nested CV will be somewhat optimistic.
+
+Nested CV generally gives the *least biased* estimate you can get without an external test set, but it is still slightly optimistic because it’s reusing the same data. If you want a truly unbiased comparison, you’d keep aside a **final holdout test set** that’s never seen until the very end.
+
+# Data Leakage: What it looks like and how to avoid it
+
+We demonstrate two common leakage patterns and how to fix them.
+
+## Leakage from using post‑outcome/future information
+
+Imagine accidentally including a lab measured after the 6‑month outcome (e.g., a follow‑up A1c proxy). We simulate a “future” feature that is just the outcome + noise. Including it drives errors unrealistically low.
+
+```{r}
+train_leak <- train %>% mutate(future_lab = dA1c + rnorm(nrow(train), 0, 0.2))
+test_leak  <- test  %>% mutate(future_lab = dA1c + rnorm(nrow(test),  0, 0.2))
+
+# Model with leakage
+fit_leak <- lm(dA1c ~ age + BMI + steps + sodium + future_lab, data = train_leak)
+rmse_leak_train <- rmse_vec(train_leak$dA1c, predict(fit_leak, newdata = train_leak))
+rmse_leak_test  <- rmse_vec(test_leak$dA1c,  predict(fit_leak, newdata = test_leak))
+
+# Proper model (exclude future variable)
+fit_clean <- lm(dA1c ~ age + BMI + steps + sodium, data = train)
+rmse_clean_test <- rmse_vec(test$dA1c, predict(fit_clean, newdata = test))
+
+tibble(
+  Model = c("**LEAKED** (uses future_lab)", "Clean (no future info)"),
+  Train_RMSE = c(rmse_leak_train, NA),
+  Test_RMSE  = c(rmse_leak_test,  rmse_clean_test)
+) %>% knitr::kable(digits = 3, caption = "Leakage via future information yields deceptively low error.")
+```
+
+**Fix:** Strictly enforce **temporal order** and exclude variables measured after the outcome (or after prediction time).
+
+## Leakage from feature selection carried out before CV
+
+Selecting features using all the data (including validation folds) leaks outcome information into the features. We show (i) **leaky CV** that preselects top‑K features by correlation with the outcome across the full training set vs (ii) proper **nested selection** where selection is redone inside each fold.
+
+```{r}
+# Create many more noise features to make selection "tempting"
+p_more <- 100
+more_noise <- replicate(p_more, rnorm(nrow(train)))
+colnames(more_noise) <- paste0("w", 1:p_more)
+train2 <- bind_cols(train, as_tibble(more_noise))
+
+# Leaky feature selection: pick top-K correlating noise features using FULL training data
+K <- 10
+cors <- sapply(train2 %>% select(starts_with("w")), function(v) cor(v, train2$dA1c))
+topk  <- names(sort(abs(cors), decreasing = TRUE))[1:K]
+
+form_leaky <- as.formula(paste("dA1c ~ age + BMI + steps + sodium +", paste(topk, collapse = " + ")))
+
+# 10-fold CV using the already-selected (leaky) features
+set.seed(913)
+folds2 <- vfold_cv(train2, v = 10)
+rmse_leaky_cv <- map_dbl(folds2$splits, function(s){
+  tr <- analysis(s); va <- assessment(s)
+  fit <- lm(form_leaky, data = tr)
+  rmse_vec(va$dA1c, predict(fit, newdata = va))
+}) %>% mean()
+
+# Proper CV: re-select top-K inside each training fold
+rmse_proper_cv <- map_dbl(folds2$splits, function(s){
+  tr <- analysis(s); va <- assessment(s)
+  # select within fold
+  cors_in <- sapply(tr %>% select(starts_with("w")), function(v) cor(v, tr$dA1c))
+  topk_in <- names(sort(abs(cors_in), decreasing = TRUE))[1:K]
+  form_in <- as.formula(paste("dA1c ~ age + BMI + steps + sodium +", paste(topk_in, collapse=" + ")))
+  fit_in  <- lm(form_in, data = tr)
+  rmse_vec(va$dA1c, predict(fit_in, newdata = va))
+}) %>% mean()
+
+tibble(
+  Setting = c("Leaky CV (preselect using full data)", "Proper CV (select inside each fold)"),
+  CV_RMSE = c(rmse_leaky_cv, rmse_proper_cv)
+) %>% knitr::kable(digits = 3, caption = "Feature-selection leakage: optimistic CV vs proper CV.")
+```
+
+**Fix:** Any operation that uses the outcome (feature selection, target encoding, supervised imputation) must be performed **within each resampling split** (or via nested CV).
+
+## Leakage from improper centering
+
+Many of the procedures in this class center, and sometimes scale, the X and Y data. This can lead to leakage if done incorrectly.
+
+```{r}
+# To demonstrate this issue i'm going to use a small test set (i'll tell you why later)
+set.seed(130)
+split <- initial_split(dat, prop = 0.99, strata = NULL)
+train <- training(split)
+test  <- testing(split)
+
+dim(train); dim(test)
+
+## ------------------------------
+## BAD: standardize train and test independently
+## ------------------------------
+# Compute mean/SD separately on each set  ❌ (leakage in preprocessing)
+scale_bad <- function(df) {
+  as.data.frame(scale(df, center = TRUE, scale = TRUE))
+}
+Xtr_bad <- scale_bad(subset(train, select = c(BMI, steps, z1, dA1c)))
+Xte_bad <- scale_bad(subset(test,  select = c(BMI, steps, z1, dA1c)))  # uses test means/SDs!
+## Fitting a no intercept model
+fit_bad <- lm(dA1c ~ 0 + ., data = Xtr_bad)
+pred_bad <- predict(fit_bad, newdata = cbind(Xte_bad))
+rmse_bad <- rmse_vec(Xte_bad$dA1c, pred_bad)
+
+# ------------------------------
+# GOOD: fit scalers on training only; apply to test
+# ------------------------------
+mu  <- sapply(train[c("BMI","steps","z1", "dA1c")], mean)
+sdv <- sapply(train[c("BMI","steps","z1", "dA1c")], sd)
+
+scale_with <- function(df, mu, sdv) {
+  as.data.frame(mapply(function(x, m, s) (x - m)/s,
+                       df, mu[colnames(df)], sdv[colnames(df)]))
+}
+
+Xtr_ok <- scale_with(train[c("BMI","steps","z1", "dA1c")], mu, sdv)
+Xte_ok <- scale_with(test[c("BMI","steps","z1", "dA1c")],  mu, sdv)  # uses train params ✅
+fit_ok <- lm(dA1c ~ 0 + ., data = Xtr_ok)
+pred_ok <- predict(fit_ok, newdata = cbind(Xte_ok))
+rmse_ok <- rmse_vec(Xte_ok$dA1c, pred_ok)
+
+tibble(RMSE_bad_scaling = round(rmse_bad, 4), 
+       RMSE_proper_scaling = round(rmse_ok, 4))
+```
+
+What’s happening
+
+-   **Improper (leaky) preprocessing:** Standardizing the test set with its own mean/SD uses information unavailable at deployment time (you won’t know the population mean/SD for future patients). It also puts train and test on different scales, so the model’s coefficients (trained on train‑scale features) are applied to mismatched features.
+
+-   **Proper preprocessing:** Estimate centering/scaling once on the training data, then apply those same parameters to both training and test (and later, to new patients). This keeps the feature space consistent and avoids sneaking test information into your pipeline.
+
+# Summary
+
+-   Training error falls with complexity, but test error often worsens after a point (overfitting).
+-   When you search over many models/hyperparameters, the minimum CV error is typically optimistic (winner’s curse).
+-   Use nested CV (or a true external test set) for an honest performance estimate.
+-   Prevent data leakage by enforcing time order, redoing any outcome-informed steps inside each resample, and keeping test data completely untouched until the end.
+
+# Stratified K-fold Cross-Validation
+
+This example demonstrates **standard** vs **stratified** K-fold CV for a **continuous outcome** using the **change in HbA1c** as the target.
+
+Stratification for regression is done by **binning** the outcome (e.g., quintiles) so each fold spans the full outcome range.
+
+We’ll use a simple **linear regression** as the working model:
+
+$$
+\text{dA1c} \sim \text{BMI} + \log(\text{steps}+1) + \text{sodium} + \text{age}.
+$$
+
+```{r}
+df <- train %>% mutate(log_steps = log(steps + 1))
+form <- dA1c ~ BMI + log_steps + sodium + age
+form
+```
+
+## Create stratification bins (quintiles of ΔHbA1c)
+
+```{r}
+df <- df %>% mutate(dA1c_q = ntile(dA1c, 5) |> factor())
+count(df, dA1c_q)
+```
+
+## Make folds
+
+```{r}
+K <- 10
+
+# (A) Standard K-fold (no stratification)
+folds_std <- vfold_cv(df, v = K)
+
+# (B) Stratified K-fold (by dA1c quintile)
+folds_strat <- vfold_cv(df, v = K, strata = dA1c_q)
+```
+
+## Check outcome balance by fold
+
+```{r}
+fold_summ <- function(folds, label){
+  map_dfr(seq_len(nrow(folds)), function(i){
+    va <- assessment(folds$splits[[i]])
+    tibble(
+      scheme = label,
+      fold   = i,
+      n      = nrow(va),
+      mean_dA1c = mean(va$dA1c),
+      sd_dA1c   = sd(va$dA1c)
+    )
+  })
+}
+
+bal_std   <- fold_summ(folds_std,  "Standard")
+bal_strat <- fold_summ(folds_strat,"Stratified")
+
+bind_rows(bal_std, bal_strat) %>%
+  arrange(scheme, fold) %>%
+  kable(digits = 3, caption = "Validation-fold outcome balance (ΔHbA1c)") %>%
+  kable_styling(full_width = FALSE)
+```
+
+```{r}
+bind_rows(bal_std, bal_strat) %>%
+  pivot_longer(cols = c(mean_dA1c, sd_dA1c),
+               names_to = "stat", values_to = "value") %>%
+  ggplot(aes(x = factor(fold), y = value, color = scheme, group = scheme)) +
+  geom_point(position = position_dodge(width = 0.3), size = 2.4) +
+  geom_line(position = position_dodge(width = 0.3)) +
+  facet_wrap(~ stat, scales = "free_y") +
+  labs(title = "Outcome balance across validation folds",
+       x = "Fold", y = NULL) +
+  theme_minimal(base_size = 13)
+```
+
+# CV Workflow & RMSE Comparison
+
+We’ll compute **RMSE per validation fold** and compare the average/variability between standard and stratified folds.
+
+```{r}
+cv_rmse_byfold <- function(folds, formula, label){
+  map_dfr(seq_len(nrow(folds)), function(i){
+    sp <- folds$splits[[i]]
+    tr <- analysis(sp)
+    va <- assessment(sp)
+
+    # --- NO LEAKAGE: any preprocessing that uses outcome must be inside each fold ---
+    # Here we already created log_steps outside, but it's outcome-agnostic.
+    # If you center/scale or select features, do it using only `tr` and apply to `va`.
+
+    fit  <- lm(formula, data = tr)
+    pred <- predict(fit, newdata = va)
+    tibble(scheme = label, fold = i, rmse = rmse_vec(va$dA1c, pred))
+  })
+}
+
+rmse_std_by   <- cv_rmse_byfold(folds_std,   form, "Standard")
+rmse_strat_by <- cv_rmse_byfold(folds_strat, form, "Stratified")
+
+bind_rows(
+  rmse_std_by %>% summarise(scheme = "Standard",
+                            mean_RMSE = mean(rmse), sd_RMSE = sd(rmse)),
+  rmse_strat_by %>% summarise(scheme = "Stratified",
+                              mean_RMSE = mean(rmse), sd_RMSE = sd(rmse))
+) %>%
+  kable(digits = 3, caption = "CV RMSE: Standard vs Stratified folds") %>%
+  kable_styling(full_width = FALSE)
+```
+
+```{r}
+bind_rows(rmse_std_by, rmse_strat_by) %>%
+  ggplot(aes(x = factor(fold), y = rmse, color = scheme, group = scheme)) +
+  geom_point(position = position_dodge(width = 0.3), size = 2.4) +
+  geom_line(position = position_dodge(width = 0.3)) +
+  labs(title = "Per-fold RMSE by scheme",
+       x = "Fold", y = "RMSE (ΔHbA1c)") +
+  theme_minimal(base_size = 13)
+```
+
+# Notes
+
+-   For regression, **stratified CV** is commonly implemented by **binning** the outcome (here, quintiles of `dA1c`) and stratifying on those bins.
+-   Stratification tends to **stabilize** fold performance estimates by ensuring each fold spans a similar outcome range.
+-   **Leakage reminder:** Any operation informed by the outcome (e.g., supervised feature selection, imputation that uses `dA1c`) must be performed **within** each resample’s training partition and then applied to its validation partition.

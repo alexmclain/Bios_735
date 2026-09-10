@@ -1,0 +1,767 @@
+---
+title: "07 - Mock Analysis"
+subtitle: "Biostatistics 735 — Machine Learning in Public Health"
+author: "Alexander McLain"
+date: today
+format:
+  html:
+    toc: true
+    toc-location: left
+    toc-depth: 3
+    number-sections: true
+    smooth-scroll: true
+    theme: cosmo
+    code-fold: false
+    highlight-style: github
+    embed-resources: true
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+```{r}
+#| include: true
+set.seed(735794)
+library(tidyverse)
+library(janitor)
+library(rsample)   # group_vfold_cv(), rolling_origin()
+library(mgcv)      # gam()
+library(genlasso)  # fusedlasso1d()
+library(glmnet)
+library(grpreg)     # group lasso
+library(nhanesA)    # NHANES data pull
+library(BGLR)       # wheat data
+library(kableExtra)
+
+select <- dplyr::select 
+```
+
+
+# Scenario 1: NHANES 
+
+**Goal:** Predict systolic blood pressure from
+demographic and body-measurement variables using a recent NHANES cycle.
+
+**Intended CV issue:** NHANES uses a complex, clustered survey design.
+Participants are sampled within primary sampling units (`SDMVPSU`), nested
+within strata (`SDMVSTRA`). Observations within the same PSU are more similar
+to each other than to observations in a different PSU (shared geography,
+recruitment site, local population characteristics). A random row-level CV
+split puts people from the same PSU in both training and validation folds,
+which overstates performance — the same leakage mechanism as splitting
+repeated visits on the same subject, just from geographic clustering instead
+of time.
+
+**Intended method:** GAM, since age and BMI effects on blood pressure are
+plausibly nonlinear (we just covered `s()` terms) and NHANES is large enough
+to estimate smooth terms comfortably.
+
+## Pulling the Data
+
+```{r}
+demo <- nhanes("DEMO_J")   # 2017-2018 cycle: demographics, SDMVPSU, SDMVSTRA
+bpx  <- nhanes("BPX_J")    # blood pressure exam
+bmx  <- nhanes("BMX_J")    # body measures
+
+str(demo[, c("SEQN", "RIDAGEYR", "RIAGENDR", "SDMVPSU", "SDMVSTRA")])
+```
+
+```{r}
+# SDMVPSU only takes values 1–2 and is nested within each stratum, 
+# not a standalone cluster ID. To get a cluster ID we need to combine
+# psu and strata.
+nhanes_df <- demo |>
+  select(SEQN, age = RIDAGEYR, sex = RIAGENDR, race.eth = RIDRETH3, 
+         educ = DMDEDUC2, married = DMDHRMAZ, 
+         psu = SDMVPSU, strata = SDMVSTRA) |>
+  left_join(bpx |> select(SEQN, sysBP = BPXSY1), by = "SEQN") |>
+  left_join(bmx |> select(SEQN, BMI = BMXBMI), by = "SEQN")  |> 
+  mutate(cluster = interaction(strata, psu, drop = TRUE)) |>
+  drop_na()
+
+nrow(nhanes_df)
+n_distinct(nhanes_df$cluster)   # should be 30 (15 strata x 2 psu)
+table(nhanes_df$cluster)
+
+```
+
+
+## The Wrong Way: Naive Row-Level CV
+
+```{r}
+set.seed(1)
+folds_naive <- vfold_cv(nhanes_df, v = 5)
+
+rmse_naive <- map_dbl(folds_naive$splits, function(s) {
+  tr <- analysis(s); va <- assessment(s)
+  fit <- gam(sysBP ~ s(age, by = sex) + s(BMI, by = sex) + sex + 
+               race.eth + educ + married, data = tr, method = "REML")
+  sqrt(mean((va$sysBP - predict(fit, newdata = va))^2))
+})
+
+mean(rmse_naive)
+```
+
+## The Right Way: Grouping by Cluster
+
+```{r}
+set.seed(1)
+folds_psu <- group_vfold_cv(nhanes_df, group = cluster, v = 5)
+
+rmse_grouped <- map_dbl(folds_psu$splits, function(s) {
+  tr <- analysis(s); va <- assessment(s)
+  fit <- gam(sysBP ~ s(age, by = sex) + s(BMI, by = sex) + sex + 
+               race.eth + educ + married, data = tr, method = "REML")
+  sqrt(mean((va$sysBP - predict(fit, newdata = va))^2))
+})
+
+mean(rmse_grouped)
+```
+
+```{r}
+tibble(
+  CV_design = c("Naive (row-level)", "Grouped by Cluster"),
+  Mean_RMSE = c(mean(rmse_naive), mean(rmse_grouped))
+)
+```
+
+**Debrief point:** if the naive CV RMSE is meaningfully lower than the grouped
+CV RMSE, that gap *is* the leakage — it's an estimate of how much the model
+was "cheating" by seeing correlated observations from the same PSU on both
+sides of the split.
+
+
+## A New Question: Does Error Vary by Race/Ethnicity
+
+In this particular dataset, the overall naive vs. grouped RMSE comparison
+earlier didn't show much of a gap — so it might be tempting to assume the
+subgroup breakdown above is fine as is. However, a small or absent gap in the *overall* RMSE doesn't guarantee a small
+gap in every *subgroup's* RMSE, since leakage severity can vary by how
+concentrated each group is across PSUs. The only way to know is to rerun the
+breakdown on `folds_psu` and compare directly, I've done that and there still isn't a difference. However, here, we'll still use the correct `folds_psu`.
+
+
+```{r}
+set.seed(1)
+grouped_preds <- map_dfr(folds_psu$splits, function(s) {
+  tr <- analysis(s); va <- assessment(s)
+  fit <- gam(sysBP ~ s(age, by = sex) + s(BMI, by = sex) + sex +
+               race.eth + educ + married, data = tr, method = "REML")
+
+  va |>
+    mutate(pred = predict(fit, newdata = va)) |>
+    select(race.eth, sysBP, pred)
+})
+
+rmse_by_race_grouped <- grouped_preds |>
+  mutate(sq_err = (sysBP - pred)^2) |>
+  group_by(race.eth) |>
+  summarize(
+    n       = n(),
+    avg_obs = mean(sysBP),
+    avg_pred = mean(pred),
+    mse     = mean(sq_err),
+    se_mse  = sd(sq_err) / sqrt(n),
+    rmse    = sqrt(mse),
+    se_rmse = se_mse / (2 * rmse),        # delta method: SE(sqrt(x)) ~= SE(x) / (2*sqrt(x))
+    ci_lower = rmse - 1.96 * se_rmse,
+    ci_upper = rmse + 1.96 * se_rmse,
+    .groups = "drop"
+  ) |>
+  arrange(desc(rmse))
+
+rmse_by_race_grouped |>
+  transmute(
+    `Race/Ethnicity` = race.eth,
+    `n`              = n,
+    `Avg Obs` = round(avg_obs,1),
+    `Avg Pred` = round(avg_pred,1),
+    `Avg Diff` = round(avg_obs - avg_pred,2),
+    `RMSE`           = round(rmse, 2),
+    `SE`             = round(se_rmse, 3),
+    `95% CI`         = paste0("(", round(ci_lower, 2), ", ", round(ci_upper, 2), ")")
+  ) |>
+  kable(align = "lrrrr", caption = "RMSE by Race/Ethnicity with Approximate 95% CIs")
+```
+
+
+---
+
+# Scenario 2: Testing Volume and Percent Positive
+
+**Goal:** Using weekly test-volume and
+percent-positive data from the five most populous states, predict (a) total
+weekly specimens tested and (b) percent positive, for future weeks.
+
+**CV issue:** Two, layered. First, temporal ordering — the outcome
+in week $t$ is correlated with weeks $t-1, t-2, \dots$, so a random split lets
+the model see the future. CV has to be a rolling-origin / forward-chaining
+design. Second, if state is entered as a fixed effect, the fitted model
+cannot generalize to a state it never saw in training — worth surfacing even
+though we aren't holding out a state here, because it constrains what this
+model can and can't be used for later.
+
+**Intended methods:** GAM and fused lasso (captures the piecewise trend / regime
+shifts in each state's series — a direct callback to the fused-lasso lesson). For `state` we can use a fixed-effects linear model since there are only 5 states.
+
+
+## Data Setup
+
+This uses CDC's ILINet clinical-lab surveillance file directly. I downloaded this from the [web](https://gis.cdc.gov/grasp/fluview/fluportaldashboard.html). 
+
+```{r}
+flu_raw <- read_csv("ICL_NREVSS_Clinical_Labs.csv", skip = 1, na = "X") |>
+  clean_names()
+
+top5_states <- c("California", "Texas", "Florida", "New York", "Pennsylvania")
+
+flu_df <- flu_raw |>
+  rename(state = region,
+         total_tests  = total_specimens,
+         pct_positive = percent_positive) |>
+  filter(state %in% top5_states) |>
+  arrange(state, year, week) |>          # chronological order WITHIN each state
+  select(state, year, week, total_tests, pct_positive) |>
+  group_by(state) |>
+  mutate(t = row_number()) |>            # sequential time index that respects year + week
+  ungroup() 
+
+flu_df |> count(state)
+```
+
+::: {.callout-note}
+If I was modeling this data, I would log-transform the pct_positive variable. Here, for clean interpretations, we won't do this.
+:::
+
+
+::: {.callout-important}
+`week` alone resets every season (1–52/53), so ordering by `week` without
+`year` first silently interleaves different flu seasons — week 40 of 2015
+would sort next to week 40 of 2019. `arrange(state, year, week)` fixes the
+chronology; `t` is then a clean sequential index per state that both the
+rolling-origin split and the fused lasso can rely on.
+:::
+
+## Why the Two "Obvious" Approaches Don't Actually Answer the Question
+
+The handout goal is genuine forecasting — total specimens and percent
+positive for a **future** week/year, e.g., California, 2026, week 50. That
+requirement rules out a couple of approaches:
+
+- **Fused lasso on the raw time series** estimates one coefficient per
+  *observed* time point. There is no coefficient for "week 50 of 2026"
+  because that row doesn't exist in the fitted path — the model has nothing
+  to extrapolate with. It's a good *descriptive* tool for finding past
+  regime shifts, but not a predictive one for a genuinely new time point.
+- **`week_num` as a sequential index fed into a fixed-effects model** has the
+  same problem in a different place: it's tied to the training data's
+  specific rows, not a reusable calendar concept. There's no principled way
+  to hand the model "week_num = (whatever a 2026 week-50 row would have
+  been)."
+
+What actually generalizes to a new year/week is a model with **separate,
+interpretable terms for week and year**: a cyclic seasonal effect for week
+(defined for all 52 weeks, so no extrapolation needed there at all) and a
+linear trend for year (which *can* be extrapolated, honestly, a few years
+out). `state` re-enters as a plain fixed effect — a factor term.
+
+## Model: GAM with Cyclic Week Smooth + Linear Year + State Fixed Effect
+
+```{r}
+gam_fit <- gam(
+  pct_positive ~ state + s(week, bs = "cc", k = 10) + year,
+  data   = flu_df,
+  knots  = list(week = c(0.5, 52.5)),   # ties week 52 back to week 1
+  method = "REML"
+)
+
+summary(gam_fit)
+plot(gam_fit, select = 1, shade = TRUE, main = "Seasonal effect of week (cyclic)")
+```
+
+`s(week, bs = "cc")` is a **cyclic** cubic smooth — it forces the fitted
+curve at week 52 to connect back to week 1, the right assumption for a
+seasonal effect (there's no real discontinuity between the last week of one
+flu season and the first week of the next). `year` enters linearly, so it
+contributes a single extrapolable slope rather than a value tied to specific
+observed years. `state` is a plain factor term — a fixed effect exactly as
+requested, fit directly in `gam()`.
+
+::: {.callout-note}
+`refund::pfr()` would fit this identical model — it's built directly on top
+of `mgcv::gam()` and accepts the same formula syntax when there's no
+functional predictor involved. `gam()` is used here because nothing in this
+formula is actually functional (unlike the DTI example); `pfr()` becomes
+necessary once you have a genuine curve as a predictor, not before.
+:::
+
+## Honest Error Estimation: Rolling-Origin CV, Actually Used
+
+The `roll` object above illustrated the *idea* of rolling-origin splits on a
+single state. The number we actually need — the expected forecast error of
+the model above — requires applying that same logic to the full pooled panel,
+refitting at each cutoff and scoring on the weeks immediately after.
+
+```{r}
+flu_df <- flu_df |>
+  mutate(calendar_t = (year - min(year)) * 52 + week) |>
+  arrange(calendar_t, state)
+
+weeks_sorted  <- sort(unique(flu_df$calendar_t))
+initial_weeks <- 104   # ~2 seasons before the first forecast
+horizon_weeks <- 4     # forecast 4 weeks ahead at each cutoff
+
+cutoffs <- weeks_sorted[initial_weeks:(length(weeks_sorted) - horizon_weeks)]
+cutoffs[1:5]
+
+cv_results <- map_dfr(cutoffs, function(cut) {
+  train <- flu_df |> filter(calendar_t <= cut)
+  test  <- flu_df |> filter(calendar_t > cut, calendar_t <= cut + horizon_weeks)
+  if (nrow(test) == 0) return(NULL)
+
+  fit <- gam(pct_positive ~ state + s(week, bs = "cc", k = 10) + year,
+             data = train, knots = list(week = c(0.5, 52.5)), method = "REML")
+
+  tibble(
+    cutoff = cut,
+    rmse   = sqrt(mean((test$pct_positive - predict(fit, newdata = test))^2, na.rm = TRUE))
+  )
+})
+
+head(cv_results)
+
+mean(cv_results$rmse)
+
+min_year <- min(flu_df$year)
+
+cv_results <- cv_results |>
+  mutate(
+    approx_year = min_year + (cutoff - 1) %/% 52,
+    approx_week = (cutoff - 1) %% 52 + 1,
+    # Approximate date for the start of that MMWR week (good enough for plotting)
+    approx_date = as.Date(paste0(approx_year, "-01-01")) + (approx_week - 1) * 7
+  )
+
+ggplot(cv_results, aes(approx_date, rmse)) +
+  # Shade Dec-Feb each year so winter/flu-season is visible at a glance
+  annotate("rect",
+           xmin = as.Date(paste0(min_year:(min_year + 10), "-12-01"))[-c(1,2)],
+           xmax = as.Date(paste0((min_year + 1):(min_year + 11), "-03-01"))[-c(1,2)],
+           ymin = -Inf, ymax = Inf, fill = "steelblue", alpha = 0.08) +
+  geom_line() +
+  geom_point() +
+  scale_x_date(date_breaks = "1 year", date_labels = "%Y") +
+  labs(title = "Rolling-Origin Forecast Error Over Time",
+       x = "Training cutoff (date)", y = "RMSE (4-week-ahead forecast)") +
+  theme_minimal(base_size = 13)
+```
+
+This refits `gam()` at every cutoff using only data available up to that
+point, then evaluates on the following month — exactly how the model would be
+used in practice. `mean(cv_results$rmse)` is the number to report as the
+model's expected forecast error, not any single train/test split.
+
+::: {.callout-important}
+This loop refits the model dozens of times, which is the honest cost of doing
+CV properly for a forecasting model. Resist the temptation to shortcut it
+with a single holdout at the end — one split gives a noisy point estimate,
+not a distribution you can trust.
+:::
+
+## Forecasting a Genuinely Future Observation
+
+```{r}
+final_fit <- gam(pct_positive ~ state + s(week, bs = "cc", k = 10) + year,
+                  data = flu_df, knots = list(week = c(0.5, 52.5)), method = "REML")
+
+future_point <- tibble(state = "California", year = 2026, week = 50)
+predict(final_fit, newdata = future_point, se.fit = TRUE)
+```
+
+::: {.callout-important}
+This prediction is only as trustworthy as the linear extrapolation in `year`.
+The seasonal `week` effect is well-supported (fit on the full observed
+cycle), but the `year` coefficient is extrapolating past the last observed
+year and cannot know about a genuine future disruption (a new variant,
+another pandemic-scale event). Report the rolling-origin CV RMSE alongside
+any such forecast as the honest uncertainty, and treat a multi-year-out
+extrapolation as considerably shakier than a same-season forecast.
+:::
+
+The same approach — cyclic week smooth, linear year, state fixed effect,
+rolling-origin CV — applies to `total_tests`: refit with
+`total_tests ~ state + s(week, bs = "cc", k = 10) + year` and repeat the CV
+loop above.
+
+::: {.callout-important}
+**The limitation to flag explicitly.** A fixed effect for `state` is
+estimated *only* for the states in the training data. There is no mechanism
+in this model for predicting a sixth state that wasn't part of the fit — the
+model has literally no parameter for it. If the eventual goal is a model that
+generalizes to new states (not just the five here), a fixed-effects approach
+is the wrong tool; you'd want something that treats state as a random effect
+or borrows strength across states (e.g., a hierarchical model), which is
+beyond what we've covered so far. Worth having the group articulate this
+limitation even though it doesn't change what they fit today.
+:::
+
+### Repeating for log-transformed outcome
+
+Below, I'm repeating the entire thing for a log transformed outcome:
+
+```{r}
+flu_df <- flu_df |>
+  mutate(l_pct_positive = log(if_else(pct_positive==0, 1/total_tests*100, pct_positive))) |>
+  arrange(calendar_t, state)
+
+weeks_sorted  <- sort(unique(flu_df$calendar_t))
+initial_weeks <- 104   # ~2 seasons before the first forecast
+horizon_weeks <- 4     # forecast 4 weeks ahead at each cutoff
+
+cutoffs <- weeks_sorted[initial_weeks:(length(weeks_sorted) - horizon_weeks)]
+
+cv_results <- map_dfr(cutoffs, function(cut) {
+  train <- flu_df |> filter(calendar_t <= cut)
+  test  <- flu_df |> filter(calendar_t > cut, calendar_t <= cut + horizon_weeks)
+  if (nrow(test) == 0) return(NULL)
+
+  fit <- gam(l_pct_positive ~ state + s(week, bs = "cc", k = 10) + year,
+             data = train, knots = list(week = c(0.5, 52.5)), method = "REML")
+
+  tibble(
+    cutoff = cut,
+    rmse   = sqrt(mean((test$pct_positive - predict(fit, newdata = test))^2, na.rm = TRUE))
+  )
+})
+
+mean(cv_results$rmse)
+
+min_year <- min(flu_df$year)
+
+cv_results <- cv_results |>
+  mutate(
+    approx_year = min_year + (cutoff - 1) %/% 52,
+    approx_week = (cutoff - 1) %% 52 + 1,
+    # Approximate date for the start of that MMWR week (good enough for plotting)
+    approx_date = as.Date(paste0(approx_year, "-01-01")) + (approx_week - 1) * 7
+  )
+
+ggplot(cv_results, aes(approx_date, rmse)) +
+  # Shade Dec-Feb each year so winter/flu-season is visible at a glance
+  annotate("rect",
+           xmin = as.Date(paste0(min_year:(min_year + 10), "-12-01"))[-c(1,2)],
+           xmax = as.Date(paste0((min_year + 1):(min_year + 11), "-03-01"))[-c(1,2)],
+           ymin = -Inf, ymax = Inf, fill = "steelblue", alpha = 0.08) +
+  geom_line() +
+  geom_point() +
+  scale_x_date(date_breaks = "1 year", date_labels = "%Y") +
+  labs(title = "Rolling-Origin Forecast Error Over Time",
+       x = "Training cutoff (date)", y = "RMSE (4-week-ahead forecast)") +
+  theme_minimal(base_size = 13)
+
+final_fit <- gam(l_pct_positive ~ state + s(week, bs = "cc", k = 10) + year,
+                  data = flu_df, knots = list(week = c(0.5, 52.5)), method = "REML")
+
+future_point <- tibble(state = "California", year = 2026, week = 50)
+pred_vals <- predict(final_fit, newdata = future_point, se.fit = TRUE)
+
+tibble(pred = exp(pred_vals$fit), se.fit = pred_vals$se.fit*exp(pred_vals$fit))
+```
+
+
+## Fused Lasso
+
+For fun, I wanted to fit this model with the fused LASSO. What's cool about this is that I can fuse the coefficients in two directions `year` and `week`. Let's check it out:
+
+
+```{r}
+# ============================================================
+# Step 1: Fit the 2D fused lasso on years up to 2024 (holding out 2025)
+# ============================================================
+fused_train <- flu_df |>
+  filter(state == "California") |>
+  filter(year > 2015 & year < 2025 & week < 53) |>   # complete years, 2025 excluded
+  arrange(year, week)                                 # week must vary fastest within each year
+
+dim1 <- length(unique(fused_train$week))   # 52 weeks
+dim2 <- length(unique(fused_train$year))   # years 2016-2024
+
+fl_train <- fusedlasso2d(fused_train$pct_positive, dim1 = dim1, dim2 = dim2)
+
+# Grab a fine path of lambdas so the validation curve below isn't lumpy
+a_train <- coef(fl_train, nlam = 30)
+
+# ============================================================
+# Keep the 3x3 plot of coefficients from the TRAINING-ONLY fit
+# (same 9-lambda snapshot as before, just refit without 2025)
+# ============================================================
+a9 <- coef(fl_train, nlam = 9)
+
+par(mar = c(1, 1, 2, 1), mfrow = c(3, 3))
+cols <- rainbow(100)
+zlim <- range(a9$beta)
+for (i in 1:9) {
+  image(matrix(a9$beta[, i], nrow = dim1), col = cols, zlim = zlim, axes = FALSE)
+  mtext(bquote(lambda == .(sprintf("%.3f", a9$lambda[i]))))
+}
+```
+
+
+```{r}
+# ============================================================
+# Step 2: Predict 2025 from the training fit, at every lambda,
+# and see which lambda gives the lowest holdout error
+# ============================================================
+
+# The fused lasso has no coefficient beyond the training grid, so the natural
+# forecast for a year it never saw is the LAST fitted year's curve
+# (total-variation regularization assumes adjacent cells are similar --
+# "next year looks like last year" is the model's own implied forecast).
+
+weeks_grid <- sort(unique(fused_train$week))
+
+holdout_2025 <- flu_df |>
+  filter(state == "California", year == 2025, week < 53) |>
+  arrange(week)
+
+forecast_rmse <- map_dbl(seq_along(a_train$lambda), function(j) {
+  beta_mat <- matrix(a_train$beta[, j], nrow = dim1, ncol = dim2)
+  last_year_col <- beta_mat[, dim2]                # fitted 2024 curve
+  names(last_year_col) <- weeks_grid
+
+  pred_2025 <- last_year_col[as.character(holdout_2025$week)]
+  sqrt(mean((holdout_2025$pct_positive - pred_2025)^2, na.rm = TRUE))
+})
+
+lambda_err <- tibble(lambda = a_train$lambda, rmse = forecast_rmse)
+
+ggplot(lambda_err, aes(lambda, rmse)) +
+  geom_line() + geom_point() +
+  scale_x_log10() +
+  labs(title = "Validation Error by Lambda (2025 Held Out)",
+       x = expression(lambda ~ "(log scale)"),
+       y = "RMSE, 2025 forecast vs. actual (log percent positive)") +
+  theme_minimal(base_size = 13)
+
+lambda_best <- lambda_err$lambda[which.min(lambda_err$rmse)]
+lambda_best
+```
+
+```{r}
+# ============================================================
+# Step 3: Refit at lambda_best using ALL data (now including 2025),
+# display the coefficients with ggplot
+# ============================================================
+fused_full <- flu_df |>
+  filter(state == "California") |>
+  filter(year > 2015 & year < 2026 & week < 53) |>
+  arrange(year, week)
+
+dim1_full <- length(unique(fused_full$week))
+dim2_full <- length(unique(fused_full$year))
+
+fl_full <- fusedlasso2d(fused_full$pct_positive, dim1 = dim1_full, dim2 = dim2_full)
+
+beta_full <- coef(fl_full, lambda = lambda_best)$beta
+
+plot_full <- fused_full |>
+  mutate(Beta = as.vector(beta_full),
+         year_f = factor(year))
+
+ggplot(plot_full, aes(week, Beta, color = year_f)) +
+  geom_line() + geom_point(size = 0.8) +
+  labs(title = paste0("2D Fused Lasso Coefficients, Full Data (\u03bb = ",
+                       round(lambda_best, 3), ")"),
+       x = "Week", y = "Beta", color = "Year") +
+  theme_minimal(base_size = 13)
+```
+
+```{r}
+# ============================================================
+# Step 4: Predict 2025 week 50 from the full refit, then carry that
+# forward as the prediction for 2026 week 50
+# ============================================================
+weeks_grid_full <- sort(unique(fused_full$week))
+years_grid_full  <- sort(unique(fused_full$year))
+
+beta_mat_full <- matrix(beta_full, nrow = dim1_full, ncol = dim2_full,
+                         dimnames = list(weeks_grid_full, years_grid_full))
+
+pred_2025_wk50 <- beta_mat_full[as.character(50), as.character(2025)]
+pred_2026_wk50 <- pred_2025_wk50   # no coefficient exists beyond the observed grid
+
+tibble(
+  year = c(2025, 2026),
+  week = 50,
+  predicted_pct_positive = c(pred_2025_wk50, pred_2026_wk50))
+```
+
+::: {.callout-important}
+Notice the 2026 prediction is identical to the 2025 one — the fused lasso literally has no parameter for a cell outside the fitted grid, so "predicting 2026" here just means assuming next year looks like the last observed year. That's a fine baseline, but it's a much weaker extrapolation than the year-as-linear-term GAM from earlier in this document, which can actually project a trend forward. Worth having students compare the two 2026 forecasts side by side.
+:::
+
+
+---
+
+# Scenario 3: BGLR Wheat
+
+**Goal:** Using genetic marker data on a panel
+of wheat lines, predict yield in a new growing environment using a model
+trained on other environments.
+
+**Intended CV issue:** This is a target-context mismatch, not a random-split
+problem. The same lines are phenotyped in multiple environments, and the
+genetic effect on yield can differ by environment (G×E interaction) — a model
+fit on environments 1–3 may not transfer cleanly to environment 4, which is
+structurally the same issue as a model failing to generalize across
+populations, sites, or cohorts. The honest evaluation is to hold out an
+*entire environment*, never a random subset of line-by-environment
+combinations.
+
+**Intended method:** Lasso, this will provide variable selection and prediction of new values.
+
+## Data
+
+```{r}
+data(wheat)
+str(wheat.X[, 1:5])
+str(wheat.Y)
+
+X <- wheat.X
+Y <- wheat.Y
+colnames(Y)
+```
+
+
+::: {.callout-note}
+`wheat.Y` has one column per environment. The code below assumes the first column is the held-out one and the last three are the training
+environments.
+:::
+
+## Held-Out Environment Design
+
+```{r}
+train_envs <- 2:4
+test_env   <- 1
+
+y_train <- rowMeans(Y[, train_envs], na.rm = TRUE)  # average across training environments
+y_test  <- Y[, test_env]
+
+keep <- complete.cases(X) & !is.na(y_train) & !is.na(y_test)
+X_fit  <- X[keep, ]
+y_fit  <- y_train[keep]
+y_eval <- y_test[keep]
+```
+
+## Lasso
+
+```{r}
+cv_fit <- cv.glmnet(X_fit, y_fit, nfolds = 10, alpha = 1)
+plot(cv_fit)
+
+lambda_best <- cv_fit$lambda.min
+lambda_1se <- cv_fit$lambda.1se
+
+lasso_min  <- glmnet(X_fit, y_fit, alpha = 1, lambda = lambda_best,  standardize = TRUE)
+lasso_1se  <- glmnet(X_fit, y_fit, alpha = 1, lambda = lambda_1se,  standardize = TRUE)
+```
+
+## Evaluating Transfer to the Held-Out Environment
+
+```{r}
+pred_test <- predict(lasso_min, X_fit)
+pred_test_1se <- predict(lasso_1se, X_fit)
+
+tibble(
+  metric = c("RMSE", "Correlation", "Non-zero Coeffs"),
+  Best  = c(
+    sqrt(mean((y_eval - pred_test)^2)),
+    cor(y_eval, pred_test), 
+    sum(coef(lasso_min )[-1]!=0)
+  ),
+  One_SE  = c(
+    sqrt(mean((y_eval - pred_test_1se)^2)),
+    cor(y_eval, pred_test_1se), 
+    sum(coef(lasso_1se )[-1]!=0)
+  )
+)
+```
+
+```{r}
+tibble(observed = y_eval, predicted = as.numeric(pred_test)) |>
+  ggplot(aes(observed, predicted)) +
+  geom_point(alpha = 0.5) +
+  geom_abline(slope = 1, intercept = 0, color = "firebrick", linetype = "dashed") +
+  labs(title = "Held-Out Environment: Observed vs. Predicted",
+       x = "Observed yield (env 4)", y = "Predicted yield (trained on envs 1-3)") +
+  theme_minimal(base_size = 13)
+```
+
+## Naive Comparison: Ordinary CV Ignoring Environment
+
+Rather than holding out an entire environment, we could instead pool every
+line-by-environment observation into one long dataset and run standard
+random k-fold CV on it — treating each row as if it were independent. This
+is the version many people reach for by default; here's why it's misleading
+for this data.
+
+```{r}
+# Stack ALL environments (not just the training ones) into a long dataset:
+# one row per line-by-environment combination. Random folds below don't
+# know that the same genetic line shows up once per environment.
+
+env_cols <- colnames(Y)[1:4]
+
+y_long  <- as.vector(Y[, env_cols])
+X_long  <- X[rep(seq_len(nrow(X)), times = length(env_cols)), ]
+line_id <- rep(seq_len(nrow(X)), times = length(env_cols))
+
+keep_long <- complete.cases(X_long) & !is.na(y_long)
+X_long_fit  <- X_long[keep_long, ]
+y_long_fit  <- y_long[keep_long]
+line_long_fit <- line_id[keep_long]
+
+nrow(X_long_fit)
+```
+
+```{r}
+set.seed(1)
+cv_naive <- cv.glmnet(X_long_fit, y_long_fit, nfolds = 10, alpha = 1)
+plot(cv_naive)
+
+# cv.glmnet's cvm at the chosen lambda is mean CV squared error
+# for a gaussian family, so sqrt(cvm) is directly comparable to the
+# RMSE reported for the honest environment-transfer evaluation above.
+rmse_naive_cv <- sqrt(min(cv_naive$cvm))
+rmse_naive_cv
+```
+
+```{r}
+tibble(
+  Design = c("Naive CV (pooled, random folds, ignores environment)",
+             "Honest environment transfer (train envs 1-3, test env 4)"),
+  RMSE = c(rmse_naive_cv, sqrt(mean((y_eval - pred_test)^2)))
+)
+
+# Percent difference
+round((rmse_naive_cv- sqrt(mean((y_eval - pred_test)^2))) /rmse_naive_cv, 3)*100
+```
+
+::: {.callout-important}
+**Why the naive number looks better.** Each line appears once per
+environment, so it contributes up to four rows to `X_long_fit` — one per
+environment — all sharing the same genotype. Random folds don't keep a
+line's rows together, so a line's environment-4 phenotype can end up in the
+validation fold while that *same line's* environment-1/2/3 phenotypes (and
+identical `X` row) sit in the training fold. The model can partly recognize
+the line from its genotype and lean on what it already "knows" about that
+line's phenotype in other environments, rather than learning a genotype
+effect that genuinely transfers to a new environment. The gap between these
+two RMSEs is an estimate of exactly that — the same leakage mechanism
+flagged for NHANES, just clustered by genetic line instead of by PSU.
+:::
+
+---
+
+

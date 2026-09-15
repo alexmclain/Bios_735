@@ -1,0 +1,677 @@
+---
+title: "Breast Cancer Classification: Model Selection & Discrimination"
+subtitle: "Biostatistics 735"
+author: "Alexander McLain"
+date: today
+format:
+  html:
+    toc: true
+    toc-location: left
+    toc-depth: 3
+    number-sections: true
+    smooth-scroll: true
+    theme: cosmo
+    code-fold: false
+    highlight-style: github
+    embed-resources: true
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+```{r}
+#| include: false
+set.seed(735794)
+```
+
+
+```{r}
+# Core
+library(tidyverse)
+library(rsample)
+library(recipes)
+library(yardstick)
+library(broom)
+library(knitr)
+library(kableExtra)
+
+# Models
+library(glmnet)        # logistic lasso
+# MASS functions used via explicit namespace to avoid select() conflicts
+# library(MASS)        # we'll call MASS::lda / MASS::qda / MASS::stepAIC directly
+```
+
+# Loading in the data
+
+**Data:** Wisconsin Diagnostic Breast Cancer (WDBC)
+
+Each row is a patient. Outcome is diagnosis: Malignant (M) or Benign (B).
+
+There are 30 numeric features computed from a digitized image of a breast mass (10 characteristics × 3 summaries: mean, standard error, “worst”).
+
+```{r}
+# Download from UCI ML repo
+  url_data  <- "https://archive.ics.uci.edu/ml/machine-learning-databases/breast-cancer-wisconsin/wdbc.data"
+  raw <- read.csv(url_data, header = FALSE)
+
+
+# According to UCI:
+# V1 = ID, V2 = Diagnosis (M/B), V3:V32 = 30 features
+names(raw) <- c("ID","Diagnosis",
+                "radius_mean","texture_mean","perimeter_mean","area_mean","smoothness_mean",
+                "compactness_mean","concavity_mean","concave_points_mean","symmetry_mean","fractal_dimension_mean",
+                "radius_se","texture_se","perimeter_se","area_se","smoothness_se",
+                "compactness_se","concavity_se","concave_points_se","symmetry_se","fractal_dimension_se",
+                "radius_worst","texture_worst","perimeter_worst","area_worst","smoothness_worst",
+                "compactness_worst","concavity_worst","concave_points_worst","symmetry_worst","fractal_dimension_worst")
+
+bc <- raw %>%
+  as_tibble() %>%
+  mutate(Diagnosis = factor(Diagnosis, levels = c("B","M"))) %>%  # B=negative (benign), M=positive (malignant)
+  select(-ID)
+
+glimpse(bc)
+summary(bc$Diagnosis)
+```
+
+We’ll create a train/test split once, then do model selection and evaluation within the training set (for AIC/BIC and CV). The test set is reserved for a final sanity check (optional).
+
+```{r}
+set.seed(42)
+split <- initial_split(bc, prop = 0.8, strata = Diagnosis)
+train <- training(split)
+test  <- testing(split)
+
+nrow(train); nrow(test)
+```
+
+**Preprocessing Recipe**
+
+Before commensing with the CV, we're going to create some functions to help us scale/center predictors and keep the outcome as a factor. This avoids leakage by **fitting the recipe inside resamples** when used with rsample.
+
+The `recipe()` function is a description of the steps to be applied to a data set in order to prepare it for data analysis.
+
+```{r}
+rec_base <- recipe(Diagnosis ~ ., data = train) %>%
+  step_zv(all_predictors()) %>%
+  step_normalize(all_predictors())
+prep_base <- prep(rec_base)         # for direct train fit (non-CV steps)
+train_ready <- bake(prep_base, train)
+test_ready  <- bake(prep_base, test)
+```
+
+Here, we're telling `R` that we are doing two steps:
+
+- `step_zv()` creates a *specification* of a recipe step that will remove variables that contain only a single value.
+
+- `step_normalize()` creates a *specification* of a recipe step that will normalize numeric data to have a standard deviation of one and a mean of zero.
+
+- `prep()` estimates the required parameters from a training set that can be later applied to other data sets.
+
+- `bake()` will apply the computations to new data.
+
+
+⸻
+
+# Logistic Regression with AIC and BIC
+
+We fit a full logistic regression on all 30 predictors, then run stepwise selection:
+
+•	AIC via MASS::stepAIC (default),
+
+•	BIC via MASS::stepAIC(..., k = log(n)).
+
+
+```{r}
+full_glm <- glm(Diagnosis ~ ., data = train_ready, family = binomial())
+null_glm <- glm(Diagnosis ~ 1, data = train_ready, family = binomial())
+
+summary(full_glm)$coef |> kable(digits = 3)
+
+# AIC-based backwards (backwards starting at full model)
+aic_fit <- MASS::stepAIC(full_glm, direction = "backward", trace = FALSE)
+
+# BIC-based backwards (penalty k = log(n))
+n_train <- nrow(train_ready)
+#BIC gives the same model as AIC when backwards is used
+#bic_fit <- MASS::stepAIC(full_glm, direction = "backward", 
+#                         k = log(n_train), trace = FALSE)
+
+# BIC-based stepwise (penalty k = log(n))
+bic_fit <- MASS::stepAIC(null_glm, 
+                         direction = "both", 
+                         k = log(n_train), 
+                         scope=list(lower=null_glm,
+                                    upper=full_glm), 
+                         trace = FALSE)
+
+# Summaries
+tibble(
+  AIC_parms = length(coef(aic_fit)),
+  BIC_parms = length(coef(bic_fit)))
+formula(aic_fit)
+formula(bic_fit)
+```
+
+
+## Estimating the ROC curve and AUC from the full model.
+
+```{r}
+# Predicted probabilities for the Malignant class ("M")
+p_train_full <- predict(full_glm, type = "response")
+p_test_full  <- predict(full_glm, newdata = test_ready, type = "response")
+
+
+# 1) ROC curves (training & test)
+ROC_data_train <- train_ready %>% 
+  mutate(estimate = p_train_full)
+
+# We use event_level = "second" because the probabilities predict "M"
+levels(ROC_data_train$Diagnosis)
+roc_train <- yardstick::roc_curve(data = ROC_data_train, 
+                                  Diagnosis, estimate, 
+                                  event_level = "second") %>%
+  mutate(set = "Train")
+
+ROC_data_test <- test_ready  %>% 
+  mutate(estimate = p_test_full)
+roc_test  <- yardstick::roc_curve(data = ROC_data_test, 
+                                  Diagnosis, estimate, 
+                                  event_level = "second") %>%
+  mutate(set = "Test")
+
+bind_rows(roc_train, roc_test) %>%
+  ggplot(aes(x = 1 - specificity, y = sensitivity, color = set)) +
+  geom_path() +
+  geom_abline(slope = 1, intercept = 0, linetype = 3) +
+  coord_equal() +
+  labs(title = "ROC Curves — Full Logistic Model",
+       x = "1 - Specificity (FPR)", y = "Sensitivity (TPR)") +
+  theme_minimal(base_size = 13)
+```
+
+AUC on training & test for reference.
+```{r}
+tibble(
+  set = c("Train", "Test"),
+  AUC = c(
+    roc_auc_vec(train_ready$Diagnosis, p_train_full, event_level = "second"),
+    roc_auc_vec(test_ready$Diagnosis,  p_test_full,  event_level = "second")
+  )
+) |> kable(digits = 3)
+```
+
+AUC on test from the AIC and BIC models.
+
+```{r}
+pred_aic <- predict(aic_fit, newdata = test_ready, type = "response")
+pred_bic <- predict(bic_fit, newdata = test_ready, type = "response")
+tibble(
+  model = c("AIC","BIC"),
+  AUC   = c(roc_auc_vec(test_ready$Diagnosis, pred_aic, event_level = "second"),
+            roc_auc_vec(test_ready$Diagnosis, pred_bic, event_level = "second"))
+) %>% kable(digits = 3)
+```
+
+
+## Youden’s Index
+
+Youden’s Index (J) is a single number that summarizes how well a classifier balances
+**sensitivity** and **specificity**. It is defined as
+
+\[
+J = Sensitivity + Specificity - 1
+\]
+
+
+
+The value of J ranges from 0 (no better than chance) to 1 (perfect classification).
+In practice, we can compute J at every possible classification threshold and then
+choose the threshold that maximizes J. This threshold gives the “best balance”
+between correctly identifying positives and negatives, and is often used when
+there is no clear reason to favor sensitivity over specificity (or vice versa).
+
+### Estimating Youden’s J from the full model.
+
+The following function will tune the threshold and find Youden’s J on the training portion data.
+
+```{r}
+# Grid-search threshold to maximize Youden's J on TRAINING data within a fold
+tune_threshold_j <- function(truth, prob, grid = seq(0.001, 0.999, by = 0.001)) {
+  # truth: factor with levels c("B","M"), "M" is the event
+  # prob:  numeric vector of P(event="M")
+  stopifnot(is.factor(truth), length(levels(truth)) == 2)
+  best_thr <- 0.5
+  best_j   <- -Inf
+  for (t in grid) {
+    cls <- factor(ifelse(prob >= t, levels(truth)[2], levels(truth)[1]),
+                  levels = levels(truth))
+    se  <- sens_vec(truth, cls, event_level = "second")
+    sp  <- spec_vec(truth, cls, event_level = "second")
+    j   <- as.numeric(se + sp - 1)
+    if (!is.na(j) && j > best_j) {
+      best_j   <- j
+      best_thr <- t
+    }
+  }
+  best_thr
+}
+```
+
+```{r}
+# 3) Choose threshold by Youden's J on TRAINING data
+thr_youden <- tune_threshold_j(truth = train_ready$Diagnosis, prob = p_train_full)
+thr_youden
+```
+
+
+
+```{r}
+# 4) Metrics at the Youden-tuned threshold (Train & Test)
+cls_train <- factor(ifelse(p_train_full >= thr_youden, "M", "B"),
+                    levels = levels(train_ready$Diagnosis))
+cls_test  <- factor(ifelse(p_test_full  >= thr_youden, "M", "B"),
+                    levels = levels(test_ready$Diagnosis))
+
+metrics_tbl <- tribble(~set, ~AUC, ~Sensitivity, ~Specificity, ~PPV, ~NPV,
+  "Train",
+  roc_auc_vec(train_ready$Diagnosis, p_train_full, event_level = "second"),
+  sens_vec(train_ready$Diagnosis, cls_train, event_level = "second"),
+  spec_vec(train_ready$Diagnosis, cls_train, event_level = "second"),
+  ppv_vec (train_ready$Diagnosis, cls_train, event_level = "second"),
+  npv_vec (train_ready$Diagnosis, cls_train, event_level = "second"),
+  "Test",
+  roc_auc_vec(test_ready$Diagnosis,  p_test_full,  event_level = "second"),
+  sens_vec(test_ready$Diagnosis,  cls_test,  event_level = "second"),
+  spec_vec(test_ready$Diagnosis,  cls_test,  event_level = "second"),
+  ppv_vec (test_ready$Diagnosis,  cls_test,  event_level = "second"),
+  npv_vec (test_ready$Diagnosis,  cls_test,  event_level = "second")
+)
+
+metrics_tbl %>% kable(digits = 3,
+                      caption = paste0("Full Model Performance at Youden's Threshold (t = ", round(thr_youden, 3), ")"))
+```
+
+```{r}
+# 5) (Optional) Visualize the training ROC with the Youden point highlighted
+#    Compute J across thresholds from the training ROC object
+roc_train_with_j <- roc_train %>%
+  mutate(J = sensitivity + specificity - 1)
+
+idx_best <- which.max(roc_train_with_j$J)
+pt <- roc_train_with_j[idx_best, ]
+
+ggplot(roc_train_with_j, aes(x = 1 - specificity, y = sensitivity)) +
+  geom_path(color = "steelblue", linewidth = 1) +
+  geom_abline(slope = 1, intercept = 0, linetype = 3) +
+  geom_point(data = pt, color = "red", size = 3) +
+  annotate("text",
+           x = 1 - pt$specificity, y = pt$sensitivity,
+           label = paste0("Youden point\nJ = ", round(pt$J, 3)),
+           hjust = -0.1, vjust = 1.2, size = 3.5) +
+  coord_equal() +
+  labs(title = "Training ROC — Youden’s Index Highlighted (Full Model)",
+       x = "1 - Specificity (FPR)", y = "Sensitivity (TPR)") +
+  theme_minimal(base_size = 13)
+```
+
+⸻
+
+
+# CV Model Selection using AUC, Specificity, and NPV
+
+
+We’ll compare three candidates on the training data using 10-fold stratified CV:
+
+•	Full logistic model (all 30 predictors),
+
+•	AIC-selected model,
+
+•	BIC-selected model.
+
+
+For specificity and NPV we'll use a fixed threshold 0.5 for probabilities for now.
+
+
+
+```{r}
+set.seed(735794)
+folds <- vfold_cv(train, v = 10, strata = Diagnosis)
+
+# helper: fit a recipe + model in one fold, then compute metrics on assessment
+evaluate_glm_cv <- function(formula_obj, folds, base_recipe, threshold = 0.5) {
+  map_dfr(seq_len(nrow(folds)), function(i){
+    sp  <- folds$splits[[i]]
+    tr  <- analysis(sp)
+    va  <- assessment(sp)
+    
+    # fold-specific preprocessing to prevent leakage
+    rec <- prep(base_recipe, training = tr)
+    trx <- bake(rec, tr)
+    vax <- bake(rec, va)
+    
+    fit <- glm(formula_obj, data = trx, family = binomial())
+    p   <- predict(fit, newdata = vax, type = "response")
+    cls <- factor(ifelse(p >= threshold, "M", "B"), levels = levels(vax$Diagnosis))
+    
+    tibble(
+      fold = i,
+      auc  = roc_auc_vec(vax$Diagnosis, p,   event_level = "second"),
+      spec = spec_vec(vax$Diagnosis, cls,    event_level = "second"),
+      npv  = npv_vec(vax$Diagnosis,  cls,    event_level = "second")
+    )
+  }) %>%
+    summarise(across(c(auc,spec,npv), list(mean = mean, sd = sd)))
+}
+
+# Build candidate formulas
+form_full <- as.formula(Diagnosis ~ .)
+form_aic  <- formula(aic_fit)
+form_bic  <- formula(bic_fit)
+
+cv_full <- evaluate_glm_cv(form_full, folds, rec_base)
+cv_aic  <- evaluate_glm_cv(form_aic,  folds, rec_base)
+cv_bic  <- evaluate_glm_cv(form_bic,  folds, rec_base)
+
+bind_rows(
+  mutate(cv_full, model = "Full"),
+  mutate(cv_aic,  model = "AIC"),
+  mutate(cv_bic,  model = "BIC")
+) %>%
+  relocate(model) %>%
+  kable(digits = 3, caption = "10-fold CV metrics (threshold = 0.5)") %>%
+  kable_styling(full_width = FALSE)
+```
+
+**Selection:** pick the model that best aligns with your goal (e.g., highest AUC overall; or, for screening, prioritize high NPV/sensitivity).
+
+The AUC, NPV, sensitivity, etc. from the best model are biased for two reasons: (i) we chose the model based on these values, (ii) we used all the training data to get the AIC/BIC models. 
+
+To get unbiased error estimation, we'll evaluate the chosen model on the held-out test set:
+
+```{r}
+# pick by AUC mean (example)
+cv_table <- bind_rows(
+  mutate(cv_full, model = "Full"),
+  mutate(cv_aic,  model = "AIC"),
+  mutate(cv_bic,  model = "BIC")
+) %>% mutate(auc_mean = auc_mean)
+
+(best_model <- cv_table$model[which.max(cv_table$auc_mean)])
+best_form  <- list(Full = form_full, AIC = form_aic, BIC = form_bic)[[best_model]]
+
+# final refit on entire training (with preprocessing from earlier)
+final_glm <- glm(best_form, data = train_ready, family = binomial())
+p_test    <- predict(final_glm, newdata = test_ready, type = "response")
+cls_test  <- factor(ifelse(p_test >= 0.5, "M","B"), levels = levels(test_ready$Diagnosis))
+
+tibble(
+  set  = "Test",
+  AUC  = roc_auc_vec(test_ready$Diagnosis, p_test,  event_level = "second"),
+  Spec = spec_vec(test_ready$Diagnosis,    cls_test, event_level = "second"),
+  NPV  = npv_vec(test_ready$Diagnosis,     cls_test, event_level = "second")
+) %>% kable(digits = 3)
+```
+
+⸻
+
+## CV with tuned threshold (Youden J inside each fold)
+
+What we do below is similar to above, but it answers a different questions. Which is the best model (full/AIC/BIC) when each have their thresholds for positive/negative tuned using Youden's J.
+
+```{r}
+# Evaluate a GLM with fold-wise preprocessing and THRESHOLD TUNING by Youden's J
+evaluate_glm_cv_tuned <- function(formula_obj, folds, base_recipe) {
+  map_dfr(seq_len(nrow(folds)), function(i){
+    sp  <- folds$splits[[i]]
+    tr  <- analysis(sp)
+    va  <- assessment(sp)
+    
+    # fold-specific preprocessing (prevents leakage)
+    rec <- prep(base_recipe, training = tr)
+    trx <- bake(rec, tr)
+    vax <- bake(rec, va)
+    
+    # fit on training portion
+    fit <- glm(formula_obj, data = trx, family = binomial())
+    
+    # --- Threshold tuning on TRAINING portion (resubstitution) ---
+    p_tr   <- predict(fit, newdata = trx, type = "response")
+    thr_j  <- tune_threshold_j(truth = trx$Diagnosis, prob = p_tr)
+    
+    # --- Evaluate on VALIDATION portion using tuned threshold ---
+    p_va   <- predict(fit, newdata = vax, type = "response")
+    cls_va <- factor(ifelse(p_va >= thr_j, "M", "B"), levels = levels(vax$Diagnosis))
+    
+    tibble(
+      fold = i,
+      thr  = thr_j,
+      auc  = roc_auc_vec(vax$Diagnosis, p_va,   event_level = "second"),
+      spec = spec_vec(vax$Diagnosis,    cls_va, event_level = "second"),
+      npv  = npv_vec(vax$Diagnosis,     cls_va, event_level = "second")
+    )
+  }) %>%
+    summarise(
+      thr_mean = mean(thr),
+      thr_sd   = sd(thr),
+      across(c(auc, spec, npv), list(mean = mean, sd = sd))
+    )
+}
+```
+
+Run tuned-threshold CV for your three candidate models
+
+```{r}
+set.seed(735794)
+folds <- vfold_cv(train, v = 10, strata = Diagnosis)
+
+cv_full_tuned <- evaluate_glm_cv_tuned(form_full, folds, rec_base)
+cv_aic_tuned  <- evaluate_glm_cv_tuned(form_aic,  folds, rec_base)
+cv_bic_tuned  <- evaluate_glm_cv_tuned(form_bic,  folds, rec_base)
+
+bind_rows(
+  mutate(cv_full_tuned, model = "Full"),
+  mutate(cv_aic_tuned,  model = "AIC"),
+  mutate(cv_bic_tuned,  model = "BIC")
+) %>%
+  relocate(model) %>%
+  kable(digits = 3,
+        caption = "10-fold CV with fold-wise threshold tuning (Youden's J on training portion)")
+```
+
+⸻
+
+Notes to include beneath the table (optional)
+
+•	What changed? Instead of using a fixed 0.5 threshold, each fold now learns its own threshold from the training portion by maximizing Youden’s J (sensitivity + specificity − 1).
+
+•	Why do this? If class prevalence or costs are asymmetric, tuning the threshold can substantially improve specificity or NPV (or sensitivity) compared with a fixed 0.5.
+
+•	**Caveat:** This is still within-fold tuning (based on resubstitution on the training portion), which is acceptable for model selection but will give biased estimates of the error. If you want unbiased estimates of performance, combine this with nested CV or keep a held-out test set for the final report.
+
+# Logistic Lasso (glmnet)
+
+We fit a penalized logistic regression (lasso) with internal CV to choose ($\lambda$). Then evaluate on the test set.
+
+```{r}
+# Rebuild design matrices from the preprocessed data
+x_tr <- model.matrix(Diagnosis ~ . - 1, data = train_ready)
+y_tr <- train_ready$Diagnosis
+
+x_te <- model.matrix(Diagnosis ~ . - 1, data = test_ready)
+y_te <- test_ready$Diagnosis
+
+set.seed(202)
+cv_lasso <- cv.glmnet(x_tr, y_tr, alpha = 1, family = "binomial", 
+                      nfolds = 10, type.measure = "class")
+plot(cv_lasso)
+lam_min  <- cv_lasso$lambda.min
+lam_1se  <- cv_lasso$lambda.1se
+
+fit_min <- glmnet(x_tr, y_tr, alpha = 1, family = "binomial", lambda = lam_min)
+fit_1se <- glmnet(x_tr, y_tr, alpha = 1, family = "binomial", lambda = lam_1se)
+
+
+tibble(
+  Variable = rownames(coef(fit_min))[-1],
+  coef_full = coef(full_glm)[-1],
+  coef_min = coef(fit_min)[-1],
+  coef_1se = coef(fit_1se)[-1], 
+) %>% kable(digits = 3, caption = "Coefficient estimates for Logistic Lasso (note: all X and standardized).")
+
+p_min <- predict(fit_min, newx = x_te, type = "response")[,1]
+p_1se <- predict(fit_1se, newx = x_te, type = "response")[,1]
+
+cls_min <- factor(ifelse(p_min >= 0.5, "M","B"), levels = levels(y_te))
+cls_1se <- factor(ifelse(p_1se >= 0.5, "M","B"), levels = levels(y_te))
+
+
+tibble(
+  model = c("Lasso (min)","Lasso (1SE)"),
+  AUC   = c(roc_auc_vec(y_te, p_min, event_level = "second"),
+            roc_auc_vec(y_te, p_1se, event_level = "second")),
+  Spec  = c(spec_vec(y_te, cls_min, event_level = "second"),
+            spec_vec(y_te, cls_1se, event_level = "second")),
+  NPV   = c(npv_vec(y_te, cls_min, event_level = "second"),
+            npv_vec(y_te, cls_1se, event_level = "second"))
+) %>% kable(digits = 3, caption = "Test-set performance: Logistic Lasso")
+```
+
+Inspect sparsity:
+
+```{r}
+nnz <- function(m) sum(as.numeric(m)!=0)
+tibble(
+  Model = c("Lasso (min)","Lasso (1SE)"),
+  Nonzero = c(nnz(coef(fit_min)), nnz(coef(fit_1se)))
+) %>% kable()
+```
+
+
+# LDA and QDA
+
+We’ll fit LDA and QDA (after standardizing predictors). QDA can have singularity issues when classes are small; standardization and all-numeric predictors help.
+
+
+```{r}
+# Train LDA/QDA on preprocessed training data
+lda_fit <- MASS::lda(Diagnosis ~ ., data = train_ready)
+qda_fit <- MASS::qda(Diagnosis ~ ., data = train_ready)
+
+# Predict on test set
+pred_lda <- predict(lda_fit, newdata = test_ready)
+pred_qda <- predict(qda_fit, newdata = test_ready)
+
+head(pred_lda$posterior)
+head(pred_lda$class)
+
+# yardstick expects class probs for AUC; LDA/QDA return posteriors
+p_lda <- pred_lda$posterior[, "M"]
+p_qda <- pred_qda$posterior[, "M"]
+
+cls_lda <- factor(pred_lda$class, levels = levels(test_ready$Diagnosis))
+cls_qda <- factor(pred_qda$class, levels = levels(test_ready$Diagnosis))
+
+tibble(
+  model = c("LDA","QDA"),
+  AUC   = c(roc_auc_vec(test_ready$Diagnosis, p_lda, event_level = "second"),
+            roc_auc_vec(test_ready$Diagnosis, p_qda, event_level = "second")),
+  Spec  = c(spec_vec(test_ready$Diagnosis, cls_lda, event_level = "second"),
+            spec_vec(test_ready$Diagnosis, cls_qda, event_level = "second")),
+  NPV   = c(npv_vec(test_ready$Diagnosis,  cls_lda, event_level = "second"),
+            npv_vec(test_ready$Diagnosis,  cls_qda, event_level = "second"))
+) %>% kable(digits = 3, caption = "Test-set performance: LDA and QDA")
+```
+
+The following 
+
+(1) fits LDA and QDA, 
+
+(2) tunes the posterior cutoff with K-fold CV using Youden’s J inside each fold (training portion only), and 
+
+(3) reports CV metrics and then refits on all training data to evaluate on the held-out test set using the CV-chosen cutoff.
+
+
+```{r}
+
+# General CV evaluation for LDA or QDA with fold-wise preprocessing and cutoff tuning
+evaluate_discriminant_cv <- function(method = c("lda","qda"),
+                                     folds, base_recipe) {
+  method <- match.arg(method)
+
+  map_dfr(seq_len(nrow(folds)), function(i){
+    sp  <- folds$splits[[i]]
+    tr  <- analysis(sp)
+    va  <- assessment(sp)
+
+    # Fold-specific preprocessing to avoid leakage
+    rec <- prep(base_recipe, training = tr)
+    trx <- bake(rec, tr)
+    vax <- bake(rec, va)
+
+    # Fit LDA/QDA on TRAIN
+    fit <- switch(method,
+                  lda = MASS::lda(Diagnosis ~ ., data = trx),
+                  qda = MASS::qda(Diagnosis ~ ., data = trx))
+
+    # Posterior probs for the Malignant class ("M")
+    p_tr <- predict(fit, newdata = trx)$posterior[, "M"]
+    p_va <- predict(fit, newdata = vax)$posterior[, "M"]
+
+    # Tune threshold on TRAIN by Youden's J
+    thr  <- tune_threshold_j(truth = trx$Diagnosis, prob = p_tr)
+
+    # Evaluate on VALIDATION at tuned threshold
+    cls_va <- factor(ifelse(p_va >= thr, "M", "B"), levels = levels(vax$Diagnosis))
+
+    tibble(
+      fold = i,
+      thr  = thr,
+      auc  = roc_auc_vec(vax$Diagnosis, p_va,   event_level = "second"),
+      spec = spec_vec(vax$Diagnosis,    cls_va, event_level = "second"),
+      npv  = npv_vec(vax$Diagnosis,     cls_va, event_level = "second")
+    )
+  }) %>%
+    summarise(
+      thr_mean = mean(thr), thr_sd = sd(thr),
+      auc_mean = mean(auc), auc_sd = sd(auc),
+      spec_mean = mean(spec), spec_sd = sd(spec),
+      npv_mean  = mean(npv),  npv_sd  = sd(npv)
+    )
+}
+
+set.seed(735794)
+folds <- vfold_cv(train, v = 10, strata = Diagnosis)
+
+cv_lda <- evaluate_discriminant_cv("lda", folds, rec_base)
+cv_qda <- evaluate_discriminant_cv("qda", folds, rec_base)
+
+bind_rows(
+  mutate(cv_lda, model = "LDA"),
+  mutate(cv_qda, model = "QDA")
+) %>%
+  relocate(model) %>%
+  kable(digits = 3,
+        caption = "10-fold CV with fold-wise Youden tuning: LDA vs QDA") %>%
+  kable_styling(full_width = FALSE)
+```
+
+⸻
+
+# Wrap-Up
+
+•	AIC/BIC give quick, interpretable logistic models;
+
+•	CV + AUC/Spec/NPV lets us pick models aligned with clinical goals (e.g., high NPV for screening);
+
+•	Lasso adds regularization and automatic feature selection;
+
+•	LDA/QDA provide classical discriminant approaches—often surprisingly competitive after proper standardization.
+
+•	For those score at home, either the Lasso model fit the data the "best" (using AUC)
+
+
+```{r}
+sessionInfo()
+```

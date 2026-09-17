@@ -1,0 +1,403 @@
+---
+title: "Naive Bayes with Mixed Feature Types — Wisconsin Breast Cancer (WDBC)"
+subtitle: "Biostatistics 735/794 — Machine Learning in Public Health (R)"
+author: "Alexander McLain"
+date: today
+format:
+  html:
+    toc: true
+    toc-location: left
+    toc-depth: 3
+    number-sections: true
+    smooth-scroll: true
+    theme: cosmo
+    code-fold: false
+    highlight-style: github
+    embed-resources: true
+execute:
+  echo: true
+  warning: false
+  message: false
+lang: en
+---
+
+```{r}
+#| include: false
+set.seed(735794)
+
+# Core
+library(tidyverse)
+library(rsample)
+library(yardstick)
+library(knitr)
+library(kableExtra)
+
+# Models
+library(e1071)   # naiveBayes (Gaussian / mixed-type)
+library(klaR)    # NaiveBayes with usekernel = TRUE (kernel-density NB)
+
+select <- dplyr::select 
+
+# Small helper: nice tables
+kbl2 <- function(x, digits = 3, ...) kable(x, align = "lrrrrrr", digits = digits, ...) %>% kable_styling(full_width = FALSE)
+```
+
+# Setup
+
+We reuse the WDBC data and the train/test split from the previous two
+examples.
+
+```{r}
+url_data  <- "https://archive.ics.uci.edu/ml/machine-learning-databases/breast-cancer-wisconsin/wdbc.data"
+raw <- read.csv(url_data, header = FALSE)
+
+names(raw) <- c("ID","Diagnosis",
+                "radius_mean","texture_mean","perimeter_mean","area_mean","smoothness_mean",
+                "compactness_mean","concavity_mean","concave_points_mean","symmetry_mean","fractal_dimension_mean",
+                "radius_se","texture_se","perimeter_se","area_se","smoothness_se",
+                "compactness_se","concavity_se","concave_points_se","symmetry_se","fractal_dimension_se",
+                "radius_worst","texture_worst","perimeter_worst","area_worst","smoothness_worst",
+                "compactness_worst","concavity_worst","concave_points_worst","symmetry_worst","fractal_dimension_worst")
+
+bc <- raw %>%
+  as_tibble() %>%
+  mutate(Diagnosis = factor(Diagnosis, levels = c("B","M"))) %>%  # B = negative, M = positive
+  select(-ID)
+
+set.seed(42)
+split <- initial_split(bc, prop = 0.8, strata = Diagnosis)
+train <- training(split)
+test  <- testing(split)
+```
+
+A helper to compute the metrics we've discussed (AUC is threshold-free; others use a threshold, default 0.5):
+
+```{r}
+eval_metrics <- function(truth, prob_pos, thr = 0.5) {
+  truth <- factor(truth, levels = c("B","M"))     # "M" is event
+  cls   <- factor(ifelse(prob_pos >= thr, "M","B"), levels = c("B","M"))
+  tibble(
+    AUC  = roc_auc_vec(truth, prob_pos, event_level = "second"),
+    Sens = sens_vec(truth, cls,        event_level = "second"),
+    Spec = spec_vec(truth, cls,        event_level = "second"),
+    PPV  = ppv_vec (truth, cls,        event_level = "second"),
+    NPV  = npv_vec (truth, cls,        event_level = "second"),
+    Acc  = accuracy_vec(truth, cls)
+  )
+}
+```
+
+---
+
+# Part A — **Gaussian Naive Bayes** (treat all predictors as continuous)
+
+`e1071::naiveBayes` models numeric predictors with a Gaussian density per class and factors with multinomial/Bernoulli. Here we keep **all 30 features numeric** → Gaussian NB.
+
+```{r}
+nb_gauss <- naiveBayes(Diagnosis ~ ., data = train, laplace = 0)  # no smoothing needed for continuous
+
+p_tr_g <- predict(nb_gauss, newdata = train, type = "raw")[,"M"]
+p_te_g <- predict(nb_gauss, newdata = test,  type = "raw")[,"M"]
+
+metrics_gauss <- bind_rows(
+  eval_metrics(train$Diagnosis, p_tr_g) %>% mutate(Set = "Train"),
+  eval_metrics(test$Diagnosis,  p_te_g) %>% mutate(Set = "Test")
+) %>% relocate(Set)
+
+kbl2(metrics_gauss, caption = "Gaussian Naive Bayes: Performance (threshold = 0.5)")
+```
+
+ROC curve (train vs test):
+
+```{r}
+train$estimate <- p_tr_g
+test$estimate  <- p_te_g
+roc_train_g <- yardstick::roc_curve(data = train, Diagnosis, estimate, event_level = "second") %>% mutate(Set = "Train")
+roc_test_g  <- yardstick::roc_curve(data = test, Diagnosis,  estimate, event_level = "second") %>% mutate(Set = "Test")
+
+bind_rows(roc_train_g, roc_test_g) %>%
+  ggplot(aes(x = 1 - specificity, y = sensitivity, color = Set)) +
+  geom_path(linewidth = 1) + geom_abline(slope = 1, intercept = 0, linetype = 3) +
+  coord_equal() + theme_minimal(base_size = 13) +
+  labs(title = "Gaussian Naive Bayes — ROC", x = "1 - Specificity (FPR)", y = "Sensitivity (TPR)")
+```
+
+---
+
+# Part B — **Mixed-Type Naive Bayes** (some binary, some multinomial, some continuous)
+
+Here we transform a few predictors to **binary** (median split) and a few to **multinomial** (tertiles), and leave the rest **continuous**. `naiveBayes` will combine the appropriate likelihoods under the Naive assumption.
+
+**Choices for this demo**
+
+* Binary: `radius_mean`, `texture_mean`, `perimeter_mean` (High vs Low, median split)
+* Multinomial (3-level): `area_mean`, `smoothness_mean` (Low/Med/High via tertiles)
+* Continuous: all remaining features stay numeric
+
+```{r}
+make_mixed <- function(df) {
+  out <- df
+
+  # Binary via median split
+  for (v in c("radius_mean","texture_mean","perimeter_mean")) {
+    med <- median(out[[v]], na.rm = TRUE)
+    out[[paste0(v,"_bin")]] <- factor(ifelse(out[[v]] > med, "High","Low"))
+    out[[v]] <- NULL
+  }
+
+  # Multinomial via tertiles
+  for (v in c("area_mean","smoothness_mean")) {
+    qs <- quantile(out[[v]], probs = c(1/3, 2/3), na.rm = TRUE)
+    cutv <- cut(out[[v]],
+                breaks = c(-Inf, qs[1], qs[2], Inf),
+                labels = c("Low","Med","High"),
+                right = TRUE)
+    out[[paste0(v,"_ter")]] <- factor(cutv)
+    out[[v]] <- NULL
+  }
+
+  out
+}
+
+train_mx <- make_mixed(train)
+test_mx  <- make_mixed(test)
+```
+
+Fit Naive Bayes with **Laplace smoothing** (recommended when categorical levels can be rare):
+
+```{r}
+nb_mixed <- naiveBayes(Diagnosis ~ ., data = train_mx, laplace = 1)
+
+p_tr_mx <- predict(nb_mixed, newdata = train_mx, type = "raw")[,"M"]
+p_te_mx <- predict(nb_mixed, newdata = test_mx,  type = "raw")[,"M"]
+
+metrics_mixed <- bind_rows(
+  eval_metrics(train_mx$Diagnosis, p_tr_mx) %>% mutate(Set = "Train"),
+  eval_metrics(test_mx$Diagnosis,  p_te_mx) %>% mutate(Set = "Test")
+) %>% relocate(Set)
+
+kbl2(metrics_mixed, caption = "Mixed-Type Naive Bayes (binary + multinomial + continuous): Performance (threshold = 0.5)")
+```
+
+ROC curve (train vs test) for the mixed model:
+
+```{r}
+train$estimate_mx <- p_tr_mx
+test$estimate_mx  <- p_te_mx
+roc_train_m <- yardstick::roc_curve(data = train, Diagnosis, estimate_mx, event_level = "second") %>% mutate(Set = "Train")
+roc_test_m  <- yardstick::roc_curve(data = test, Diagnosis,  estimate_mx, event_level = "second") %>% mutate(Set = "Test")
+
+bind_rows(roc_train_m, roc_test_m) %>%
+  ggplot(aes(x = 1 - specificity, y = sensitivity, color = Set)) +
+  geom_path(linewidth = 1) + geom_abline(slope = 1, intercept = 0, linetype = 3) +
+  coord_equal() + theme_minimal(base_size = 13) +
+  labs(title = "Mixed-Type Naive Bayes — ROC", x = "1 - Specificity (FPR)", y = "Sensitivity (TPR)")
+```
+
+---
+
+## Summary So Far
+
+* **Naive Bayes is a framework**: multiply class-conditional likelihoods per feature under conditional independence.
+* With `e1071::naiveBayes`, **numeric** variables are modeled as **Gaussian**; **factors** are modeled as **multinomial/Bernoulli** with optional **Laplace smoothing**.
+* You can **mix feature types** in the same model (as we did with binary + multinomial + continuous).
+* Report both **threshold-free (AUC)** and **thresholded (Se/Sp/PPV/NPV/Acc)** performance.
+
+---
+
+# Part C — **Kernel-Density Naive Bayes** (non-parametric for continuous features)
+
+Not all of the variables have a normal distribution. For example:
+
+```{r}
+ggplot(data = train) + geom_histogram(aes(radius_mean))
+```
+
+We now replace the Gaussian assumption with a **kernel density estimate
+(KDE)** per class, for every continuous feature. This lets us capture
+skewness, heavy tails, and multi-modality that a Normal model can't. `klaR::NaiveBayes()` fits exactly this
+model with `usekernel = TRUE`: a per-class KDE for every numeric predictor,
+combined under the same Naive independence assumption as Parts A and B.
+
+```{r}
+nb_kde <- NaiveBayes(Diagnosis ~ ., data = train, usekernel = TRUE)
+
+p_tr_kde <- predict(nb_kde, newdata = train)$posterior[, "M"]
+p_te_kde <- predict(nb_kde, newdata = test)$posterior[, "M"]
+
+metrics_kde <- bind_rows(
+  eval_metrics(train$Diagnosis, p_tr_kde) %>% mutate(Set = "Train"),
+  eval_metrics(test$Diagnosis,  p_te_kde) %>% mutate(Set = "Test")
+) %>% relocate(Set)
+
+kbl2(metrics_kde, caption = "Kernel-Density Naive Bayes: Performance (threshold = 0.5)")
+```
+
+ROC curves for KDE-NB:
+
+```{r}
+train$estimate_kde <- p_tr_kde
+test$estimate_kde  <- p_te_kde
+roc_train_kde <- yardstick::roc_curve(data = train, Diagnosis, estimate_kde, event_level = "second") %>% mutate(Set = "Train")
+roc_test_kde  <- yardstick::roc_curve(data = test, Diagnosis,  estimate_kde, event_level = "second") %>% mutate(Set = "Test")
+
+bind_rows(roc_train_kde, roc_test_kde) %>%
+  ggplot(aes(x = 1 - specificity, y = sensitivity, color = Set)) +
+  geom_path(linewidth = 1) + geom_abline(slope = 1, intercept = 0, linetype = 3) +
+  coord_equal() + theme_minimal(base_size = 13) +
+  labs(title = "KDE-Naive Bayes — ROC", x = "1 - Specificity (FPR)", y = "Sensitivity (TPR)")
+```
+
+The bandwidth (`bw`) and kernel (`kernel`) arguments to `NaiveBayes()` control
+how smooth each class-conditional density is — the KDE analogue of a tuning
+parameter, worth adjusting if a density looks too wiggly or too flat.
+
+## Compare Gaussian NB vs Mixed NB vs KDE-NB (test set)
+
+```{r}
+compare_tbl <- list(
+  `Gaussian NB` = eval_metrics(test$Diagnosis,     p_te_g),
+  `Mixed NB`    = eval_metrics(test_mx$Diagnosis,  p_te_mx),
+  `KDE-NB`      = eval_metrics(test$Diagnosis,     p_te_kde)
+) %>%
+  imap_dfr(~ mutate(.x, Model = .y)) %>%
+  relocate(Model)
+
+kbl2(compare_tbl, caption = "Test-set comparison: Gaussian NB vs Mixed NB vs KDE-NB (threshold = 0.5)")
+```
+
+**Notes**
+
+* KDE-NB **drops the Normality assumption** for continuous features; it can adapt to skewed or multi-modal FNA features.
+* Trade-offs: KDE adds flexibility but may overfit with tiny class-specific samples; the bandwidth acts like a **smoothness** tuning parameter, much like `s()` did for GAMs.
+
+---
+
+# Part D — **Naive Bayes with Cost-Sensitive Thresholds**
+
+We are going to use the predicted probabilities from Part C, but now choose the classification
+threshold to reflect asymmetric costs rather than defaulting to 0.5.
+
+**Screening context.** Suppose a false negative (calling a diseased patient
+healthy) is 10 times as costly as a false positive. When a false negative is
+$K$ times as costly as a false positive, the cost-minimizing threshold is
+$1/(K+1)$ — here, $1/11$.
+
+**Confirmation context.** Suppose instead a false positive (calling a healthy patient
+diseased) is 10 times as
+costly as a false negative. When a false positive is $K$ times as costly,
+the cost-minimizing threshold is $K/(K+1)$ — here, $10/11$.
+
+```{r}
+
+metrics_overall <- bind_rows(
+  eval_metrics(train$Diagnosis, p_tr_kde, thr = 0.5) %>% mutate(Set = "Train"),
+  eval_metrics(test$Diagnosis,  p_te_kde, thr = 0.5) %>% mutate(Set = "Test")
+) %>% mutate(Type = "Overall", Threshold = 0.5)
+
+metrics_screen <- bind_rows(
+  eval_metrics(train$Diagnosis, p_tr_kde, thr = 1/11) %>% mutate(Set = "Train"),
+  eval_metrics(test$Diagnosis,  p_te_kde, thr = 1/11) %>% mutate(Set = "Test")
+) %>% mutate(Type = "Screen", Threshold = 1/11)
+
+metrics_confirm <- bind_rows(
+  eval_metrics(train$Diagnosis, p_tr_kde, thr = 10/11) %>% mutate(Set = "Train"),
+  eval_metrics(test$Diagnosis,  p_te_kde, thr = 10/11) %>% mutate(Set = "Test")
+) %>% mutate(Type = "Confirm", Threshold = 10/11)
+
+metrics_cost <- bind_rows(metrics_overall, metrics_screen, metrics_confirm) %>%
+  relocate(Set, Type, Threshold)
+
+kbl2(metrics_cost %>% filter(Set == "Train"),
+     caption = "Gaussian Naive Bayes: Overall vs. Cost-Sensitive Thresholds (Test Set)", digits = 3)
+
+kbl2(metrics_cost %>% filter(Set == "Test"),
+     caption = "Gaussian Naive Bayes: Overall vs. Cost-Sensitive Thresholds (Test Set)", digits = 3)
+```
+
+**Reading the comparison:**
+
+Under Gaussian NB, none of the test-set predicted probabilities fell between
+$1/11$ and $10/11$ — the Gaussian model is confident enough that moving the
+threshold anywhere in that range reclassifies nobody, so the overall,
+screen, and confirm rows are identical. That's itself worth pointing out:
+it's a sign of how peaked the Gaussian posterior tends to be, not a bug.
+
+Switching to KDE-NB, a handful of predicted probabilities do fall in that
+band, so the three thresholds now produce different classifications. On the
+training set, the results look textbook: moving from screen to confirm
+pushes specificity to a perfect 1.00 and PPV to 1.00, with sensitivity and
+NPV essentially unchanged. That's the theoretical trade-off working as
+expected, and it's not surprising — training data is where the model fits
+best, and there's enough data for the general pattern to show through
+cleanly.
+
+The test set is the interesting case. Going from screen ($1/11$) to confirm
+($10/11$) drops sensitivity from 0.884 to 0.860, while specificity stays
+exactly flat at 0.958 — and PPV, NPV, and accuracy all *decrease* slightly
+instead of PPV increasing the way theory predicts. This isn't a contradiction
+of the theory, it's a consequence of how few observations are actually
+driving it. If only one or two malignant cases sit in that borderline
+probability range, raising the threshold reclassifies just those one or two
+patients from "predicted M" to "predicted B" — which mechanically lowers
+sensitivity — while zero benign cases happen to cross the line in the other
+direction, so specificity doesn't move at all. With so few borderline cases,
+a single reclassified patient can dominate the metrics and push them in a
+direction that doesn't match the population-level trade-off the theory
+describes.
+
+The lesson: the sensitivity/specificity/PPV/NPV trade-off from moving a
+threshold is an *expected* pattern over enough borderline cases, not a
+guarantee in any particular finite sample. A test set this size, with only a
+few predictions near the cutoff, is exactly where you should expect noisy,
+occasionally counter-intuitive movement — and it's a good reminder to look
+at *how many* observations a threshold change actually affects before
+reading much into the direction of the shift.
+
+
+```{r}
+par(mfrow = c(2, 2))
+hist(p_tr_kde[train$Diagnosis == "B"], breaks = 100, main = "Histogram of pi's for Healthy (train)", xlim = c(0,1))
+abline(v = c(1/11,1/2,10/11), col = c(3,1,4))
+hist(p_te_kde[test$Diagnosis == "B"], breaks = 100, main = "Histogram of pi's for Healthy (test)", xlim = c(0,1))
+abline(v = c(1/11,1/2,10/11), col = c(3,1,4))
+hist(p_tr_kde[train$Diagnosis == "M"], breaks = 100, main = "Histogram of pi's for Diseased (train)", xlim = c(0,1))
+abline(v = c(1/11,1/2,10/11), col = c(3,1,4))
+hist(p_te_kde[test$Diagnosis == "M"], breaks = 100, main = "Histogram of pi's for Diseased (test)", xlim = c(0,1))
+abline(v = c(1/11,1/2,10/11), col = c(3,1,4))
+```
+
+**Notes**
+
+* **For screening:** decreasing the threshold results in more FPs, fewer
+  FNs, **higher sensitivity**, lower specificity, **higher NPV**, and lower
+  PPV. *The test prioritizes not missing diseased individuals — ruling
+  people out.*
+* **For confirmation:** increasing the threshold results in fewer FPs, more
+  FNs, lower sensitivity, **higher specificity**, lower NPV, and **higher
+  PPV.** *The test prioritizes not calling healthy individuals diseased —
+  ruling people in.*
+* **For overall predictive accuracy** with no clear cost asymmetry, a
+  threshold of 0.5 is the natural default.
+  
+  
+  
+# GAM for the Breast Cancer Data
+
+
+
+```{r}
+library(mgcv)
+
+gam_fit <- gam(
+  Diagnosis ~ s(radius_worst) + s(radius_se)  + s(texture_mean) + s(concavity_mean),
+  data   = train,
+  family = binomial
+)
+
+summary(gam_fit)
+plot(gam_fit, pages = 1, shade = TRUE, seWithMean = TRUE)
+```
+
+
+  

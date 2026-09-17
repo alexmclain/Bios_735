@@ -1,0 +1,530 @@
+---
+title: "Breast Cancer Classification II"
+subtitle: "Biostatistics 735"
+author: "Alexander McLain"
+date: today
+format:
+  html:
+    toc: true
+    toc-location: left
+    toc-depth: 3
+    number-sections: true
+    smooth-scroll: true
+    theme: cosmo
+    code-fold: false
+    highlight-style: github
+    embed-resources: true
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+```{r}
+# Core
+set.seed(735794)
+library(tidyverse)
+library(rsample)
+library(recipes)
+library(yardstick)
+library(broom)
+library(knitr)
+library(kableExtra)
+
+# Models
+library(glmnet)
+library(ncvreg)
+
+# Metrics
+library(pROC)
+```
+
+# Loading in the data
+
+**Data:** Wisconsin Diagnostic Breast Cancer (WDBC)
+
+Each row is a patient. Outcome is diagnosis: Malignant (M) or Benign (B).
+
+There are 30 numeric features computed from a digitized image of a breast mass (10 characteristics × 3 summaries: mean, standard error, “worst”).
+
+```{r}
+#| cache: true
+
+url_data <- "https://archive.ics.uci.edu/ml/machine-learning-databases/breast-cancer-wisconsin/wdbc.data"
+raw <- read.csv(url_data, header = FALSE)
+
+names(raw) <- c(
+  "ID","Diagnosis",
+  "radius_mean","texture_mean","perimeter_mean","area_mean","smoothness_mean",
+  "compactness_mean","concavity_mean","concave_points_mean","symmetry_mean",
+  "fractal_dimension_mean",
+  "radius_se","texture_se","perimeter_se","area_se","smoothness_se",
+  "compactness_se","concavity_se","concave_points_se","symmetry_se",
+  "fractal_dimension_se",
+  "radius_worst","texture_worst","perimeter_worst","area_worst","smoothness_worst",
+  "compactness_worst","concavity_worst","concave_points_worst","symmetry_worst",
+  "fractal_dimension_worst"
+)
+
+bc <- raw %>%
+  as_tibble() %>%
+  mutate(Diagnosis = factor(Diagnosis, levels = c("B","M"))) %>%
+  select(-ID)
+
+glimpse(bc)
+summary(bc$Diagnosis)
+```
+
+We’ll create a train/test split once, then do model selection and evaluation within the training set. The test set is reserved for final evaluation.
+
+```{r}
+#| cache: true
+
+set.seed(42)
+
+split <- initial_split(bc, prop = 0.8, strata = Diagnosis)
+train <- training(split)
+test  <- testing(split)
+
+nrow(train)
+nrow(test)
+```
+
+# Preprocessing
+
+```{r}
+#| cache: true
+
+rec_base <- recipe(Diagnosis ~ ., data = train) %>%
+  step_zv(all_predictors()) %>%
+  step_normalize(all_predictors())
+
+prep_base <- prep(rec_base)
+
+train_ready <- bake(prep_base, train)
+test_ready  <- bake(prep_base, test)
+```
+
+Create the design matrices used by all four methods.
+
+```{r}
+#| cache: true
+
+x_tr <- model.matrix(Diagnosis ~ . - 1, data = train_ready)
+y_tr <- train_ready$Diagnosis
+
+x_te <- model.matrix(Diagnosis ~ . - 1, data = test_ready)
+y_te <- test_ready$Diagnosis
+```
+
+# Logistic Lasso
+
+```{r}
+#| cache: true
+
+set.seed(202)
+
+cv_lasso <- cv.glmnet(
+  x_tr, y_tr,
+  alpha = 1,
+  family = "binomial",
+  nfolds = 10,
+  type.measure = "class"
+)
+
+plot(cv_lasso)
+
+lam_min <- cv_lasso$lambda.min
+lam_1se <- cv_lasso$lambda.1se
+
+fit_min <- glmnet(
+  x_tr, y_tr,
+  alpha = 1,
+  family = "binomial",
+  lambda = lam_min
+)
+
+fit_1se <- glmnet(
+  x_tr, y_tr,
+  alpha = 1,
+  family = "binomial",
+  lambda = lam_1se
+)
+
+p_min <- predict(fit_min, newx = x_te, type = "response")[, 1]
+p_1se <- predict(fit_1se, newx = x_te, type = "response")[, 1]
+
+cls_min <- factor(
+  ifelse(p_min >= 0.5, "M", "B"),
+  levels = levels(y_te)
+)
+
+cls_1se <- factor(
+  ifelse(p_1se >= 0.5, "M", "B"),
+  levels = levels(y_te)
+)
+```
+
+# Logistic Ridge
+
+```{r}
+#| cache: true
+
+set.seed(202)
+
+cv_ridge <- cv.glmnet(
+  x_tr, y_tr,
+  alpha = 0,
+  family = "binomial",
+  nfolds = 10,
+  type.measure = "class"
+)
+
+plot(cv_ridge)
+
+lam_min_ridge <- cv_ridge$lambda.min
+lam_1se_ridge <- cv_ridge$lambda.1se
+
+fit_min_ridge <- glmnet(
+  x_tr, y_tr,
+  alpha = 0,
+  family = "binomial",
+  lambda = lam_min_ridge
+)
+
+fit_1se_ridge <- glmnet(
+  x_tr, y_tr,
+  alpha = 0,
+  family = "binomial",
+  lambda = lam_1se_ridge
+)
+
+p_min_ridge <- predict(
+  fit_min_ridge,
+  newx = x_te,
+  type = "response"
+)[, 1]
+
+p_1se_ridge <- predict(
+  fit_1se_ridge,
+  newx = x_te,
+  type = "response"
+)[, 1]
+
+cls_min_ridge <- factor(
+  ifelse(p_min_ridge >= 0.5, "M", "B"),
+  levels = levels(y_te)
+)
+
+cls_1se_ridge <- factor(
+  ifelse(p_1se_ridge >= 0.5, "M", "B"),
+  levels = levels(y_te)
+)
+```
+
+# Logistic MCP and SCAD
+
+```{r}
+#| cache: true
+
+set.seed(202)
+
+cv_mcp <- cv.ncvreg(
+  x_tr, y_tr,
+  penalty = "MCP",
+  family = "binomial",
+  nfolds = 10,
+  nlambda = 200
+)
+
+plot(cv_mcp)
+
+set.seed(202)
+
+cv_scad <- cv.ncvreg(
+  x_tr, y_tr,
+  penalty = "SCAD",
+  family = "binomial",
+  nfolds = 10,
+  nlambda = 200
+)
+
+plot(cv_scad)
+```
+
+Use the $\lambda$ selected by cross-validation to obtain the final MCP and SCAD fits.
+
+```{r}
+#| cache: true
+
+lambda_mcp <- cv_mcp$lambda.min
+lambda_scad <- cv_scad$lambda.min
+
+coef_mcp <- coef(cv_mcp$fit, lambda = lambda_mcp)
+coef_scad <- coef(cv_scad$fit, lambda = lambda_scad)
+
+p_mcp <- predict(
+  cv_mcp$fit,
+  X = x_te,
+  lambda = lambda_mcp,
+  type = "response"
+)
+
+p_scad <- predict(
+  cv_scad$fit,
+  X = x_te,
+  lambda = lambda_scad,
+  type = "response"
+)
+
+cls_mcp <- factor(
+  ifelse(p_mcp >= 0.5, "M", "B"),
+  levels = levels(y_te)
+)
+
+cls_scad <- factor(
+  ifelse(p_scad >= 0.5, "M", "B"),
+  levels = levels(y_te)
+)
+```
+
+# Coefficient table
+
+Create a single table containing the coefficient estimates from all six fitted models.
+
+```{r}
+#| cache: true
+
+coef_lasso_min <- as.numeric(coef(fit_min))[-1]
+coef_lasso_1se <- as.numeric(coef(fit_1se))[-1]
+coef_ridge_min <- as.numeric(coef(fit_min_ridge))[-1]
+coef_ridge_1se <- as.numeric(coef(fit_1se_ridge))[-1]
+coef_mcp_vec <- as.numeric(coef_mcp)[-1]
+coef_scad_vec <- as.numeric(coef_scad)[-1]
+
+all_variables <- rownames(coef(fit_min))[-1]
+
+coefficient_table <- tibble(
+  Variable = all_variables,
+  `Lasso (min)` = coef_lasso_min,
+  `Lasso (1SE)` = coef_lasso_1se,
+  `Ridge (min)` = coef_ridge_min,
+  `Ridge (1SE)` = coef_ridge_1se,
+  MCP = coef_mcp_vec,
+  SCAD = coef_scad_vec
+)
+
+coefficient_table %>%
+  kable(
+    digits = 3,
+    caption = "Coefficient estimates for all penalized regression models"
+  ) %>%
+  kable_styling(full_width = FALSE)
+```
+
+# Test-set performance and sparsity
+
+```{r}
+#| cache: true
+
+nnz <- function(x) {
+  sum(as.numeric(x) != 0)
+}
+
+performance_table <- tibble(
+  Model = c(
+    "Lasso (min)",
+    "Lasso (1SE)",
+    "Ridge (min)",
+    "Ridge (1SE)",
+    "MCP",
+    "SCAD"
+  ),
+  Nonzero = c(
+    nnz(coef(fit_min)[-1]),
+    nnz(coef(fit_1se)[-1]),
+    nnz(coef(fit_min_ridge)[-1]),
+    nnz(coef(fit_1se_ridge)[-1]),
+    nnz(coef_mcp[-1]),
+    nnz(coef_scad[-1])
+  ),
+  AUC = c(
+    roc_auc_vec(y_te, p_min, event_level = "second"),
+    roc_auc_vec(y_te, p_1se, event_level = "second"),
+    roc_auc_vec(y_te, p_min_ridge, event_level = "second"),
+    roc_auc_vec(y_te, p_1se_ridge, event_level = "second"),
+    roc_auc_vec(y_te, p_mcp, event_level = "second"),
+    roc_auc_vec(y_te, p_scad, event_level = "second")
+  ),
+
+  Sensitivity = c(
+    sens_vec(y_te, cls_min, event_level = "second"),
+    sens_vec(y_te, cls_1se, event_level = "second"),
+    sens_vec(y_te, cls_min_ridge, event_level = "second"),
+    sens_vec(y_te, cls_1se_ridge, event_level = "second"),
+    sens_vec(y_te, cls_mcp, event_level = "second"),
+    sens_vec(y_te, cls_scad, event_level = "second")
+  ),
+
+  Specificity = c(
+    spec_vec(y_te, cls_min, event_level = "second"),
+    spec_vec(y_te, cls_1se, event_level = "second"),
+    spec_vec(y_te, cls_min_ridge, event_level = "second"),
+    spec_vec(y_te, cls_1se_ridge, event_level = "second"),
+    spec_vec(y_te, cls_mcp, event_level = "second"),
+    spec_vec(y_te, cls_scad, event_level = "second")
+  ),
+
+  PPV = c(
+    ppv_vec(y_te, cls_min, event_level = "second"),
+    ppv_vec(y_te, cls_1se, event_level = "second"),
+    ppv_vec(y_te, cls_min_ridge, event_level = "second"),
+    ppv_vec(y_te, cls_1se_ridge, event_level = "second"),
+    ppv_vec(y_te, cls_mcp, event_level = "second"),
+    ppv_vec(y_te, cls_scad, event_level = "second")
+  ),
+
+  NPV = c(
+    npv_vec(y_te, cls_min, event_level = "second"),
+    npv_vec(y_te, cls_1se, event_level = "second"),
+    npv_vec(y_te, cls_min_ridge, event_level = "second"),
+    npv_vec(y_te, cls_1se_ridge, event_level = "second"),
+    npv_vec(y_te, cls_mcp, event_level = "second"),
+    npv_vec(y_te, cls_scad, event_level = "second")
+  )
+)
+
+
+performance_table %>%
+  kable(
+    digits = 3,
+    caption = "Test-set performance and number of non-zero coefficients"
+  ) %>%
+  kable_styling(full_width = FALSE)
+```
+
+## Which model would we choose?
+
+The models have very similar AUCs, but their performance at a classification threshold of 0.5 differs in clinically important ways.
+
+**Lasso (min): Prioritize sensitivity**
+
+The Lasso (min) model has a sensitivity of **1.00** and NPV of **1.00**. In this test set, it correctly identifies every malignant tumor.
+
+- This may be particularly desirable for breast cancer detection, where a **false negative** could delay diagnosis and treatment of a malignancy.
+- The cost is somewhat lower specificity (0.972) and PPV (0.956). Thus, more benign tumors are incorrectly classified as malignant.
+- This represents a tradeoff: we accept more false positives to reduce the risk of missing a malignancy.
+
+**Ridge (min): Prioritize specificity and PPV**
+
+The Ridge (min) model has specificity and PPV of **1.00**. In this test set, every tumor classified as malignant is actually malignant, and no benign tumors are classified as malignant.
+
+- This reduces **false positives**, potentially avoiding unnecessary follow-up testing, biopsies, anxiety, and costs.
+- However, sensitivity falls to **0.953**. Some malignant tumors are therefore classified as benign.
+- In a breast cancer application, this may be an important disadvantage: avoiding unnecessary follow-up comes at the cost of potentially **missing cancers**.
+
+**Ridge (1SE): Probably not attractive here**
+
+Ridge (1SE) also achieves specificity and PPV of 1.00, but sensitivity falls substantially to **0.884**.
+
+- It provides no improvement in specificity or PPV over Ridge (min).
+- It misses substantially more malignant tumors.
+- Thus, at this threshold, there is little apparent reason to prefer Ridge (1SE) over Ridge (min).
+
+**MCP and SCAD: Much simpler models**
+
+MCP and SCAD use only **4 and 5 predictors**, respectively, while maintaining AUCs of 0.997.
+
+- Their primary advantage is therefore **parsimony** rather than better classification performance.
+- This could be valuable if obtaining the predictors is expensive, invasive, or difficult.
+- However, both have lower sensitivity than Lasso (min), meaning they miss more malignant tumors at the 0.5 threshold.
+
+::: {.callout-important}
+Models with nearly identical AUCs can have meaningfully different clinical consequences. For breast cancer detection, the choice depends partly on the relative cost of **missing a malignancy (false negative)** versus **unnecessarily flagging a benign tumor (false positive)**.
+:::
+
+
+# Confidence Intervals for prediction metrics
+
+It is common to want confidence intervals for AUC, sensitivity, specificity, PPV, and NPV. These can be obtained for any given model. Below, we'll focus on the lasso model with 1se rule for selecting $\lambda$.
+
+First, we'll use the `pROC` package to get CI's for AUC, sensitivity, and specificity. 
+
+```{r}
+#| cache: true
+# truth: factor with levels 
+# prob: predicted probability for the positive class
+truth <- test_ready$Diagnosis
+roc_obj <- roc(response = truth, predictor = p_1se, levels = c("B","M"), direction = "<")
+
+# AUC + 95% CI (DeLong by default)
+auc(roc_obj)
+ci.auc(roc_obj)                 # (lower, AUC, upper)
+
+# Sensitivity/Specificity CI 
+ci.se.obj <- ci.se(roc_obj)
+plot(roc_obj) # restart a new plot
+plot(ci.se.obj, col="blue")
+ci.se.obj 
+
+ci.sp.obj <- ci.sp(roc_obj)
+plot(roc_obj) # restart a new plot
+plot(ci.sp.obj, col="blue")
+ci.sp.obj
+
+# Alternatively: CI along the ROC curve at fixed specificity/sensitivity targets
+# Here, we'll use the specificity/sensitivity at a threshold of 0.5.
+thr <- 0.5
+spec <- roc_obj$specificities[which.max(roc_obj$thresholds > 0.5)]
+ci.se(roc_obj, specificities = spec)
+
+sens <- roc_obj$sensitivities[which.max(roc_obj$thresholds > 0.5)]
+ci.sp(roc_obj, sensitivities = sens)
+
+```
+
+
+Second, we'll use bootstrapping to get CI's for all of our prediction metrics. There are other ways we could get CI's for sensitivity, specificity, PPV and NPV since they just proportions. However, using bootstrapping gives use some extra flexibility. For example, if we were using Youden's Index to select our threshold, we could embed the selection of it into our bootstrapping. This would result in CI's that account for the uncertainty in the selected threshold.
+
+```{r}
+#| cache: true
+
+boot_ci_metrics <- function(truth, prob, thr = 0.5, B = 2000, levels) {
+  # The first element of "levels" must correspond to a "high" prob.
+  truth <- factor(truth, levels = levels)
+  n <- length(truth)
+  stat <- function(idx) {
+    tr <- truth[idx]; pr <- prob[idx]
+    pred <- factor(ifelse(pr >= thr, levels[1], levels[2]), levels = levels(tr))
+    TP <- sum(tr==levels[1] & pred==levels[1]); FP <- sum(tr==levels[2] & pred==levels[1])
+    FN <- sum(tr==levels[1] & pred==levels[2]); TN <- sum(tr==levels[2] & pred==levels[2])
+    se <- ifelse(TP+FN>0, TP/(TP+FN), NA)
+    sp <- ifelse(TN+FP>0, TN/(TN+FP), NA)
+    ppv<- ifelse(TP+FP>0, TP/(TP+FP), NA)
+    npv<- ifelse(TN+FN>0, TN/(TN+FN), NA)
+    auc<- tryCatch(as.numeric(auc(roc(tr, pr, levels=c(levels[2],levels[1]), direction="<"))),
+                   error=function(e) NA)
+    c(auc=auc, se=se, sp=sp, ppv=ppv, npv=npv)
+  }
+  S <- stat(seq_len(n))
+  M <- replicate(B, stat(sample.int(n, n, replace = TRUE)))
+  ci <- apply(M, 1, function(x) quantile(x, c(0.025, 0.975), na.rm = TRUE))
+tribble(~value,~auc, ~se, ~sp, ~ppv, ~npv, 
+        "Estimates", S[1], S[2], S[3], S[4], S[5],
+        "CI_95_L", ci[1,1], ci[1,2], ci[1,3], ci[1,4], ci[1,5],
+        "CI_95_U", ci[2,1], ci[2,2], ci[2,3], ci[2,4], ci[2,5]
+                 )
+}
+
+set.seed(1)
+out <- boot_ci_metrics(truth, p_1se, thr = 0.5, B = 2000, levels = c("M", "B"))
+out %>%  kable(digits = 3)%>%
+  kable_styling(full_width = FALSE)
+```
+
+
+
+```{r}
+#| cache: true
+sessionInfo()
+```

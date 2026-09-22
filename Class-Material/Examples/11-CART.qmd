@@ -1,0 +1,356 @@
+---
+title: "CART Examples"
+subtitle: "Biostatistics 735 — Machine Learning in Public Health"
+author: "Alexander McLain"
+date: today
+format:
+  html:
+    toc: true
+    toc-location: left
+    toc-depth: 3
+    number-sections: true
+    smooth-scroll: true
+    theme: cosmo
+    code-fold: false
+    highlight-style: github
+    embed-resources: true
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+```{r}
+#| include: false
+
+library(tidyverse)
+library(knitr)
+library(kableExtra)
+library(rpart)
+library(rpart.plot)
+library(caret)
+library(mlbench)
+library(naivebayes)   # for Naive Bayes
+
+# Small helper: nice tables
+kbl2 <- function(x, ...) kable(x, align = "lrrrrrr", ...) %>% kable_styling(full_width = FALSE)
+```
+
+# Continuous Outcome: Communities and Crime Data
+
+We will predict violent crime rate using socioeconomic predictors with the Communities and Crime dataset.
+
+```{r}
+df <- read_csv("communities+and+crime/communities.data", col_names = FALSE, na = "?")
+
+names(df) <- c("state","county", "community","communityname", "fold","population", "householdsize","racepctblack", "racePctWhite","racePctAsian", "racePctHisp","agePct12t21", "agePct12t29","agePct16t24", "agePct65up","numbUrban", "pctUrban","medIncome", "pctWWage","pctWFarmSelf", "pctWInvInc","pctWSocSec", "pctWPubAsst","pctWRetire", "medFamInc","perCapInc", "whitePerCap","blackPerCap", "indianPerCap","AsianPerCap", "OtherPerCap","HispPerCap", "NumUnderPov","PctPopUnderPov", "PctLess9thGrade","PctNotHSGrad", "PctBSorMore","PctUnemployed", "PctEmploy","PctEmplManu", "PctEmplProfServ","PctOccupManu", "PctOccupMgmtProf","MalePctDivorce", "MalePctNevMarr","FemalePctDiv", "TotalPctDiv","PersPerFam", "PctFam2Par","PctKids2Par", "PctYoungKids2Par","PctTeen2Par", "PctWorkMomYoungKids","PctWorkMom", "NumIlleg","PctIlleg", "NumImmig","PctImmigRecent", "PctImmigRec5","PctImmigRec8", "PctImmigRec10","PctRecentImmig", "PctRecImmig5","PctRecImmig8", "PctRecImmig10","PctSpeakEnglOnly", "PctNotSpeakEnglWell","PctLargHouseFam", "PctLargHouseOccup","PersPerOccupHous", "PersPerOwnOccHous","PersPerRentOccHous", "PctPersOwnOccup","PctPersDenseHous", "PctHousLess3BR","MedNumBR", "HousVacant","PctHousOccup", "PctHousOwnOcc","PctVacantBoarded", "PctVacMore6Mos","MedYrHousBuilt", "PctHousNoPhone","PctWOFullPlumb", "OwnOccLowQuart","OwnOccMedVal", "OwnOccHiQuart","RentLowQ", "RentMedian","RentHighQ", "MedRent","MedRentPctHousInc", "MedOwnCostPctInc","MedOwnCostPctIncNoMtg", "NumInShelters","NumStreet", "PctForeignBorn","PctBornSameState", "PctSameHouse85","PctSameCity85", "PctSameState85","LemasSwornFT", "LemasSwFTPerPop","LemasSwFTFieldOps", "LemasSwFTFieldPerPop","LemasTotalReq", "LemasTotReqPerPop","PolicReqPerOffic", "PolicPerPop","RacialMatchCommPol", "PctPolicWhite","PctPolicBlack", "PctPolicHisp","PctPolicAsian", "PctPolicMinor","OfficAssgnDrugUnits", "NumKindsDrugsSeiz","PolicAveOTWorked", "LandArea","PopDens", "PctUsePubTrans","PolicCars", "PolicOperBudg","LemasPctPolicOnPatr", "LemasGangUnitDeploy","LemasPctOfficDrugUn", "PolicBudgPerPop","ViolentCrimesPerPop")
+
+df_nomiss <- df %>% 
+  select(-c(state:fold,LemasSwornFT:PolicAveOTWorked, PolicCars:LemasGangUnitDeploy, PolicBudgPerPop)) %>% 
+  filter(complete.cases(.))
+
+head(df_nomiss)
+```
+
+Distribution of outcome by candidate predictors
+
+```{r}
+ggplot(df_nomiss, aes(x = PctIlleg, y = ViolentCrimesPerPop)) + geom_point(alpha = 0.6) +
+  geom_smooth(method = "loess") +
+  labs(title = "Outcome distribution by house hold size")
+
+ggplot(df_nomiss, aes(x = PctFam2Par, y = ViolentCrimesPerPop)) + geom_point(alpha = 0.6) +
+  geom_smooth(method = "loess") +
+  labs(title = "Outcome vs. Median Income")
+```
+
+Fit CART with cross-validation to select CP
+
+```{r}
+set.seed(735)
+
+fit.n <- rpart(ViolentCrimesPerPop~., 
+               data=df_nomiss, 
+               method="anova", 
+               control = list(minbucket = 50,
+                              minsplit = 70,
+                              cp = 0.0000002, 
+                              xval = 50))
+
+Fit_table.n <- as.data.frame(fit.n$cptable)
+kbl2(Fit_table.n, caption = "50-Fold CV Results for CART")
+
+plot(Fit_table.n$nsplit,Fit_table.n$xerror,
+     xlab = "Number of splits",ylab="CV error",
+     main = "CV error by number of splits",
+     type = "l", xlim=c(0,min(c(max(Fit_table.n$nsplit),100))))
+abline(h=1,lty=3)
+
+
+Best_mod <- which.min(Fit_table.n$xerror)
+Best_mod_1sd <- which.max(Fit_table.n$xerror < c(Fit_table.n$xerror+Fit_table.n$xstd) [which.min(Fit_table.n$xerror)])
+abline(v = Fit_table.n$nsplit[Best_mod] ,lwd=3)
+abline(v = Fit_table.n$nsplit[Best_mod_1sd], lwd = 3, col = 4)
+```
+
+## Final tree
+
+Here, we'll use the 1-sd criteria to get our final tree:
+
+```{r}
+j <- Best_mod_1sd
+kbl2(Fit_table.n[j,])
+# Get Cp for the best model
+cp <- Fit_table.n$CP[j]
+# Get the tree for the best model
+fit.best <- prune(fit.n,cp=cp)
+rpart.plot(fit.best,extra = 101)
+
+```
+
+Some of the variables:
+
+- PctIlleg: percentage of kids born to never married (numeric - decimal)
+- PctFam2Par: percentage of families (with kids) that are headed by two parents (numeric - decimal)
+- HousVacant: number of vacant households (numeric - decimal)
+- MalePctDivorce: percentage of males who are divorced (numeric - decimal)
+- PctKids2Par: percentage of kids in family housing with two parents (numeric - decimal)
+- NumIlleg: number of kids born to never married (numeric - decimal)
+- PctPersDenseHous: percent of persons in dense housing (more than 1 person per room) (numeric - decimal)
+- NumStreet: number of homeless people counted in the street (numeric - decimal)
+
+⸻
+
+# Binary Outcome: Pima Indians Diabetes
+
+Next, we classify diabetes status using the Pima Indians Diabetes dataset.
+
+```{r}
+PimaIndiansDiabetes <- read_csv("pima.indians.diabetes3.csv")
+bin_df <- na.omit(PimaIndiansDiabetes) |> 
+  rename(diabetes = class) |> 
+  select(-classdigit)
+head(bin_df)
+```
+
+
+Distribution of outcome by candidate predictors
+
+```{r}
+ggplot(bin_df, aes(x = diabetes, y = glucose)) + geom_boxplot() +
+  labs(title = "Glucose by Diabetes Status")
+
+ggplot(bin_df, aes(x = diabetes, y = age)) + geom_boxplot() +
+  labs(title = "Age by Diabetes Status")
+```
+
+## Using `caret` for Model Tuning
+
+So far, we have fit models directly using functions such as `rpart()`. Here we will use the `caret` package.
+
+`caret` provides a common framework for:
+
+1. fitting a model,
+2. choosing tuning parameters using cross-validation, and
+3. comparing predictive performance across models.
+
+The first step is to tell `caret` **how we want model performance to be evaluated**.
+
+```{r}
+set.seed(735)
+
+train_control <- trainControl(
+  method = "cv",
+  number = 10,
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary
+)
+```
+
+`trainControl()` does **not fit a model**. It defines the resampling procedure that `caret` will use later.
+
+Here we are asking for:
+
+* `method = "cv"`: use cross-validation.
+* `number = 10`: use 10 folds.
+* `classProbs = TRUE`: calculate predicted probabilities in addition to predicted classes.
+* `summaryFunction = twoClassSummary`: calculate ROC AUC, sensitivity, and specificity within the validation folds.
+
+We can now use this same resampling plan to fit different classification models.
+
+## Fitting and Tuning CART
+
+```{r}
+cart_class <- train(
+  diabetes ~ .,
+  data = bin_df,
+  method = "rpart",
+  trControl = train_control,
+  metric = "ROC",
+  tuneLength = 10
+)
+
+cart_class
+```
+
+The `train()` function coordinates the entire model-fitting and tuning process.
+
+Here:
+
+* `diabetes ~ .` defines the outcome and predictors.
+* `method = "rpart"` tells `caret` which type of model to fit.
+* `trControl = train_control` tells `caret` to use the 10-fold CV procedure defined above.
+* `metric = "ROC"` tells `caret` to choose the tuning parameter that maximizes cross-validated ROC AUC.
+* `tuneLength = 10` asks `caret` to consider 10 candidate values of the tuning parameter.
+
+For CART, the tuning parameter is the complexity parameter:
+
+\[
+cp.
+\]
+
+Conceptually, `caret` is doing the following:
+
+1. Select candidate values of $cp$.
+2. Divide the data into 10 folds.
+3. For each value of $cp$:
+   * fit CART using 9 folds,
+   * predict observations in the remaining fold,
+   * calculate ROC AUC,
+   * repeat until every fold has served as the validation set.
+4. Average the ROC AUC across the 10 folds.
+5. Select the value of $cp$ with the largest cross-validated ROC AUC.
+6. Fit the final CART model to the full dataset using the selected $cp$.
+
+Thus, `caret` separates two important decisions:
+
+> **What model should we fit?**  
+> `method = "rpart"`
+
+and
+
+> **How should we tune and evaluate it?**  
+> `trControl = train_control` and `metric = "ROC"`
+
+## Looking at the Tuning Results
+
+The cross-validation results for the candidate values of $cp$ are stored in:
+
+```{r}
+cart_class$results
+```
+
+We can also plot them:
+
+```{r}
+plot(cart_class)
+```
+
+The selected tuning parameter is:
+
+```{r}
+cart_class$bestTune
+```
+
+## Final CART Tree
+
+After selecting $cp$ using cross-validation, `caret` refits CART using the full dataset.
+
+The resulting `rpart` model is stored in:
+
+```{r}
+best_tree_class <- cart_class$finalModel
+
+rpart.plot(
+  best_tree_class,
+  main = "CART Classification Tree",
+  extra = 101
+)
+```
+
+The important distinction is:
+
+* `cart_class` contains the **entire caret analysis**, including the CV results and tuning information.
+* `cart_class$finalModel` contains the **final fitted CART model** selected by that procedure.
+⸻
+
+# Compare CART vs Naive Bayes for Pima Indians Diabetes
+
+## Using the Same Framework for Naive Bayes
+
+One advantage of `caret` is that the same general workflow can be used for many different machine learning methods.
+
+For CART we used:
+
+```r
+method = "rpart"
+```
+
+For Naive Bayes we simply change the modeling method:
+
+```{r}
+nb_grid <- expand.grid(
+  usekernel = c(TRUE, FALSE),
+  laplace   = c(0, 1, 2),
+  adjust    = c(0.5, 1, 1.5, 2)
+) |> 
+  # adjust only matters when usekernel = TRUE
+  filter(!(!usekernel & adjust > 0.5))
+
+set.seed(735)
+
+nb_model <- train(
+  diabetes ~ .,
+  data = bin_df,
+  method = "naive_bayes",
+  trControl = train_control,
+  metric = "ROC",
+  tuneGrid = nb_grid
+)
+```
+
+Notice that we use the **same `train_control` object**.
+
+Thus, CART and Naive Bayes are evaluated using the same:
+
+* 10-fold cross-validation strategy,
+* prediction metric (ROC AUC), and
+* general model-selection framework.
+
+What changes is the statistical model being fit.
+
+```{r}
+nb_model$results|> kbl2(digits = 3)
+nb_model$bestTune |> kbl2()
+```
+
+
+## Compare ROC AUC
+
+```{r}
+results <- resamples(list(CART = cart_class, NB = nb_model))
+```
+
+**Code Explanation**
+
+•	`resamples()` is a caret function that takes multiple fitted caret models (here cart_class and nb_model) and extracts the resampling results (cross-validation scores).
+
+•	`list(CART = cart_class, NB = nb_model)` names each model so they can be compared side by side.
+
+```{r}
+summary(results)
+bwplot(results, main = "CART vs Naive Bayes")
+```
+
+⸻
+
+Key Takeaways
+
+•	CART flexibly partitions the predictor space for continuous or binary outcomes.
+
+•	Cross-validation is essential for tuning tree complexity (cp).
+
+•	CART trees are interpretable but may not always perform as well as other classifiers.
+
+•	Naive Bayes provides a useful baseline for classification problems and often complements CART in comparison.
+

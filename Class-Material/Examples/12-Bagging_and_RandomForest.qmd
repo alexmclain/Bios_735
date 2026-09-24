@@ -1,0 +1,218 @@
+---
+title: "12 - Random Forests"
+subtitle: "Biostatistics 735 — Machine Learning in Public Health"
+author: "Alexander McLain"
+date: today
+format:
+  html:
+    toc: true
+    toc-location: left
+    toc-depth: 3
+    number-sections: true
+    smooth-scroll: true
+    theme: cosmo
+    code-fold: false
+    highlight-style: github
+    embed-resources: true
+execute:
+  echo: true
+  warning: false
+  message: false
+  cache: true
+---
+
+```{r}
+#| include: false
+library(tidyverse)
+library(kableExtra)
+library(caret)
+library(randomForest)
+library(mlbench)
+library(pdp) # for partial dependence plots
+library(yardstick)
+kbl2 <- function(x, ...) kable(x, align = "lrrrrrr", ...) %>% kable_styling(full_width = FALSE)
+```
+
+# Random Forests for Regression
+
+We begin with the Communities and Crime dataset.  
+Random forests improve CART by averaging many trees, each grown on a bootstrap sample and using a random subset of predictors at each split.
+
+```{r}
+# Load Communities and Crime data 
+crime <- readRDS("community_crime.RDS")
+
+set.seed(735)
+train_index <- createDataPartition(crime$ViolentCrime, p = 0.7, list = FALSE)
+train <- crime[train_index, ]
+test  <- crime[-train_index, ]
+```
+
+## Comparing test error across `mtry` and number of trees
+
+```{r}
+results <- data.frame()
+
+for (m in c(2, 3, 4, 6, 8, 10)) {
+  for (nt in c(50, 100, 200, 500, 1000, 2000, 3000)) {
+    rf_fit <- randomForest(ViolentCrime ~ ., data = train,
+                           mtry = m, ntree = nt)
+    pred <- predict(rf_fit, newdata = test)
+    test_mse <- mean((test$ViolentCrime - pred)^2)
+    results <- rbind(results,
+                     data.frame(mtry = m, ntree = nt, TestMSE = test_mse))
+  }
+}
+
+kbl2(results %>% arrange(TestMSE) %>% filter(row_number() <= 15), )
+```
+
+```{r}
+ggplot(results, aes(x = ntree, y = TestMSE, color = factor(mtry))) +
+  geom_line() + geom_point() +
+  labs(title = "Test Error across mtry and ntree",
+       color = "mtry") +
+  theme_minimal()
+```
+
+
+## Cross-validation to select mtry with caret
+
+```{r}
+set.seed(123)
+
+# Define training control for 10-fold CV
+ctrl <- trainControl(method = "cv", number = 10)
+
+# Train random forest model with CV to tune mtry
+rf_caret <- train(ViolentCrime ~ ., 
+                  data = train,
+                  method = "rf",
+                  metric = "RMSE",  
+                  trControl = ctrl,
+                  tuneGrid = data.frame(mtry = 1:7)) # grid of mtry values
+
+rf_caret
+plot(rf_caret)
+```
+
+Explanation of the code:
+
+•	`trainControl(method = "cv", number = 10)`: runs 10-fold CV.
+•	`metric = "RMSE"`: we’re using RMSE to pick the best mtry.
+•	`tuneGrid = data.frame(mtry = 1:7)`: defines the candidate values of mtry to try (from 1 up to 7, since Pima has 8 predictors).
+•	`plot(rf_caret)`: shows how AUC changes as mtry changes.
+
+## Variable Importance in Regression
+
+```{r}
+rf_reg <- rf_caret$finalModel
+varImpPlot(rf_reg, main = "Variable Importance (Regression)")
+```
+
+## Partial Dependence Plots (PDPs)
+
+Partial dependence plots (PDPs) help us understand how a single predictor (or a pair of predictors) influences the model’s predictions, while averaging out the effects of all other predictors.  
+
+- For regression models, the y-axis shows the average predicted outcome as the predictor changes.  
+- For classification models, the y-axis typically shows the average predicted probability of the positive class.  
+- PDPs are useful for interpreting "black box" models like random forests, since they highlight nonlinear effects and interactions that may not be obvious from variable importance alone.  
+
+In short, PDPs answer: *If we vary one predictor, holding everything else constant on average, how do predictions change?*
+
+```{r}
+p1 <- partial(rf_reg, pred.var = "PctUnemployed", train = train)
+autoplot(p1, main = "PDP: % Unemployed")
+
+p2 <- partial(rf_reg, pred.var = "PctPopUnderPov", train = train)
+autoplot(p2, main = "PDP: % Poverty")
+```
+
+---
+
+# Random Forests for Classification
+
+We now turn to the Pima Indians Diabetes dataset.
+
+```{r}
+PimaIndiansDiabetes <- read_csv("pima.indians.diabetes3.csv")
+pima <- na.omit(PimaIndiansDiabetes) |> 
+  rename(diabetes = class) |> 
+  mutate(diabetes = as.factor(diabetes)) |> 
+  select(-classdigit)
+
+set.seed(735)
+train_index <- createDataPartition(pima$diabetes, p = 0.7, list = FALSE)
+train <- pima[train_index, ]
+test  <- pima[-train_index, ]
+```
+
+## Fit Random Forest Classifier
+
+First, let's just fit for a fixed `mtry` and number of trees.
+
+```{r}
+rf_class <- randomForest(diabetes ~ ., data = train,
+                         mtry = 3, ntree = 500, importance = TRUE)
+rf_class
+```
+
+
+## Cross-validation to select mtry with caret
+
+```{r}
+set.seed(123)
+
+# Define training control for 10-fold CV
+ctrl <- trainControl(method = "cv", number = 10, 
+                     classProbs = TRUE, 
+                     summaryFunction = twoClassSummary)
+
+# Train random forest model with CV to tune mtry
+rf_caret <- train(diabetes ~ ., 
+                  data = pima,
+                  method = "rf",
+                  metric = "ROC",   # use AUC as performance measure
+                  trControl = ctrl,
+                  tuneGrid = data.frame(mtry = 1:7)) # grid of mtry values
+
+rf_caret
+plot(rf_caret)
+```
+
+## Variable Importance for Final Model
+
+```{r}
+rf_finalModel <- rf_caret$finalModel
+varImpPlot(rf_finalModel, main = "Variable Importance (Classification)")
+```
+
+## Partial Dependence Plots (Classification)
+
+```{r}
+p3 <- partial(rf_finalModel, pred.var = "glucose", train = train, which.class = "diabetic")
+autoplot(p3, main = "PDP: Glucose (Diabetes Probability)")
+
+p4 <- partial(rf_finalModel, pred.var = "age", train = train, which.class = "diabetic")
+autoplot(p4, main = "PDP: Age (Diabetes Probability)")
+```
+
+## Test Error (or lack thereof)
+
+```{r}
+pred <- predict(rf_finalModel, newdata = test, type =  "prob")
+table(pred[,1] < 0.5, test$diabetes)
+
+```
+
+
+---
+
+# Key Takeaways
+
+- Random forests reduce the variance of CART by averaging many trees.  
+- Performance depends on `mtry` (predictor subset size) and the number of trees.  
+- Variable importance measures highlight the most influential predictors.  
+- Partial dependence plots show how predictors influence the predicted outcome.  
+- In public health, random forests are widely used for both prediction and feature selection.
+```

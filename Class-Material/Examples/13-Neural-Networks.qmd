@@ -1,0 +1,751 @@
+---
+title: "13 - Neural Networks"
+subtitle: "Biostatistics 735 — Machine Learning in Public Health"
+author: "Alexander McLain"
+date: today
+format:
+  html:
+    toc: true
+    toc-location: left
+    toc-depth: 3
+    number-sections: true
+    smooth-scroll: true
+    theme: cosmo
+    code-fold: false
+    highlight-style: github
+    embed-resources: true
+execute:
+  cache: true
+  echo: true
+  warning: false
+  message: false
+---
+
+
+
+```{r}
+library(tidyverse)
+library(kableExtra)
+library(printr)
+library(mlbench)
+library(neuralnet)
+library(recipes)
+library(rsample)
+library(tensorflow)
+library(keras)
+library(reticulate)
+library(clusterGeneration)
+library(nnet)
+library(devtools)
+library(reshape)
+library(caret)
+library(randomForest)
+kbl2 <- function(x, ...) kable(x, align = "lrrrrrr", ...) |> kable_styling(full_width = FALSE)
+```
+
+Our example data set is from the Wisconsin cancer study. We read in the data and remove any rows with missing data. The following code uses the package `mlbench` that contains this data set. We show the top few lines of the data.
+
+```{r printr.help.sections=c('description', 'format')}
+#| cache: true
+data("BreastCancer")
+
+#Clean off rows with missing data
+BreastCancer = BreastCancer[which(complete.cases(BreastCancer)==TRUE),]
+dim(BreastCancer)
+head(BreastCancer)
+?BreastCancer
+str(BreastCancer)
+```
+
+Since `neuralnet` only deals with quantitative variables, you can convert all the qualitative variables (factors) to binary ("dummy"), with the `model.matrix` function.
+
+```{r}
+#| cache: true
+y = as.matrix(BreastCancer[,11])
+y[which(y=="benign")] = 0
+y[which(y=="malignant")] = 1
+y = as.numeric(y)
+x = model.matrix(~0 + Cl.thickness + Cell.size + Cell.shape + 
+                   Marg.adhesion + Epith.c.size + Bare.nuclei + Bl.cromatin +
+                   Normal.nucleoli + Mitoses, data = BreastCancer)
+dim(x)
+df <- data.frame(y,x)
+```
+
+# Preprocessing
+
+Let's split the data into training and validation:
+
+```{r}
+set.seed(92739847)
+
+split <- initial_split(df, prop = 0.7, strata = y)
+train_raw <- training(split)
+test_raw  <- testing(split)
+
+nrow(train_raw)
+nrow(test_raw)
+
+
+# Normalize predictors (always important for NN)
+rec_base <- recipe(y ~ ., data = train_raw) %>%
+  step_zv(all_predictors()) %>%
+  step_normalize(all_predictors())
+
+prep_base <- prep(rec_base)
+
+train <- bake(prep_base, train_raw)
+test  <- bake(prep_base, test_raw)
+```
+
+# Fitting with `neuralnet`
+
+In the first example, we will create a simple neural network with minimum effort using the `neuralnet` package. The `neuralnet` package is outdated, but it is still popular among the R community. 
+
+The `neuralnet` function is simple. It doesn't provide us the freedom to create fully customizable model architecture.In our case, we are providing it with a machine-learning formula and data, just like GLM. The formula consists of target variables and features. 
+
+
+```{r printr.help.sections=c('description', 'usage', 'arguments','details')}
+#| comment: ''
+?neuralnet
+```
+
+## Choosing the Number of Hidden Layers and Neurons
+
+The number of hidden layers and neurons per layer determine a neural network’s capacity — its ability to represent complex patterns in the data. Too little capacity leads to underfitting; too much leads to overfitting.
+
+**Number of Hidden Layers**
+
+•	Start simple: Most problems are captured with 1–2 hidden layers.
+
+•	A single hidden layer can approximate any smooth function (the universal approximation theorem).
+
+•	Two layers can often capture hierarchical or compositional patterns (e.g., interactions, nonlinear thresholds).
+•	Add layers only if justified:
+
+-	You have very large data (tens of thousands of observations).
+-	You’re working with structured complexity, such as images, sequences, or text.
+-	Performance clearly improves (based on validation error) when adding layers.
+
+**Number of Neurons per Layer**
+
+•	*Rule of thumb:* Start with a size between the number of input features and the number of output classes.
+Example: if you have 20 predictors and 2 outcomes, try 10–20 neurons in the first layer.
+
+•	Too few neurons → underfit: Model can’t capture the data’s patterns.
+
+•	Too many neurons → overfit: Model memorizes noise. Regularization (dropout, weight decay) helps, but doesn’t replace tuning.
+
+•	Common heuristic:
+
+$$neurons \ per \ layer = \frac{n_{samples}}{\alpha(n_{features} + n_{outputs})}$$
+
+with $\alpha$ between 2–10 as a complexity control factor.
+
+These rules come from early neural network literature (1980s–1990s). A quaint time when people ran mostly shallow, one-hidden-layer networks trained on small datasets using **simple gradient descent** and **no regularization**.
+
+Those rules of thumb were designed to:
+
+•	Avoid overfitting when no dropout or weight decay existed,
+
+•	Constrain computational cost,
+
+•	Fit networks by hand-tuning on small CPUs.
+
+They were useful back when having hundreds of parameters was “big.” 
+
+In this example, we'll fit a relatively simple NN with 450 observations, 81 features and 1 output layer. With $\alpha = 2$ this gives
+
+$$neurons \ per \ layer = \frac{450}{2(81 + 1)} = 2.7$$
+
+
+So, we'll keep things small and use 4 neurons with 1 layer.
+
+```{r}
+#| cache: true
+#| fig-width: 7
+#| fig-height: 24
+Breast_NN <- neuralnet(y ~ ., data = train, 
+                       hidden = 4, lifesign = "minimal", algorithm="backprop", 
+                       linear.output = FALSE, err.fct = 'ce',
+                       learningrate=0.1)
+
+# Look at the error and activation function
+Breast_NN$err.fct
+Breast_NN$act.fct
+
+# Here are the parameters:
+dim(Breast_NN$result.matrix)
+253/81
+head(data.frame(Breast_NN$result.matrix))
+
+plot(Breast_NN, rep="best")
+```
+
+```{r}
+#| cache: true
+valid_pred <- predict(Breast_NN, newdata = test)
+table(valid_pred>0.5, test$y)
+# Accuracy
+sum(diag(table(valid_pred>0.5, test$y)))/length(test$y)
+```
+
+
+# Fitting with `Keras`
+
+`TensorFlow` is an open source deep neural net framework, based on a graphical model. It is more than just a neural net platform, and supports numerical computing based on data flow graphs. Data may be represented in $n$-dimensional structures like vectors and matrices, or higher-dimensional tensors. Because these mathematical objects are folded into a data flow graph for computation, the moniker for this software library is an obvious one.
+
+
+The computations for deep learning nets involve tensor computations, which are known to be implemented more efficiently on GPUs than CPUs. Therefore like other deep learning libraries, `TensorFlow` may be implemented on CPUs and GPUs. The generality and speed of the `TensorFlow` software, ease of installation, its documentation and examples, and runnability on multiple platforms has made `TensorFlow` the most popular deep learning toolkit today. (Opinions on this may, of course, differ.) There is a wealth of tutorial material on TF of very high quality that you may refer to here: https://www.tensorflow.org/tutorials/.
+
+Rather than run `TensorFlow` natively, it is often easier to use it through an easy to use interface program. One of the most popular high-level APIs is `Keras` See: https://keras.io/. The site contains several examples, which make it easy to get up and running. Though originally written in Python, `Keras` has been extended to `R` via the `keras` package.
+
+`Keras` is a high-level neural networks API developed with a focus on enabling fast experimentation. Being able to go from idea to result with the least possible delay is key to doing good research. Keras has the following key features:
+
+- Allows the same code to run on CPU or on GPU, seamlessly.
+- User-friendly API which makes it easy to quickly prototype deep learning models.
+- Built-in support for convolutional networks (for computer vision), recurrent networks (for sequence processing), and any combination of both.
+- Supports arbitrary network architectures: multi-input or multi-output models, layer sharing, model sharing, etc. This means that Keras is appropriate for building essentially any deep learning model, from a memory network to a neural Turing machine.
+
+
+To use these functions were going to convert the outcome (benign, malignant) in the data set to “one-hot encoding” using the to_categorial function. What is one-hot encoding replaces a single vector of 1s (malignant) and 0s (benign) to a bivariate dependent variable as a two-column matrix, where the first column contains a 1 if the cell is benign and the second column a 1 if the cell is malignant, for each row of the data set. For this example, we'll use one-hot encoding and categorical cross-entropy.
+
+```{r}
+y_train = as.vector(train$y)
+y_test = as.vector(test$y)
+x_train = as.matrix(train[,-ncol(train)])
+x_test = as.matrix(test[,-ncol(train)])
+
+Y_train = to_categorical(y_train, 2)
+Y_test = to_categorical(y_test,2)
+```
+
+`TensorFlow` is structured in a manner where one describes the neural net first, layer by layer. We first describe, for each layer in the neural net, **the number of nodes, the type of activation function, and any other hyperparameters needed in the model fitting stage, such as the extent of dropout for example.** 
+
+In the output layer, we also state the nature of the activation function, such as sigmoid or softmax. And then, we specify a `compile` function which describes the loss function that will be minimized, along with the minimization algorithm. **At this point in the program specification, the model is not actually run.** See below for the `history` code block that builds up the deep learning network.
+
+The core data structure of Keras is a model and a way to organize layers. The simplest type of model is the *Sequential model*, a linear stack of layers.
+
+We begin by creating a sequential model and then adding layers using the pipe (`|>`) operator:
+
+```{r printr.help.sections=c('description', 'usage', 'arguments','details')}
+#| comment: ''
+#| cache: true
+?keras_model_sequential
+```
+
+Build Model
+```{r}
+set_random_seed(7353788) # Needed for reproducibility
+n_features <- ncol(x_train)
+
+model <- keras_model_sequential() |> 
+  layer_dense(units = 128, activation = "relu", input_shape = c(n_features)) |>
+  layer_dropout(rate = 0.3) |>
+  layer_dense(units = 64, activation = "relu") |>
+  layer_dropout(rate = 0.25) |>
+  layer_dense(units = 32, activation = "relu") |>
+  layer_dropout(rate = 0.2) |>
+  layer_dense(units = 2, activation = "softmax")
+
+summary(model)
+```
+
+## Why so many neurons?!?
+
+Note that we are using a much larger number of parameters than the **rules of thumb** given above. That's because we are leveraging **overparameterization + regularization** — a very different regime.
+
+Here’s why more neurons can be better, even with modest sample sizes:
+
+•	**Representation capacity:** Nonlinear relationships, feature interactions, and subtle variable dependencies often require many hidden units to represent accurately. Having more neurons gives the model the capacity to find those patterns.
+
+•	**Regularization keeps it in check:** Dropout, L2 weight penalties, and early stopping (tuning the number of epochs) all prevent the network from memorizing noise. So you can afford a larger model without necessarily overfitting.
+
+•	**Optimization stability:** Wider layers create smoother loss landscapes and make training more stable — gradients propagate better, especially with ReLU activations.
+
+•	**Empirical tuning, not analytical derivation:** Modern practice doesn’t rely on formulas; it relies on validation-based tuning (or automated hyperparameter search). In practice, “128–64–32” is just a safe mid-sized starting point for tabular data with a few hundred features.
+
+Even though we have 450 observations, 81 features, many of which are correlated but nonlinear (e.g., textural measures of nuclei), a 3-layer network with decreasing widths (128 → 64 → 32) is:
+
+•	expressive enough to capture nonlinear feature combinations,
+
+•	not so large that dropout (25–20%) can’t regularize it,
+
+•	computationally cheap (only ~15k–20k trainable weights).
+
+If you used only 2–3 neurons, the model would collapse into a nearly linear function — equivalent to a logistic regression.
+
+
+### Practical issues with Keras in R
+
+When running `compile`
+
+```{r}
+#| eval: false
+model |> compile(
+  optimizer = optimizer_adam(learning_rate = 0.001),
+  loss = "categorical_crossentropy",
+  metrics = c("accuracy")
+)
+```
+
+From this I got the following message:
+
+::: {.callout-important}
+WARNING:absl:At this time, the v2.11+ optimizer `tf.keras.optimizers.Adam` runs slowly on M1/M2 Macs, please use the legacy TF-Keras optimizer instead, located at `tf.keras.optimizers.legacy.Adam`.
+:::
+
+This error apparently happens when trying to use ADAM (on `python` or `R`) with my laptop. This illustrates a practical issue with using Keras through R. The R interface relies on an underlying Python environment and deep-learning backend, and compatibility among **R, Python, Keras, TensorFlow, and the computer hardware** can sometimes cause problems even when the R code is correct. 
+
+
+Rather than troubleshoot the Python/TensorFlow configuration for this example, the following works on my system:
+
+```{r}
+#| cache: true
+model |> compile(
+  loss = 'categorical_crossentropy',
+  metrics = c('accuracy')
+)
+```
+
+This will use the default optimizer rather than explicitly requesting Adam.
+
+When using machine learning software in practice, the software environment is an important consideration. Alternatives include using `torch` directly (discussed below) in `R` or working directly in Python with Keras/TensorFlow or PyTorch.
+
+Fit Model
+
+```{r}
+history <- model |> fit(
+  x = x_train, 
+  y = Y_train,
+  epochs = 30,
+  batch_size = 32,
+  validation_split = 0.2,
+  verbose = 1
+)
+
+# Optional: plot training progress
+plot(history)
+```
+
+Evaluate on Test Data
+
+```{r}
+score <- model |> evaluate(x_test, Y_test, verbose = 0)
+cat("Test Accuracy:", round(score["accuracy"], 3), "\n")
+
+# ----------------------------------------------------------
+# Predict
+# ----------------------------------------------------------
+pred_prob <- model |> predict(x_test)
+pred_class <- apply(pred_prob, 1, which.max) - 1  # 0/1 classes
+
+# ----------------------------------------------------------
+# Compute evaluation metrics
+# ----------------------------------------------------------
+results <- tibble(
+  truth = factor(y_test, levels = c(0, 1)),
+  .pred_0 = pred_prob[,1],
+  .pred_1 = pred_prob[,2],
+  .pred_class = factor(pred_class, levels = c(0, 1))
+) |>
+  mutate(
+    truth = factor(truth, levels = c(0, 1)),
+    .pred_class = factor(.pred_class, levels = c(0, 1))
+  )
+
+# Call each metric explicitly and specify event_level = "second"
+metrics_summary <- yardstick::metric_set(
+  yardstick::roc_auc,
+  yardstick::accuracy,
+  yardstick::sensitivity,
+  yardstick::specificity,
+  yardstick::ppv,
+  yardstick::npv
+)
+
+NN_summary <- metrics_summary(
+  data = results,
+  truth = truth,
+  estimate = .pred_class,
+  estimator = "binary",
+  event_level = "second",
+  .pred_1
+) |> dplyr::select(.metric,.estimate) |> 
+  dplyr::rename(
+    Metric = .metric,
+    Estimate = .estimate
+  ) 
+NN_summary |> kbl2(digits = 3)
+```
+
+
+# Compare with Random Forests
+
+```{r}
+# Define training control for 10-fold CV
+ctrl <- trainControl(method = "cv", number = 10, 
+                     classProbs = TRUE, 
+                     summaryFunction = twoClassSummary)
+
+train_rf <- train |> 
+  mutate(
+    y = case_when(
+      y == 0 ~"benign", 
+      TRUE ~ "malignant")
+  )
+
+test_rf <- test |> 
+  mutate(
+    y = case_when(
+      y == 0 ~"benign", 
+      TRUE ~ "malignant")
+  )
+
+
+# Train random forest model with CV to tune mtry
+rf_caret <- train(y ~ ., 
+                  data = train_rf,
+                  method = "rf",
+                  metric = "ROC",   # use AUC as performance measure
+                  trControl = ctrl,
+                  tuneGrid = data.frame(mtry = 1:10)) # grid of mtry values
+
+rf_caret
+plot(rf_caret)
+```
+
+
+```{r}
+pred_prob_rf <- predict(rf_caret$finalModel, newdata = test, type =  "prob")
+pred_class_rf <- apply(pred_prob_rf, 1, which.max) - 1  # 0/1 classes
+
+pred_class_rf[which(pred_class_rf==0)] = "benign"
+pred_class_rf[which(pred_class_rf==1)] = "malignant"
+
+# ----------------------------------------------------------
+# Compute evaluation metrics
+# ----------------------------------------------------------
+results <- tibble(
+  truth = factor(test_rf$y, levels = c("benign", "malignant")),
+  .pred_0 = pred_prob_rf[,1],
+  .pred_1 = pred_prob_rf[,2],
+  .pred_class = factor(pred_class_rf, levels = c("benign", "malignant"))
+) |>
+  mutate(
+    truth = factor(truth, levels = c("benign", "malignant")),
+    .pred_class = factor(.pred_class, levels = c("benign", "malignant"))
+  )
+
+# Call each metric explicitly and specify event_level = "second"
+metrics_summary <- yardstick::metric_set(
+  yardstick::roc_auc,
+  yardstick::accuracy,
+  yardstick::sensitivity,
+  yardstick::specificity,
+  yardstick::ppv,
+  yardstick::npv
+)
+
+metrics_summary(
+  data = results,
+  truth = truth,
+  estimate = .pred_class,
+  estimator = "binary",
+  event_level = "second",
+  .pred_1
+) |> dplyr::select(.metric,.estimate) |> 
+  dplyr::rename(
+    Metric = .metric,
+    RandForest = .estimate
+  ) |> left_join(NN_summary |> dplyr::rename(NeurNet = Estimate)) |> 
+  kbl2(digits = 3)
+
+```
+
+
+# Example with image data
+
+Let's see an example with the minst image data:
+
+
+```{r}
+#| cache: true
+mnist <- dataset_mnist()
+
+digit <- mnist$train$x[50, 1:28, 1:28]
+par(pty="s") # for keeping the aspect ratio 1:1
+image(t(digit), col = gray.colors(256), axes = FALSE)
+
+x_train <- mnist$train$x
+y_train <- mnist$train$y
+x_test <- mnist$test$x
+y_test <- mnist$test$y
+dim(x_train)
+dim(x_test)
+
+# reshape
+x_train <- array_reshape(x_train, c(nrow(x_train), 784))
+x_test  <- array_reshape(x_test, c(nrow(x_test), 784))
+```
+
+Now we normalize the values, which are pixel intensities ranging in  (0,255) and create the outcome.
+
+```{r}
+#| cache: true
+x_train <- x_train / 255
+x_test <- x_test / 255
+y_train <- to_categorical(y_train, 10)
+y_test <- to_categorical(y_test, 10)
+```
+
+Now create the model in Keras.
+
+```{r}
+#| cache: true
+set_random_seed(735) # Needed for reproducibility
+model <- keras_model_sequential()
+model |>
+  layer_dense(units = 256, activation = 'relu', input_shape = c(784)) |>
+  layer_dropout(rate = 0.4) |>
+  layer_dense(units = 128, activation = 'relu') |>
+  layer_dropout(rate = 0.3) |>
+  layer_dense(units = 10, activation = 'softmax')
+summary(model)
+
+model |> compile(
+  loss = 'categorical_crossentropy',
+  metrics = c('accuracy')
+)
+```
+
+Now run the model to get a fitted deep learning network.
+
+Last time, we ran our model for `30` epochs. This time, we'll try to optimize the number of epochs using `early stopping`. If validation accuracy stops improving for `10` consecutive epochs, training stops and the weights from the best number of epochs are returned. 
+
+```{r}
+#| cache: true
+early_stop <- callback_early_stopping(
+  monitor = "val_accuracy",
+  patience = 10,
+  restore_best_weights = TRUE
+)
+
+history <- model |> fit(
+  x_train, y_train,
+  epochs = 30,
+  batch_size = 128,
+  validation_split = 0.2,
+  callbacks = list(early_stop)
+)
+
+plot(history)
+model |> evaluate(x_test, y_test)
+model |> predict(x_test) |> k_argmax()
+```
+
+The keras package also plots the progress of the model by showing the loss function evolution by epoch, as well as accuracy, for the training and validation samples.
+
+```{r}
+#| out-width: "0.8\\linewidth"
+#| include: true
+#| fig-align: "center"
+#| echo: false
+knitr::include_graphics("19-NNplot2.png")
+```
+
+
+# The same model using `torch`
+
+Another popular way to fit NN's is PyTorch. There is an R package `torch` that allows you to use PyTorch-like functionality natively from R. No Python installation is required: `torch` is built directly on top of libtorch, a C++ library that provides the tensor-computation and automatic-differentiation capabilities essential to building neural networks.  See https://torch.mlverse.org/ for more information.
+
+Now we will fit the same neural network using the `torch` package in R.
+
+```{r}
+library(torch)
+library(luz)
+```
+
+**Torch**: low-level framework. You control the training loop.
+
+**Luz**: high-level training interface built on Torch. It handles the training loop for you.
+
+First convert the MNIST data to `torch` tensors. We use the original integer
+class labels (0--9), rather than one-hot encoding.
+
+::: {.callout-important}
+The digits in `dataset_mnist()` are `0, 1, ..., 9`, but the R `torch` implementation of `nn_cross_entropy_loss()` requires class indices to start at `1`.
+:::
+
+```{r}
+#| cache: true
+
+x_train_t <- torch_tensor(x_train, dtype = torch_float())
+x_test_t  <- torch_tensor(x_test,  dtype = torch_float())
+
+y_train_t <- torch_tensor(mnist$train$y + 1, dtype = torch_long())
+y_test_t  <- torch_tensor(mnist$test$y + 1, dtype = torch_long())
+```
+
+We will use the same 80/20 training/validation split used by the Keras example.
+
+```{r}
+n_train <- nrow(x_train)
+
+n_valid <- floor(0.20 * n_train)
+
+train_idx <- 1:(n_train - n_valid)
+valid_idx <- (n_train - n_valid + 1):n_train
+
+train_ds <- tensor_dataset(
+  x_train_t[train_idx, ],
+  y_train_t[train_idx]
+)
+
+valid_ds <- tensor_dataset(
+  x_train_t[valid_idx, ],
+  y_train_t[valid_idx]
+)
+
+test_ds <- tensor_dataset(
+  x_test_t,
+  y_test_t
+)
+
+train_dl <- dataloader(
+  train_ds,
+  batch_size = 128,
+  shuffle = TRUE
+)
+
+valid_dl <- dataloader(
+  valid_ds,
+  batch_size = 128,
+  shuffle = FALSE
+)
+
+test_dl <- dataloader(
+  test_ds,
+  batch_size = 128,
+  shuffle = FALSE
+)
+```
+
+Now create the same network as before:
+
+```{r}
+torch_manual_seed(735)
+set.seed(735)
+
+model_luz <- nn_module(
+  initialize = function() {
+    self$net <- nn_sequential(
+      nn_linear(784, 256),
+      nn_relu(),
+      nn_dropout(p = 0.4),
+      nn_linear(256, 128),
+      nn_relu(),
+      nn_dropout(p = 0.3),
+      nn_linear(128, 10)
+    )
+  },
+
+  forward = function(x) {
+    self$net(x)
+  }
+)
+```
+
+Notice that the final layer does **not** use a softmax activation. The
+cross-entropy loss handles the softmax internally.
+
+`model_luz` defines the architecture of the neural network: your layers, number of neurons, activation functions, dropout, etc.
+
+```{r}
+fitted <- model_luz %>%
+  setup(
+    # What quantity should the network minimize?
+    # Other losses:
+    #     - nn_mse_loss()
+    #     - nn_bce_with_logits_loss()
+    loss = nn_cross_entropy_loss(), 
+    # How should the weights be updated to minimize it?
+    # Othr losses:
+    #     - optim_sgd (Standard stochastic gradient descent)
+    #     - optim_adam (adaptive learning rates with momentum-like running averages.)
+    # Torch also includes Adagrad, Adadelta, Rprop, LBFGS, and others.
+    optimizer = optim_rmsprop,
+    # What performance measure do we want to monitor?
+    # - luz_metric_multiclass_auroc()
+    # - luz_metric_binary_auroc()
+    # - luz_metric_mae()
+    # - luz_metric_mse()
+    # - luz_metric_rmse()
+    metrics = list(
+      luz_metric_accuracy()
+    )
+    # Loss is what the neural network actually optimizes. Accuracy is not.
+  ) %>%
+  # setting hyperparameters for the optimizer. 
+  # They control how RMSprop performs optimization.
+  set_opt_hparams(
+    lr = 0.001, # learning rate
+    alpha = 0.9, # how much memory moving average of squared gradients has.
+    eps = 1e-7 # very small number added for numerical stability.
+  )
+```
+
+In all, the above says take this neural network. Train it by minimizing multiclass cross-entropy. Use RMSprop to update its weights. Use a learning rate of 0.001 and the specified RMSprop settings. While training, keep track of classification accuracy.
+
+
+Now train the network.
+
+```{r}
+torch_manual_seed(735)
+
+fitted <- fitted %>%
+  fit(
+    train_dl,
+    epochs = 30,
+    valid_data = valid_dl
+  )
+
+plot(fitted)
+```
+
+Finally, evaluate the fitted `luz` model on the test set.
+
+```{r}
+test_results <- fitted %>%
+  evaluate(test_dl)
+
+get_metrics(test_results)
+
+torch_luz_acc <- get_metrics(test_results)$value[2]
+```
+
+
+We can compare the test-set accuracy of the Keras and Torch models.
+
+```{r}
+keras_results <- model |> keras::evaluate(
+  x_test,
+  y_test,
+  verbose = 0
+)
+
+keras_accuracy <- as.numeric(
+  keras_results["accuracy"]
+)
+
+comparison <- tibble(
+  Model = c("Keras", "Torch_luz"),
+  Test_Accuracy = c(
+    keras_accuracy,
+    torch_luz_acc
+  )
+)
+
+comparison
+```
+

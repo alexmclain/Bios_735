@@ -1,0 +1,1030 @@
+---
+title: "14 - Neural Networks II: Regularization and a Harder Problem"
+subtitle: "Biostatistics 735 — Machine Learning in Public Health"
+author: "Alexander McLain"
+date: today
+format:
+  html:
+    toc: true
+    toc-location: left
+    toc-depth: 3
+    number-sections: true
+    smooth-scroll: true
+    theme: cosmo
+    code-fold: false
+    highlight-style: github
+    embed-resources: true
+execute:
+  cache: false
+  echo: true
+  warning: false
+  message: false
+---
+
+
+```{r}
+#| include: true
+library(tidyverse)
+library(kableExtra)
+library(rsample)
+library(recipes)
+library(yardstick)
+library(torch)
+library(luz)
+library(reticulate) # reading numpy .npy arrays, for Part 2
+library(caret)      # random forest with tuned mtry (Part 1)
+
+kbl2 <- function(x, ...) kable(x, align = "lrrrrrr", ...) |> kable_styling(full_width = FALSE)
+```
+
+# Overview
+
+Last time we built neural networks with `neuralnet`, `keras`, and `torch`,
+but we never really leaned on two things that matter in practice:
+**regularization**, and **architectures beyond a stack of dense layers**.
+This document does both, entirely in `torch`:
+
+1. **Same complexity level as before, but regularized.** We refit a small
+   network on a familiar tabular dataset (Framingham), this time comparing
+   an unregularized version against one with dropout and weight decay
+   (L2 regularization via the optimizer).
+2. **A genuinely harder problem.** We build our first real **convolutional
+   neural network (CNN)** on real medical images — chest X-rays, predicting
+   pneumonia — rather than the flattened-pixel MLP we used for MNIST.
+
+---
+
+# Part 1: Tuning and Regularizing a Small Network
+
+Neural networks come with many choices: how many hidden layers, how many
+units per layer, how much dropout, how much weight decay, and how fast to
+learn. Rather than guess, we'll do this the way we've done model selection
+all semester, with an honest three-way split:
+
+| Set | Used for |
+|-----|----------|
+| **Training** (60%) | fitting the network weights |
+| **Validation** (20%) | comparing architectures/hyperparameters, choosing the best model, and choosing a classification threshold |
+| **Test** (20%) | one final, honest estimate of performance — touched only at the very end |
+
+## Data
+
+We reuse the Framingham data from earlier in the course, predicting
+`TenYearCHD` from a handful of predictors.
+
+```{r}
+framingham <- read_csv("framingham.csv") |>
+  select(TenYearCHD, age, male, currentSmoker, prevalentHyp, diabetes,
+         totChol, sysBP, BMI, heartRate, glucose) |>
+  drop_na() |>
+  mutate(
+    TenYearCHD = factor(TenYearCHD, levels = c(0, 1)),
+    male          = factor(male),
+    currentSmoker = factor(currentSmoker),
+    prevalentHyp  = factor(prevalentHyp),
+    diabetes      = factor(diabetes)
+  )
+```
+
+
+## Is This a Good Problem for a Neural Network?
+
+**Reasons it might be:**
+
+* Networks can learn nonlinear effects and interactions automatically, without us
+  specifying them as we would in a logistic regression.
+* The problem is small, so we can afford to tune many architectures.
+
+**Reasons it might not be:**
+
+* **Small, low-dimensional tabular data.** We have ~2,500 training rows and 10
+  predictors. Neural networks tend to shine with very large samples and/or
+  high-dimensional, unstructured inputs (images, text, signals). On modest tabular data,
+  random forests, boosting, and even plain logistic regression are usually as good or
+  better, and much easier to tune.
+* **Weak signal.** Ten-year CHD risk is only partly predictable from these
+  measurements, so the achievable AUC is modest (roughly 0.70 to 0.75). When the ceiling is that low, a fancier model
+  has little room to help. That's why the many network configurations above land within noise
+  of each other, and why the random forest is in the same ballpark.
+* **Tuning burden and interpretability.** The network has many knobs (architecture, dropout, weight decay,
+  learning rate, epochs, seed) and is much harder to explain to a clinician than a
+  logistic regression or a single tree.
+
+The takeaway isn't that neural networks are bad, but that they should have to *earn*
+their place against simpler benchmarks. Here the network edges out the random forest by
+a few points of AUC, but the difference is small relative to the noise, and the smallest
+network (8 units) won, which says the extra flexibility isn't buying much. Part 2 is a much better fit.
+
+## Preprocessing
+
+```{r}
+set.seed(2026)
+split1    <- initial_split(framingham, prop = 0.6, strata = TenYearCHD)
+train_raw <- training(split1)
+holdout   <- testing(split1)
+
+split2    <- initial_split(holdout, prop = 0.5, strata = TenYearCHD)
+val_raw   <- training(split2)
+test_raw  <- testing(split2)
+
+# preprocessing is learned on the training set only, then applied to all three
+rec <- recipe(TenYearCHD ~ ., data = train_raw) |>
+  step_dummy(all_nominal_predictors()) |>
+  step_normalize(all_numeric_predictors())
+
+prep_rec <- prep(rec)
+train <- bake(prep_rec, train_raw)
+val   <- bake(prep_rec, val_raw)
+test  <- bake(prep_rec, test_raw)
+
+c(train = nrow(train), validation = nrow(val), test = nrow(test))
+```
+
+## Torch Tensors and Dataloaders
+
+```{r}
+to_x <- function(d) torch_tensor(as.matrix(select(d, -TenYearCHD)), dtype = torch_float())
+# torch's cross-entropy loss wants class indices starting at 1
+to_y <- function(d) torch_tensor(as.integer(d$TenYearCHD), dtype = torch_long())
+
+x_train_t <- to_x(train); y_train_t <- to_y(train)
+x_val_t   <- to_x(val);   y_val_t   <- to_y(val)
+x_test_t  <- to_x(test);  y_test_t  <- to_y(test)
+
+# outcomes coded 0/1 for yardstick
+y_train <- as.integer(train$TenYearCHD) - 1
+y_val   <- as.integer(val$TenYearCHD)   - 1
+y_test  <- as.integer(test$TenYearCHD)  - 1
+
+train_dl <- dataloader(tensor_dataset(x_train_t, y_train_t), batch_size = 64, shuffle = TRUE)
+val_dl   <- dataloader(tensor_dataset(x_val_t,   y_val_t),   batch_size = 64, shuffle = FALSE)
+
+n_features <- ncol(x_train_t)
+n_features
+```
+
+## A Flexible Network and a Fitting Function
+
+To compare architectures we need a network whose depth and width we can
+change. `make_mlp()` builds a stack of `Linear -> ReLU -> Dropout` blocks from
+a vector of hidden-layer sizes, so `c(32, 16)` means two hidden layers with 32
+and then 16 units.
+
+```{r}
+make_mlp <- nn_module(
+  initialize = function(n_in, hidden, p_drop) {
+    layers <- list()
+    prev <- n_in
+    for (h in hidden) {
+      layers <- c(layers, list(nn_linear(prev, h), nn_relu()))
+      if (p_drop > 0) layers <- c(layers, list(nn_dropout(p = p_drop)))
+      prev <- h
+    }
+    layers <- c(layers, list(nn_linear(prev, 2)))
+    self$net <- do.call(nn_sequential, layers)
+  },
+  forward = function(x) self$net(x)
+)
+
+fit_mlp <- function(hidden, p_drop, wd, lr, class_wt = NULL,
+                    max_epochs = 100, seed = 2026) {
+  torch_manual_seed(seed)
+  loss <- if (is.null(class_wt)) nn_cross_entropy_loss() else nn_cross_entropy_loss(weight = class_wt)
+
+  make_mlp |>
+    setup(loss = loss, optimizer = optim_adam) |>
+    set_hparams(n_in = n_features, hidden = hidden, p_drop = p_drop) |>
+    set_opt_hparams(lr = lr, weight_decay = wd) |>
+    fit(train_dl, epochs = max_epochs, valid_data = val_dl, verbose = FALSE,
+        callbacks = list(luz_callback_early_stopping(monitor = "valid_loss", patience = 8)),
+        accelerator = accelerator(cpu = TRUE))
+}
+
+get_probs <- function(fitted, x_t) {
+  fitted |>
+    predict(x_t, accelerator = accelerator(cpu = TRUE)) |>
+    nnf_softmax(dim = 2) |>
+    as.matrix()
+}
+
+eval_metrics <- function(truth, prob_pos, thr = 0.5) {
+  truth <- factor(truth, levels = c(0, 1))
+  cls   <- factor(ifelse(prob_pos >= thr, 1, 0), levels = c(0, 1))
+  tibble(
+    AUC  = roc_auc_vec(truth, prob_pos, event_level = "second"),
+    Sens = sens_vec(truth, cls, event_level = "second"),
+    Spec = spec_vec(truth, cls, event_level = "second"),
+    Acc  = accuracy_vec(truth, cls)
+  )
+}
+```
+
+Two ideas here that are new relative to ridge/lasso:
+
+* **Early stopping.** Training runs for up to 100 epochs, but stops once the
+  validation loss hasn't improved for 8 epochs in a row. The number of epochs
+  is itself a form of regularization, and this way we don't have to tune it by hand.
+* **Learning rate** (`lr`). This is the step size of the Adam optimizer. Too
+  large and training bounces around; too small and it crawls (and early stopping
+  may quit before it gets anywhere).
+
+## The Tuning Grid
+
+We'll cross the following choices (40 networks in total):
+
+| Hyperparameter | Values |
+|---|---|
+| Architecture (hidden units) | `8`, `32`, `32-16`, `64-32`, `64-32-16` |
+| Dropout probability | 0, 0.3 |
+| Weight decay (L2) | 0, 1e-3 |
+| Learning rate | 0.01, 0.001 |
+
+We rank the models by **validation AUC**. We use AUC rather than accuracy because
+CHD is rare and accuracy is dominated by the majority class (more on that below);
+AUC judges how well the model *ranks* cases above non-cases, regardless of threshold.
+
+```{r}
+archs <- list(
+  "8"        = 8,
+  "32"       = 32,
+  "32-16"    = c(32, 16),
+  "64-32"    = c(64, 32),
+  "64-32-16" = c(64, 32, 16)
+)
+
+grid <- expand_grid(
+  arch   = names(archs),
+  p_drop = c(0, 0.3),
+  wd     = c(0, 1e-3),
+  lr     = c(0.01, 0.001)
+)
+
+# The 40-network grid is slow, so the results are saved to disk and reloaded on later
+# renders. Delete tune_res.rds to re-run the search (e.g. after changing the grid).
+if (file.exists("tune_res.rds")) {
+  tune_res <- readRDS("tune_res.rds")
+} else {
+tune_res <- grid |>
+  mutate(res = pmap(list(arch, p_drop, wd, lr), function(arch, p_drop, wd, lr) {
+    f <- fit_mlp(archs[[arch]], p_drop, wd, lr)
+    p_tr  <- get_probs(f, x_train_t)[, 2]
+    p_val <- get_probs(f, x_val_t)[, 2]
+    tibble(
+      epochs    = length(f$records$metrics$valid),
+      train_auc = roc_auc_vec(factor(y_train, levels = c(0, 1)), p_tr,  event_level = "second"),
+      val_auc   = roc_auc_vec(factor(y_val,   levels = c(0, 1)), p_val, event_level = "second"),
+      val_ll    = mn_log_loss_vec(factor(y_val, levels = c(1, 0)), p_val)
+    )
+  })) |>
+  unnest(res) |>
+  arrange(desc(val_auc))
+  saveRDS(tune_res, "tune_res.rds")
+}
+```
+
+```{r}
+tune_res |>
+  slice_head(n = 10) |>
+  kbl2(digits = 3, caption = "Top 10 Configurations by Validation AUC")
+```
+
+```{r}
+#| fig-height: 4.5
+tune_res |>
+  mutate(reg = paste0("dropout = ", p_drop, ", wd = ", wd),
+         lr  = paste("lr =", lr),
+         arch = factor(arch, levels = names(archs))) |>
+  ggplot(aes(arch, val_auc, colour = reg, group = reg)) +
+  geom_point(size = 2) + geom_line() +
+  facet_wrap(~lr) +
+  labs(x = "Architecture (hidden units)", y = "Validation AUC", colour = NULL) +
+  theme_minimal() + theme(legend.position = "bottom")
+```
+
+A few things to look for in the table and plot:
+
+* **Train vs. validation AUC.** A big gap (train much higher than validation) is overfitting —
+  most likely for the deeper/wider networks with no dropout and no weight decay.
+* **Diminishing returns.** With ~2,500 training rows and a handful of predictors, we
+  don't expect big networks to beat small ones by much. Many configurations will be
+  within noise of each other (validation AUC on ~840 rows has a standard error of
+  a couple of points), so prefer the simpler model when it's a near-tie.
+
+```{r}
+best <- tune_res |> slice_head(n = 1)
+best |> kbl2(digits = 3, caption = "Selected Configuration")
+```
+
+## Comparison: Random Forest
+
+Before going further with the network, it's fair to ask whether a neural network
+is even the right tool here. Random forests are a strong default for tabular data,
+so we fit one as a benchmark. We use the `caret` package to choose `mtry` (the
+number of predictors tried at each split) by 5-fold cross-validated AUC. To keep
+things on equal footing with the network, the forest is tuned using **only the
+training set**, and we then score it on the validation set.
+
+```{r}
+# caret needs syntactically valid class labels
+to_caret <- function(d) mutate(d, TenYearCHD = factor(ifelse(TenYearCHD == 1, "yes", "no"),
+                                                     levels = c("no", "yes")))
+train_c <- to_caret(train)
+val_c   <- to_caret(val)
+test_c  <- to_caret(test)
+
+# as above: tune once, save, and reload on later renders (delete rf_fit.rds to refit)
+if (file.exists("rf_fit.rds")) {
+  rf_fit <- readRDS("rf_fit.rds")
+} else {
+set.seed(2026)
+rf_fit <- caret::train(
+  TenYearCHD ~ ., data = train_c,
+  method    = "rf",
+  ntree     = 500,
+  metric    = "ROC",
+  tuneGrid  = data.frame(mtry = 1:n_features),
+  trControl = trainControl(method = "cv", number = 5,
+                           classProbs = TRUE, summaryFunction = twoClassSummary)
+)
+  saveRDS(rf_fit, "rf_fit.rds")
+}
+
+rf_fit$bestTune
+plot(rf_fit)
+```
+
+```{r}
+p_val_rf <- predict(rf_fit, val_c, type = "prob")[, "yes"]
+
+bind_rows(
+  tibble(Model = "Best neural network", Val_AUC = best$val_auc),
+  tibble(Model = paste0("Random forest (mtry = ", rf_fit$bestTune$mtry, ")"),
+         Val_AUC = eval_metrics(y_val, p_val_rf)$AUC)
+) |> kbl2(digits = 3, caption = "Validation AUC: Neural Network vs. Random Forest")
+```
+
+## The Selected Model at the Default Threshold
+
+We refit the selected configuration and look at its validation-set performance
+using the usual 0.5 cutoff.
+
+```{r}
+fit_best <- fit_mlp(archs[[best$arch]], best$p_drop, best$wd, best$lr)
+
+p_val_best <- get_probs(fit_best, x_val_t)[, 2]
+eval_metrics(y_val, p_val_best) |>
+  kbl2(digits = 3, caption = "Selected Model: Validation Set, Threshold = 0.5")
+```
+
+**What's causing the low sensitivity?** With the default cutoff, accuracy is
+maximized by saying few people are cases:
+
+```{r}
+table(Predicted_positive = p_val_best > 0.5, Truth = y_val)
+round(prop.table(table(y_train)), 3)
+```
+
+**Note: these proportions do match what is in the data.**
+
+We'll look at two ways to address this, using the selected architecture: first a weighted loss
+function, and then adjusting the cutoff.
+
+## Fix 1: Weighted Loss
+
+Previously we used no `weight =` argument, so every training example counts
+equally. The fastest way to shrink the loss is to push predicted probabilities
+toward the majority class ("no CHD") for almost everyone. Weighting each class
+inversely to its frequency makes a missed case cost far more.
+
+```{r}
+class_weights <- as.numeric(1 / table(y_train))
+class_weights <- class_weights / sum(class_weights) * 2
+class_weights
+class_weights_t <- torch_tensor(class_weights, dtype = torch_float())
+
+fit_best_wt <- fit_mlp(archs[[best$arch]], best$p_drop, best$wd, best$lr,
+                       class_wt = class_weights_t)
+
+p_val_wt <- get_probs(fit_best_wt, x_val_t)[, 2]
+
+bind_rows(
+  eval_metrics(y_val, p_val_best) |> mutate(Model = "Selected model"),
+  eval_metrics(y_val, p_val_wt)   |> mutate(Model = "Selected model + weighted loss")
+) |>
+  relocate(Model) |>
+  kbl2(digits = 3, caption = "Weighted Loss (Validation Set, Threshold = 0.5)")
+```
+
+Note we run on the `cpu` here because of the M1/M2 Mac issue we discussed.
+
+## Fix 2: Threshold Tuning Instead of Reweighting
+
+Weighting the loss changes what the network *learns*. There's a cheaper
+alternative that changes nothing about training: leave the model as fit, and move
+the classification threshold away from 0.5 at prediction time, using Youden's
+$J = \text{Sens} + \text{Spec} - 1$.
+
+The threshold is a tuning parameter too, so we choose it on the **validation** set,
+not the test set. Otherwise the test estimate wouldn't be honest.
+
+```{r}
+tune_threshold_j <- function(truth, prob, grid = NULL) {
+  if (is.null(grid)) grid <- sort(unique(prob))
+  truth <- factor(truth, levels = c(0, 1))
+
+  best_t <- 0.5
+  best_j <- -Inf
+  for (t in grid) {
+    cls <- factor(ifelse(prob >= t, 1, 0), levels = c(0, 1))
+    se  <- sens_vec(truth, cls, event_level = "second")
+    sp  <- spec_vec(truth, cls, event_level = "second")
+    j   <- as.numeric(se + sp - 1)
+    if (!is.na(j) && j > best_j) {
+      best_j <- j
+      best_t <- t
+    }
+  }
+  best_t
+}
+
+thr_best <- tune_threshold_j(y_val, p_val_best)
+thr_wt   <- tune_threshold_j(y_val, p_val_wt)
+c(unweighted = thr_best, weighted = thr_wt)
+```
+
+```{r}
+bind_rows(
+  eval_metrics(y_val, p_val_best, 0.5)      |> mutate(Model = "Selected", Threshold = "0.5"),
+  eval_metrics(y_val, p_val_best, thr_best) |> mutate(Model = "Selected", Threshold = "Youden"),
+  eval_metrics(y_val, p_val_wt,   0.5)      |> mutate(Model = "Selected + weighted loss", Threshold = "0.5"),
+  eval_metrics(y_val, p_val_wt,   thr_wt)   |> mutate(Model = "Selected + weighted loss", Threshold = "Youden")
+) |>
+  relocate(Model, Threshold) |>
+  kbl2(digits = 3, caption = "Weighting vs. Threshold Tuning (Validation Set)")
+```
+
+::: {.callout-important}
+The unweighted model's Youden threshold comes out well below 0.5, because its predicted
+probabilities for the positive class are systematically compressed low. This is a
+**prediction-time** fix, not a **training-time** one. Reweighting the loss changes what the
+network optimizes; threshold tuning changes how we read out an already-fit model.
+They aren't mutually exclusive, and the weighted model's Youden threshold should land
+much closer to 0.5 since the weighting has already done part of the job. Note that
+**AUC doesn't change** with the threshold. It's the same model, ranked the same way.
+:::
+
+## Honest Error Estimate on the Test Set
+
+Everything above (architecture, hyperparameters, class weights, thresholds) was chosen
+using the training and validation sets. The test set has not been touched, so we
+can now report performance for each final strategy, using the thresholds chosen on
+the validation set.
+
+```{r}
+p_test_best <- get_probs(fit_best,    x_test_t)[, 2]
+p_test_wt   <- get_probs(fit_best_wt, x_test_t)[, 2]
+p_test_rf   <- predict(rf_fit, test_c, type = "prob")[, "yes"]
+thr_rf      <- tune_threshold_j(y_val, p_val_rf)   # threshold chosen on validation
+
+bind_rows(
+  eval_metrics(y_test, p_test_best, 0.5)      |> mutate(Model = "Selected", Threshold = "0.5"),
+  eval_metrics(y_test, p_test_best, thr_best) |> mutate(Model = "Selected", Threshold = "Youden (from validation)"),
+  eval_metrics(y_test, p_test_wt,   0.5)      |> mutate(Model = "Selected + weighted loss", Threshold = "0.5"),
+  eval_metrics(y_test, p_test_wt,   thr_wt)   |> mutate(Model = "Selected + weighted loss", Threshold = "Youden (from validation)"),
+  eval_metrics(y_test, p_test_rf,   0.5)      |> mutate(Model = "Random forest", Threshold = "0.5"),
+  eval_metrics(y_test, p_test_rf,   thr_rf)   |> mutate(Model = "Random forest", Threshold = "Youden (from validation)")
+) |>
+  relocate(Model, Threshold) |>
+  kbl2(digits = 3, caption = "Final Test-Set Performance (never used for any tuning)")
+```
+
+Compare these to the validation numbers. The test-set values are the ones to
+report. The validation values are somewhat optimistic, because we picked the winner
+from 40 candidates using them. (Here test AUC happens to come out a bit
+*higher* than validation AUC, which is just sampling variability in a ~770-row split.) The
+pattern from validation carries over: at 0.5 the unweighted network catches almost
+no cases, while weighting or a Youden threshold buys much higher sensitivity at the
+cost of specificity. The random forest, tuned with `caret`, has a lower AUC than the networks
+on both validation and test, and needs the same threshold fix.
+
+::: {.callout-note}
+This is a single split with a single random initialization per network, so
+differences of a point or two of AUC between configurations are mostly noise. To
+be more careful you could use cross-validation for the tuning step, or average
+over several seeds. We keep it to one split here so it stays fast and easy to follow.
+:::
+
+---
+
+# Part 2: Cranking It Up — Detecting Pneumonia from Chest X-Rays
+
+## The Data: PneumoniaMNIST
+
+[PneumoniaMNIST](https://medmnist.com/) is a real, public pediatric chest
+X-ray dataset (from the [MedMNIST](https://github.com/MedMNIST/MedMNIST)
+collection), pre-processed to 28×28 grayscale images with a binary label:
+**normal** vs. **pneumonia**. It ships with its own train/validation/test
+split, so unlike Part 1 we don't need to carve one out ourselves.
+
+```{r}
+url <- "https://zenodo.org/records/10519652/files/pneumoniamnist.npz?download=1"
+dest_zip <- "pneumoniamnist.npz"
+
+if (!file.exists(dest_zip)) {
+  download.file(url, dest_zip, mode = "wb")
+}
+
+unzip(dest_zip, list = TRUE)   # confirm the array names inside before loading
+```
+
+```{r}
+tmp_dir <- tempdir()
+unzip(dest_zip, exdir = tmp_dir)
+
+np <- import("numpy")
+
+train_images <- np$load(file.path(tmp_dir, "train_images.npy"))
+train_labels <- np$load(file.path(tmp_dir, "train_labels.npy"))
+val_images   <- np$load(file.path(tmp_dir, "val_images.npy"))
+val_labels   <- np$load(file.path(tmp_dir, "val_labels.npy"))
+test_images  <- np$load(file.path(tmp_dir, "test_images.npy"))
+test_labels  <- np$load(file.path(tmp_dir, "test_labels.npy"))
+
+dim(train_images)   # should be (n, 28, 28)
+table(as.vector(train_labels))
+```
+
+
+The class counts above are **imbalanced** — pneumonia cases outnumber
+normal ones in this dataset, the same kind of imbalance we discussed
+above. We'll come back to that when we pick a decision
+threshold.
+
+A quick look at a few images:
+
+```{r}
+par(mfrow = c(3, 3), mar = c(1, 1, 2, 1))
+for (i in 1:9) {
+  lbl <- ifelse(train_labels[i] == 1, "Pneumonia", "Normal")
+  image(t(apply(train_images[i, , ], 2, rev)), col = gray.colors(256),
+        axes = FALSE, main = lbl)
+}
+```
+
+A normal, aerated lung is mostly air, and air lets X-rays pass through easily — so on a standard chest X-ray, healthy lung tissue shows up as dark (radiolucent), while denser structures (bone, heart, fluid) show up as light/white (radiopaque).
+
+Pneumonia fills the alveoli with fluid, pus, or inflammatory exudate instead of air, so the infected regions attenuate X-rays more than normal lung does. That shows up as patches of increased whiteness/opacity — often called "infiltrates" or "consolidation" — layered on top of what would otherwise be dark lung field. Sometimes you'll also see it obscure normal landmarks like the heart border or diaphragm edge ("silhouette sign") where the opacity sits right up against them.
+
+A "pneumonia" image should generally look like it has more light/white patchy or hazy regions within the lung fields than a "normal" image, which should look more uniformly dark where the lungs are. It's not a simple "more white overall" rule though — bones, the heart, and the mediastinum are white in every chest X-ray regardless of diagnosis; what you're looking for is unusual whiteness specifically in areas that should be dark lung.
+
+
+
+## Is This a Good Problem for a Neural Network?
+
+**Reasons it is:**
+
+* **Images have spatial structure.** A random forest or logistic regression on 784
+  raw pixels treats each pixel as an unrelated column, discarding the fact that
+  neighbouring pixels form edges and textures. Convolutions are built for exactly this,
+  and the same filter is reused across the image, so the parameter count stays manageable.
+* **The signal is a pattern, not a variable.** Pneumonia shows up as patchy opacity
+  in certain regions, and no single pixel is informative on its own. Learning features
+  from the raw data is what deep networks do best. There is no obvious hand-made
+  predictor to feed a simpler model.
+* We have thousands of images, far more inputs per observation than in Part 1, and
+  a benchmark dataset with a pre-defined train/validation/test split.
+
+**Reasons to be cautious:**
+
+* **The images are tiny.** At 28×28 much of the fine detail a radiologist would use is gone.
+  Real chest X-ray models work with images of a few hundred pixels per side, and typically start from a
+  pretrained network (transfer learning) rather than training from scratch.
+* **Only ~4,700 training images** for a model with over 100,000 parameters, so overfitting is a
+  real risk and regularization matters.
+* **Generalization and validity.** These images come from a single pediatric hospital.
+  A model can pick up scanner, hospital, or patient-population quirks instead of pathology and
+  then fail elsewhere. Good test-set numbers here don't guarantee that performance
+  will hold in a new setting.
+* Like Part 1, it's a black box, which is a real concern in a clinical setting.
+
+
+## Preparing Tensors
+
+```{r}
+prep_images <- function(x) {
+  x <- x / 255                                    # scale pixel intensities to [0,1]
+  t <- torch_tensor(x, dtype = torch_float())
+  t$unsqueeze(2)                                  # (N, H, W) -> (N, 1, H, W): add channel dim
+}
+
+x_train_img <- prep_images(train_images)
+x_val_img   <- prep_images(val_images)
+x_test_img  <- prep_images(test_images)
+
+# +1: torch's cross-entropy loss expects class indices starting at 1
+y_train_img <- torch_tensor(as.integer(as.vector(train_labels)) + 1L, dtype = torch_long())
+y_val_img   <- torch_tensor(as.integer(as.vector(val_labels))   + 1L, dtype = torch_long())
+y_test_img  <- torch_tensor(as.integer(as.vector(test_labels))  + 1L, dtype = torch_long())
+
+train_ds_img <- tensor_dataset(x_train_img, y_train_img)
+val_ds_img   <- tensor_dataset(x_val_img,   y_val_img)
+test_ds_img  <- tensor_dataset(x_test_img,  y_test_img)
+
+train_dl_img <- dataloader(train_ds_img, batch_size = 64, shuffle = TRUE)
+val_dl_img   <- dataloader(val_ds_img,   batch_size = 64, shuffle = FALSE)
+test_dl_img  <- dataloader(test_ds_img,  batch_size = 64, shuffle = FALSE)
+```
+
+## A Convolutional Neural Network
+
+Every network so far in this course has been a stack of dense (fully
+connected) layers — for images, that means flattening the picture into a
+long vector and throwing away all spatial structure. A **convolutional**
+layer instead slides small learned filters across the image, picking up
+local patterns (edges, textures) wherever they occur; a **pooling** layer
+then downsamples, making the representation smaller and more robust to
+small shifts in position. Stacking a few of these is what makes CNNs the
+standard architecture for image data.
+
+[Link](https://www.youtube.com/watch?v=pj9-rr1wDhM) to video explaining CNNs.
+
+
+```{r}
+#| out-width: "0.9\\linewidth"
+#| fig-align: "center"
+#| fig-cap: "The 96 learned filters from the first convolutional layer of AlexNet (Krizhevsky et al., 2012). Each small square is one 11x11 filter, visualized as an image — notice how many resemble simple edge and color-blob detectors, similar in spirit to the filters our much smaller CNN is learning for chest X-rays."
+#| echo: false
+knitr::include_graphics("The-96-features-on-the-first-convolutional-conv1-layer-of-a-CNN-AlexNet-Krizhevsky-et.webp")
+```
+
+
+
+```{r}
+torch_manual_seed(2026)
+
+cnn_net <- nn_module(
+  initialize = function() {
+    self$conv1   <- nn_conv2d(in_channels = 1,  out_channels = 16, kernel_size = 3, padding = 1)
+    self$conv2   <- nn_conv2d(in_channels = 16, out_channels = 32, kernel_size = 3, padding = 1)
+    self$pool    <- nn_max_pool2d(kernel_size = 2)
+    self$dropout <- nn_dropout(p = 0.3)
+    self$fc1     <- nn_linear(32 * 7 * 7, 64)
+    self$fc2     <- nn_linear(64, 2)
+  },
+  forward = function(x) {
+    x <- x |> self$conv1() |> nnf_relu() |> self$pool()   # 28x28 -> 14x14
+    x <- x |> self$conv2() |> nnf_relu() |> self$pool()   # 14x14 -> 7x7
+    x <- x$reshape(c(x$size(1), -1))                      # flatten for the dense layers
+    x <- x |> self$dropout() |> self$fc1() |> nnf_relu() |> self$dropout() |> self$fc2()
+    x
+  }
+)
+```
+
+### What Each Piece Does, and Why We Chose It
+
+**Convolutional layers: `nn_conv2d(in_channels, out_channels, kernel_size, padding)`**
+
+A convolutional layer slides a small window of learned weights (a *filter*) across the image.
+At each position it takes a weighted sum of the pixels under the window, producing one number
+in an output grid called a *feature map*. Each option controls one aspect of this:
+
+* `in_channels`: how many maps the layer receives. `conv1` sees the raw image, which is
+  grayscale, so this is 1 (a color photo would be 3). `conv2` receives `conv1`'s output, so it must be 16.
+* `out_channels`: how many different filters the layer learns, and therefore how many feature
+  maps it outputs. Each filter tends to specialize in a different pattern, such as an edge at a particular
+  angle or a bright patch. More filters means more patterns but more parameters and computation.
+  We use 16, then 32. The usual convention is to **increase the number of filters as the image
+  shrinks**. Early layers detect a small set of simple patterns (edges, gradients), while later layers
+  combine them into many more complex ones (textures, shapes such as a hazy region next to the
+  heart border), so more channels are useful deeper in. With only 28×28 inputs and
+  ~4,700 training images, a modest 16/32 keeps the network small enough to train on a laptop CPU
+  and limits overfitting.
+* `kernel_size = 3`: the filter is a 3×3 window. Small kernels are the modern default: two stacked 3×3
+  layers see a 5×5 region but use fewer parameters than one 5×5 layer, and they add an
+  extra nonlinearity. On a 28×28 image, larger kernels would cover a big fraction of the picture
+  and wouldn't capture "local" structure. Each filter in `conv1` has only 3×3×1 + 1 = 10 parameters,
+  and the same weights are reused at every position, which is why convolutions are so parameter-efficient.
+* `padding = 1`: adds a one-pixel border of zeros before sliding the filter. Without it a 3×3 window can't
+  be centered on edge pixels, and each convolution would trim the image from 28×28 to 26×26.
+  With `padding = 1` the output has the same height and width as the input (for a 3×3 kernel), so all of the
+  shrinking in the network comes from the pooling layers, which keeps the size bookkeeping simple.
+
+**ReLU activation: `nnf_relu()`**
+
+After each convolution (and after `fc1`) we apply ReLU, $\max(0, x)$. Without a nonlinearity between layers, a stack of
+convolutions and linear layers would collapse into a single linear operation, no matter how many we stacked. ReLU is the
+default choice because it is cheap to compute and doesn't squash large values the way sigmoid/tanh do, which
+makes deep networks much easier to train. It has no parameters to tune.
+
+**Pooling: `nn_max_pool2d(kernel_size = 2)`**
+
+Max pooling looks at each non-overlapping 2×2 block of a feature map and keeps only the largest value. This
+halves the height and width (28×28 → 14×14 → 7×7), so each later layer has a quarter as many positions to
+process. It also makes the representation tolerant of small shifts, since a pattern that moves by a pixel
+often still produces the same maximum. It is useful for us because a pneumonia opacity can appear in slightly different places from
+image to image. Keeping the *maximum* (rather than the average) says "was this pattern detected anywhere in this
+block?" The pooling layer has no learned weights, and we reuse one `pool` object for both stages.
+A 2×2 window is standard: bigger windows throw away spatial information too quickly on such a small image.
+
+**Flattening: `x$reshape(c(x$size(1), -1))`**
+
+The dense layers expect one long vector per image, not a stack of maps. This line keeps the batch dimension
+(`x$size(1)`) and lets torch (`-1`) work out the rest, turning each `(32, 7, 7)` block into a vector of
+32 × 7 × 7 = 1,568 numbers.
+
+**Dense layers: `nn_linear(in_features, out_features)`**
+
+A fully connected layer: every input number connects to every output unit, with its own weight. The earlier
+layers *extract features* and the dense layers use those features to *make the decision*.
+
+* `fc1 = nn_linear(32 * 7 * 7, 64)`: `in_features` must exactly match the flattened size (1,568), or
+  torch will throw a shape error. This is why the padding and pooling arithmetic above matters. The 64
+  hidden units are a judgment call: enough capacity to combine the 1,568 features into a useful summary,
+  but not so many that this one layer (which already holds more than 100,000 weights) dominates and
+  overfits. Powers of two such as 32, 64, 128 are conventional (they are efficient on hardware), and
+  nothing magic distinguishes 64 from, say, 50. Like the filters, this is a hyperparameter you would
+  ideally tune on the validation set, as we did for the Framingham network.
+* `fc2 = nn_linear(64, 2)`: the output layer has one unit per class (normal, pneumonia), so
+  `out_features = 2`. It has no ReLU after it because it should output unbounded scores ("logits").
+  `nn_cross_entropy_loss()` applies the softmax internally during training, and we apply `nnf_softmax()` ourselves at
+  prediction time to convert the scores to probabilities.
+
+**Putting the sizes together**
+
+| Step | Output shape (per image) |
+|---|---|
+| Input | 1 × 28 × 28 |
+| `conv1` + ReLU | 16 × 28 × 28 |
+| pool | 16 × 14 × 14 |
+| `conv2` + ReLU | 32 × 14 × 14 |
+| pool | 32 × 7 × 7 |
+| flatten | 1,568 |
+| `fc1` + ReLU | 64 |
+| `fc2` | 2 |
+
+This is a deliberately small, classic design (two conv/pool stages followed by a small dense head), in the
+spirit of early networks like LeNet. It is a reasonable starting point for 28×28 images, not a tuned optimum. Depth, filter
+counts, and the width of `fc1` could all be compared on the validation set in the same way we compared
+architectures in Part 1.
+
+```{r}
+model_inst <- cnn_net()
+
+# Show the architecture
+print(model_inst)
+
+## "Neurons" per layer — for the dense layers this is unambiguous (layer width);
+## for the conv layers, the closest analogue is the number of output channels
+## (filters), since each filter is scanned across every spatial position.
+tibble(
+  Layer   = c("conv1", "conv2", "fc1", "fc2"),
+  Neurons = c(16, 32, 64, 2)   # out_channels for conv layers, out_features for linear layers
+) |> kbl2(caption = "Neurons (Output Channels / Units) per Layer")
+```
+
+
+
+The conv layers look "small" (16, 32 filters) next to fc1's 64 units, but they're doing far more work per parameter — each of those 16 (then 32) filters gets applied at every position in the image, producing a `16 × 28 × 28` (then `32 × 14 × 14`) stack of activations, even though the filter itself only has a handful of weights (3×3×in_channels + 1 bias each).
+
+
+
+```{r}
+## Per-layer parameter counts
+params <- model_inst$named_parameters()
+
+param_tbl <- tibble(
+  Layer    = names(params),
+  Shape    = sapply(params, function(p) paste(dim(p), collapse = " x ")),
+  N_Params = sapply(params, function(p) p$numel())
+)
+
+param_tbl |> kbl2(caption = "CNN Parameters by Layer")
+
+## Total trainable parameters
+sum(param_tbl$N_Params)
+```
+
+Almost all the trainable parameters will be sitting in fc1 (`32 × 7 × 7 = 1568` inputs into 64 units is over 100,000 weights) — worth pointing out that flattening right before the dense layers is usually where a CNN's parameter count balloons, not in the `conv` layers themselves.
+
+Since pneumonia cases outnumber normal cases in training, we weight the
+loss so the rarer class isn't effectively ignored — the same spirit as the
+cost-sensitive thresholds we used for Naive Bayes, applied during training
+instead of afterward.
+
+```{r}
+class_counts  <- table(as.integer(as.vector(train_labels)))
+class_weights <- as.numeric(1 / class_counts)
+class_weights <- class_weights / sum(class_weights) * 2   # normalize, 2 classes
+class_weights_t <- torch_tensor(class_weights, dtype = torch_float())
+
+class_weights
+```
+
+```{r}
+# Fitted torch/luz objects can't be cached by knitr, so we cache by hand:
+# train once, save to disk with luz_save(), and reload on later renders.
+# (Delete cnn_fit.luz to force a retrain.)
+if (file.exists("cnn_fit.luz")) {
+  fitted_cnn <- luz_load("cnn_fit.luz")
+} else {
+  fitted_cnn <- cnn_net |>
+    setup(
+      loss      = nn_cross_entropy_loss(weight = class_weights_t),
+      optimizer = optim_adam,
+      metrics   = list(luz_metric_accuracy())
+    ) |>
+    set_opt_hparams(lr = 0.001, weight_decay = 1e-4) |>
+    fit(train_dl_img, epochs = 15, valid_data = val_dl_img, verbose = TRUE,
+        accelerator = accelerator(cpu = TRUE))
+  luz_save(fitted_cnn, "cnn_fit.luz")
+}
+
+plot(fitted_cnn)
+```
+
+`weight_decay = 1e-4` is the same L2 regularization idea from Part 1 —
+here it's earning its keep, since this CNN has far more parameters
+relative to its ~4,700 training images than the tabular network did.
+
+
+## A Non-Neural Alternative: A Smooth Coefficient Surface
+
+Before crediting the CNN for everything, let's try a classical method that also respects
+the 2D structure of the image. A logistic regression on the raw pixels would have 784
+coefficients, one per pixel, with no notion that neighbouring pixels are related. Instead we can
+require the coefficients to form a **smooth surface** over the image grid:
+
+$$
+\text{logit}\, P(\text{pneumonia}) = \beta_0 + \sum_{r,c} \beta(r, c)\, x_{rc},
+\qquad \beta(r, c) = \sum_{j} \theta_j\, B_j(r, c),
+$$
+
+where $B_j(r, c)$ are the basis functions of a **2D tensor-product spline** (the same kind of smooth you
+would get from `te()` in `mgcv`, from our splines/GAM lectures). Substituting, the model becomes an ordinary logistic
+regression on the $k^2 - 1$ scores $z_j = \sum_{r,c} B_j(r,c)\, x_{rc}$, which are
+just a matrix multiplication of the images by the basis. So the "hard" part is only building the basis once.
+
+The number of knots per dimension, $k$, controls how wiggly the coefficient surface can be, and it is the tuning
+parameter. We pick it on the validation set, exactly as we did with the network architecture.
+
+```{r}
+library(mgcv)
+
+# flatten each 28x28 image into a row; column order is (row fastest), matching `grid` below
+flatten <- function(a) matrix(a / 255, nrow = dim(a)[1])
+X_tr <- flatten(train_images)
+X_va <- flatten(val_images)
+X_te <- flatten(test_images)
+
+y_tr <- as.integer(as.vector(train_labels))
+y_va <- as.integer(as.vector(val_labels))
+
+# pixel coordinates, with row index varying fastest to match the flattening above
+pix_grid <- expand.grid(r = (1:28) / 28, c = (1:28) / 28)
+
+# tensor-product P-spline basis evaluated at every pixel: a 784 x (k^2 - 1) matrix
+spline_basis <- function(k) {
+  smoothCon(te(r, c, bs = "ps", k = c(k, k)), data = pix_grid, absorb.cons = TRUE)[[1]]$X
+}
+
+fit_spline_lr <- function(k) {
+  B <- spline_basis(k)
+  Z <- X_tr %*% B; colnames(Z) <- paste0("b", seq_len(ncol(B)))
+  list(B = B, fit = glm(y ~ ., data = data.frame(y = y_tr, Z), family = binomial))
+}
+
+predict_spline_lr <- function(m, X) {
+  Z <- X %*% m$B; colnames(Z) <- paste0("b", seq_len(ncol(m$B)))
+  as.numeric(predict(m$fit, data.frame(Z), type = "response"))
+}
+
+spline_fits <- map(c(4, 6, 8, 10, 12), fit_spline_lr)
+
+spline_tune <- tibble(
+  k         = c(4, 6, 8, 10, 12),
+  n_coef    = map_int(spline_fits, ~ ncol(.x$B)),
+  train_auc = map_dbl(spline_fits, ~ eval_metrics(y_tr, predict_spline_lr(.x, X_tr))$AUC),
+  val_auc   = map_dbl(spline_fits, ~ eval_metrics(y_va, predict_spline_lr(.x, X_va))$AUC)
+)
+
+spline_tune |> kbl2(digits = 3, caption = "Spline Logistic Regression: Choosing the Number of Knots (k) on the Validation Set")
+```
+
+```{r}
+#| fig-height: 4
+best_k      <- spline_tune$k[which.max(spline_tune$val_auc)]
+spline_best <- spline_fits[[which(spline_tune$k == best_k)]]
+
+# the estimated coefficient surface beta(r, c) = B %*% theta
+beta_surface <- matrix(spline_best$B %*% coef(spline_best$fit)[-1], nrow = 28)
+
+par(mfrow = c(1, 1), mar = c(1, 1, 2, 1))
+image(t(apply(beta_surface, 2, rev)), axes = FALSE,
+      col = hcl.colors(50, "Blue-Red 3"),
+      main = paste0("Estimated coefficient surface (k = ", best_k, ")"))
+```
+
+Red regions are where brighter pixels push the prediction toward pneumonia, and blue regions are where
+they push toward normal. This is the interpretability advantage over the CNN: the whole model is a single picture.
+
+### Head-to-Head on the Test Set
+
+Both models choose their classification threshold on the **validation** set using Youden's index, and the test set is used once.
+
+```{r}
+p_val_cnn  <- fitted_cnn |>
+  predict(x_val_img, accelerator = accelerator(cpu = TRUE)) |>
+  nnf_softmax(dim = 2) |> as.matrix()
+p_val_cnn  <- p_val_cnn[, 2]
+
+p_test_cnn <- fitted_cnn |>
+  predict(x_test_img) |>
+  nnf_softmax(dim = 2) |>
+  as.matrix()
+
+p_pneumonia <- p_test_cnn[, 2]
+
+p_val_spl  <- predict_spline_lr(spline_best, X_va)
+p_test_spl <- predict_spline_lr(spline_best, X_te)
+
+thr_cnn <- tune_threshold_j(y_va, p_val_cnn)
+thr_spl <- tune_threshold_j(y_va, p_val_spl)
+
+truth_test  <- as.integer(as.vector(test_labels))
+
+bind_rows(
+  eval_metrics(truth_test, p_pneumonia) |> mutate(Threshold = 0.5, Model = "CNN"),
+  eval_metrics(truth_test, p_pneumonia, thr_cnn) |> mutate(Threshold = thr_cnn, Model = "CNN"),
+  eval_metrics(truth_test, p_test_spl) |> mutate(Threshold = 0.5, Model = paste0("Spline logistic regression (k = ", best_k, ")")),
+  eval_metrics(truth_test, p_test_spl,  thr_spl) |> mutate(Threshold = thr_spl, Model = paste0("Spline logistic regression (k = ", best_k, ")"))
+) |>
+  relocate(Model, Threshold) |>
+  kbl2(digits = 3, caption = "Test-Set Performance (Youden threshold chosen on validation)")
+```
+
+The point of this comparison is not that one method must win. A smooth linear surface on the image is
+a much more constrained model than a CNN (it can only detect "more or less brightness here"), so it's
+informative to see how close it gets. It's also easy to fit, has one tuning parameter, and
+yields a coefficient map a clinician can look at. Where the CNN can do better is when the signal isn't a simple
+brightness pattern, for example when the *shape* or *texture* matters regardless of where it appears. If the two are
+close, the simpler model is often the better choice.
+
+```{r}
+table(p_pneumonia >= 0.5, p_test_spl >= 0.5)
+```
+
+
+
+::: {.callout-important}
+As with the Naive Bayes screening example, think about which error costs
+more here: missing a real pneumonia case (false negative) is clinically
+worse than flagging a normal X-ray for review (false positive). If
+sensitivity at the default 0.5 threshold looks lower than you'd want for a
+screening tool, that's the same threshold-shifting exercise from earlier
+in the course — lowering the cutoff trades some specificity for higher
+sensitivity.
+:::
+
+
+## A Look at a Few Predictions
+
+```{r}
+#| out-width: "100%" 
+#| fig-height: 12
+set.seed(123)
+
+idx <- unique(c(1,3,4,which((p_pneumonia >= 0.5) & truth_test == 0 )[1:3], 
+         which((p_test_spl >= 0.5) & truth_test == 0 )[4:6], 
+         which((p_pneumonia >= 0.5) != (p_test_spl >= 0.5))[1:4]
+         ))
+         
+
+par(mfrow = c(4, 3), mar = c(1, 1, 5, 1))
+for (i in idx) {
+  true_lbl <- ifelse(truth_test[i] == 1, "Pneumonia", "Normal")
+  pred_lbl <- ifelse(p_pneumonia[i] >= 0.5, "Pneumonia", "Normal")
+  pred_lbl2 <- ifelse(p_test_spl[i] >= 0.5, "Pneumonia", "Normal")
+  image(t(apply(test_images[i, , ], 2, rev)), col = gray.colors(256), axes = FALSE,
+        main = paste0("True: ", true_lbl, "\nPred CNN: ", pred_lbl, "\nPred Spl: ", pred_lbl2))
+}
+```
+
+---
+
+# Summary
+
+* **Weight decay** (an L2 penalty built into the optimizer) and **dropout**
+  are the neural-network analogues of ridge regression and random feature
+  removal — but they mostly matter when the network has real capacity to
+  overfit. On a small tabular network, regularizing barely changed
+  anything; on a CNN with far more parameters relative to its training
+  data, it's doing real work.
+* **Convolutional layers** are the first architecture in this course that
+  isn't just a stack of dense layers — they exploit the spatial structure
+  of image data instead of flattening it away.
+* The same practical themes from earlier in the semester carry over
+  directly to deep learning: **class imbalance** (handled here with a
+  weighted loss instead of resampling), and **cost-sensitive thresholds**
+  (the same screening-vs-confirmation logic applies to a CNN's output
+  probabilities exactly as it did to Naive Bayes).

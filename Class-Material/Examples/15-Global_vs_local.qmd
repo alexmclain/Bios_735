@@ -1,0 +1,374 @@
+---
+title: "12 - Global versus Local Dimension Reduction"
+subtitle: "Biostatistics 735/794 — Machine Learning in Public Health"
+author: "Alexander McLain"
+date: today
+format:
+  html:
+    toc: true
+    toc-location: left
+    toc-depth: 3
+    number-sections: true
+    smooth-scroll: true
+    theme: cosmo
+    code-fold: false
+    highlight-style: github
+    embed-resources: true
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+
+```{r}
+#| include: false
+library(tidyverse)
+library(kableExtra)
+library(dslabs) # To get the MNIST data
+library(psych) # PCA (I had to download the .tar file for this)
+library(Rtsne) # t-SNE
+library(grDevices) # for extra colors
+library(FactoMineR)
+library(factoextra)
+
+palette1 <- rainbow(10) 
+kbl2 <- function(x, ...) kable(x, align = "lrrrrrr", ...) |> kable_styling(full_width = FALSE)
+```
+
+
+# Dimension Reduction on digit data
+
+
+First were going to analyze the hand written digits dataset (MNIST).  You can download the `mnist` dataset from the `dslabs` package. Here's an example of how you can load it:
+
+```{r}
+#| cache: true
+mnist <- read_mnist()
+x_train <- mnist$train$images
+y_train <- mnist$train$labels
+digit1 <- matrix(x_train[50,], 28, 28)
+digit2 <- matrix(x_train[51,], 28, 28)
+digit3 <- matrix(x_train[8,], 28, 28)
+par(pty="s", mfrow = c(1,3)) 
+image(digit1, col = gray.colors(256), axes = FALSE)
+image(digit2, col = gray.colors(256), axes = FALSE)
+image(digit3, col = gray.colors(256), axes = FALSE)
+```
+
+
+**Should be use a global or local method for this data?**
+
+
+## Preprocess the data
+
+All were going to do is limit our analyses to the first $10,000$ observations (for most methods). Also, PCA is affected by the scale of the data, so it's generally a good idea to standardize the features to have mean = 0 and standard deviation = 1. First, we'll get rid of all the cells that have zero variation. If we don't do this we'll get errors in our code.
+
+```{r}
+#| cache: true
+dim(x_train)
+x_train <- x_train[1:10000,]
+y_train <- y_train[1:10000]
+x_sd_vec <- apply(x_train,2,sd)
+table(x_sd_vec == 0)
+x_vec_2 <- x_train[,x_sd_vec>0]
+x_vec_2 <- scale(x_vec_2)
+```
+
+We don't have to worry about train and test data here. 
+
+## Principal Components Analysis (PCA)
+
+We are going to perform PCA with the `prcomp` function. Here, we'll retain the first two principal components.
+
+```{r}
+#| cache: true
+pca_result <- prcomp(x_vec_2, center = FALSE, scale. = FALSE, rank. = 2)
+pca_data <- as.data.frame(pca_result$x)
+```
+
+Below, we'll create a scatter plot of the first two principal components, coloring the points by the digit labels.
+
+
+## t-SNE 
+
+t-SNE is a local method. Here, we'll fit it with the `Rtsne` function. We'll discuss the details of this method later.
+
+```{r}
+#| cache: true
+tsne_results10_0.5 <- Rtsne(x_train, dims = 2, perplexity = 10, theta = 0.5, verbose = FALSE)
+```
+
+
+```{r}
+#| cache: true
+#| fig-width: 8
+#| fig-height: 5
+par(mfrow = c(1,2))
+plot(pca_data$PC1, pca_data$PC2, col = palette1[y_train + 1], pch = 19, xlab = "PC1", ylab = "PC2", main = "PCA of Handwritten Digits")
+
+plot(tsne_results10_0.5$Y, col = palette1[y_train + 1], pch = 19, main = "t-SNE (Perplexity = 10, theta = 0.5)")
+legend("topright", legend = c(0:9), col = palette1[1:10], pch = 19)
+```
+
+
+# Example with single-cell RNA-sequencing (scRNA-seq) data 
+
+
+Single-cell RNA sequencing (scRNA-seq) provides gene expression data at the single-cell level, allowing for a more granular understanding of biological processes and cell heterogeneity. However, the data generated can be noisy and sparse. Standard preprocessing steps are crucial to ensure data quality and to extract meaningful information.
+
+Here are the standard preprocessing steps for scRNA-seq data:
+
+1. **Quality Control (QC) of Raw Data**:
+   - **Cell-Level QC**: Remove low-quality cells, such as cells with an abnormally high or low number of unique molecular identifiers (UMIs) or those with high mitochondrial gene content, which can indicate cell stress or damage.
+   - **Gene-Level QC**: Filter out genes that are detected in very few cells. Such genes add noise and are generally not informative for downstream analyses.
+
+2. **Normalization**:
+   - Due to technical biases and varying sequencing depths across cells, normalization is performed to make the expression values comparable across cells.
+
+3. **Mitigating Technical Variability**:
+   - **Batch Correction**: If the data comes from multiple batches, variations from batch effects need to be corrected. Methods include `Seurat's` integration functions, `Harmony`, `BBKNN`, and `MNN`.
+   - **Regression of Unwanted Variation**: Variability arising from factors like cell cycle stage or experimental conditions can be regressed out if they are not of interest.
+
+4. **Feature Selection**:
+   - Identify highly variable genes, as these genes typically carry the most information about differences between cells and will be important for downstream clustering and differential expression analyses.
+
+5. **Dimensionality Reduction**:
+   - Given the high dimensionality of scRNA-seq data, dimensionality reduction techniques are used to project the data into a lower-dimensional space. 
+
+6. **Clustering**:
+   - After dimensionality reduction, cells are clustered based on their similarity in the reduced space. 
+
+7. **Cell Type Identification**:
+   - Assign identities to clusters by comparing the expression profiles of clusters to known marker genes.
+
+8. **Differential Expression Analysis**:
+   - Identify genes that are differentially expressed between clusters or conditions to elucidate the functional differences between cell types or states.
+
+9. **Integration with Other Data** (if applicable):
+   - If there are multiple datasets or modalities (e.g., multi-omics data), integration steps are required to bring them into a common space for combined analysis.
+
+10. **Downstream Analyses**:
+    - Depending on the research question, further analyses like trajectory or pseudotime analysis, cell-cell communication analysis, etc., might be performed.
+
+
+## Dimension reduction example in `Seurat` package
+
+Here's an example using the `Seurat` package, a popular tool for single-cell RNA-seq data analysis. This will guide you through performing PCA on scRNA-seq data and visualizing the results.
+
+1. **Install and Load the Required Libraries**:
+
+```{r}
+#| cache: true
+library(Seurat)
+```
+
+2. **Load scRNA-seq Data**:
+
+For this example, let's use a built-in dataset in Seurat, the `pbmc_small` dataset.
+
+```{r}
+#| cache: true
+data("pbmc_small")
+```
+
+3. **Preprocess the Data**:
+
+Standard preprocessing steps for scRNA-seq data might include normalization and identification of highly variable features. Seurat provides convenient functions for these tasks:
+
+```{r}
+#| cache: true
+pbmc_small <- NormalizeData(pbmc_small)
+```
+
+4. **Scale the Data**:
+
+This scales the data so that each gene has a mean of 0 and a standard deviation of 1:
+
+```{r}
+#| cache: true
+pbmc_small <- ScaleData(pbmc_small, features = rownames(pbmc_small))
+```
+
+5. **Run the methods**:
+
+  PCA and t-sne dimension reductions are already contained within the data. So, we don't have to run them
+
+6. **Print and Plot the Results**:
+
+
+```{r}
+#| cache: true
+#| echo: false
+par(mfrow = c(1,2))
+DimPlot(pbmc_small, reduction = "pca")
+DimPlot(pbmc_small, reduction = "tsne")
+```
+
+
+
+# Dimension Reduction on Socioeconomic Data
+
+
+We’ll use the World Development Indicators-style dataset from `gapminder`, which captures broad global trends (GDP, life expectancy, population).
+These data have a global structure — countries differ gradually across economic and demographic dimensions.
+
+```{r}
+#| cache: true
+data("gapminder")
+
+# Use 2011, which is the last year with good data
+df <- gapminder |>
+  filter(year == 2011) |>
+  select(country, continent, infant_mortality, life_expectancy, population, gdp, fertility)
+
+# Log-transform to reduce skew
+df <- df |>
+  mutate(
+    log_gdp = log(gdp/population),
+    log_pop = log(population),
+    log_im = log(infant_mortality)
+  ) |>
+  select(-gdp, -population, -infant_mortality) |>
+  tidyr::drop_na() #Get rid of missing values
+head(df) |> kbl2(digits = 2)
+```
+
+
+⸻
+
+## PCA
+
+PCA tends to preserve global relationships — countries with similar broad socioeconomic patterns will be near each other.
+
+```{r}
+#| cache: true
+pca_res <- prcomp(df |> select(-country, -continent), scale. = TRUE)
+
+PC_res <- df |> left_join(
+  tibble(country = df$country, 
+       PC1 = pca_res$x[,1], 
+       PC2 = pca_res$x[,2], 
+       PC3 = pca_res$x[,3], 
+       PC4 = pca_res$x[,4])
+) 
+```
+
+⸻
+
+## t-SNE
+
+Now we’ll run t-SNE, which focuses more on local structure (small clusters of similar points), and compare the results.
+
+```{r}
+#| cache: true
+set.seed(123)
+tsne_res <- Rtsne(df |> select(-country, -continent), dims = 2, perplexity = 15)
+
+tsne_df <- as.data.frame(tsne_res$Y)
+tsne_dat <- df |> left_join(
+  tibble(country = df$country, 
+       tSNE1 = tsne_df[,1], 
+       tSNE2 = tsne_df[,2])
+) 
+```
+
+### Compare the results
+
+First, graphically, which doesn't mean much here as there's no "true" latent group we are trying to find.
+
+```{r}
+#| echo: false
+ggplot(PC_res, aes(PC1, PC2, color = continent)) +
+  geom_point(size = 3, alpha = 0.8) +
+  labs(title = "PCA on Global Structure Data", x = "PCA 1", y = "PCA 2") +
+  theme_minimal(base_size = 13)
+
+ggplot(tsne_dat, aes(tSNE1, tSNE2, color = continent)) +
+  geom_point(size = 3, alpha = 0.8) +
+  labs(title = "t-SNE on Global Structure Data", x = "t-SNE 1", y = "t-SNE 2") +
+  theme_minimal(base_size = 13)
+```
+
+Let's look at the most extreme values of the first PCA and tSNE score:
+
+```{r}
+#| echo: false
+PC_res  |>  
+  arrange(PC1) |> slice(c(1:6, (n() - 6 + 1):n())) |> 
+  mutate(
+      PC1 = cell_spec(
+      sprintf("%.3f", PC1),
+      color = ifelse(PC1 < 0, "red", "black")
+    )) |> 
+  dplyr::select(country, continent, PC1,PC2, everything()) |>
+  kable(
+    escape = FALSE,
+    digits = 2, 
+    format = "html"
+  ) |>
+  kable_styling(full_width = FALSE)
+
+tsne_dat |> 
+  arrange(tSNE1) |> slice(c(1:6, (n() - 6 + 1):n())) |> 
+  mutate(
+      tSNE1 = cell_spec(
+      sprintf("%.3f", tSNE1),
+      color = ifelse(tSNE1 < 0, "red", "black")
+    )) |> 
+  dplyr::select(country, continent, tSNE1,tSNE2, everything()) |>
+  kable(
+    escape = FALSE,
+    digits = 2, 
+    format = "html"
+  ) |>
+  kable_styling(full_width = FALSE)
+```
+
+The most extreme values of the second PCA and tSNE score:
+
+```{r}
+#| echo: false
+PC_res |> 
+  arrange(PC2) |> slice(c(1:6, (n() - 6 + 1):n())) |> 
+  mutate(
+      PC2 = cell_spec(
+      sprintf("%.3f", PC2),
+      color = ifelse(PC2 < 0, "red", "black")
+    )) |> 
+  dplyr::select(country, continent, PC1,PC2, everything()) |>
+  kable(
+    escape = FALSE,
+    digits = 2, 
+    format = "html"
+  ) |>
+  kable_styling(full_width = FALSE)
+
+tsne_dat |> 
+  arrange(tSNE2) |> slice(c(1:6, (n() - 6 + 1):n())) |> 
+  mutate(
+      tSNE2 = cell_spec(
+      sprintf("%.3f", tSNE2),
+      color = ifelse(tSNE2 < 0, "red", "black")
+    )) |> 
+  dplyr::select(country, continent, tSNE1,tSNE2, everything()) |>
+  kable(
+    escape = FALSE,
+    digits = 2, 
+    format = "html"
+  ) |>
+  kable_styling(full_width = FALSE)
+
+```
+
+
+⸻
+
+Discussion
+
+
+•	PCA arranges countries roughly by major socioeconomic axes (e.g., wealth, life expectancy).
+
+•	t-SNE, which focuses on local clusters, tends to break up the global structure — continents may fragment into smaller, arbitrary clusters.
+
+

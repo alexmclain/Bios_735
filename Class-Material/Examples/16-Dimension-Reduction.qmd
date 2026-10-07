@@ -1,0 +1,695 @@
+---
+title: "Dimension Reduction in Public Health: PCA, FA, ICA, MDS, t-SNE, and UMAP"
+subtitle: "Biostatistics 735 — Machine Learning in Public Health"
+author: "Alexander McLain"
+date: today
+format:
+  html:
+    toc: true
+    toc-location: left
+    toc-depth: 3
+    number-sections: true
+    smooth-scroll: true
+    theme: cosmo
+    code-fold: false
+    highlight-style: github
+    embed-resources: true
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+
+Packages
+
+```{r}
+# Data
+library(NHANES)       # public health data: BMI, BP, cholesterol, etc.
+library(tidyverse)
+library(kableExtra)
+library(janitor)
+
+# PCA & viz helpers
+library(FactoMineR)
+library(factoextra)
+
+# Factor analysis & ICA
+library(psych)        # fa(), diagnostics
+library(fastICA)
+
+# MDS
+library(stats)
+
+# t-SNE & UMAP
+library(Rtsne)
+library(uwot)
+
+# Plotting helpers
+library(ggrepel)
+kbl2 <- function(x, ...) kable(x, align = "lrrrrrr", ...) |> kable_styling(full_width = FALSE)
+```
+
+Data: NHANES (U.S. National Health and Nutrition Examination Survey)
+
+We’ll use a single cross-sectional slice from the NHANES R package and focus on numeric health indicators.
+Goal: build a feature matrix with continuous measures typically used in public health (BMI, BP, cholesterol, pulse, sleep, etc.).
+
+```{r}
+#| cache: true
+# Inspect
+glimpse(NHANES)
+
+# Select variables of interest (continuous-ish)
+vars <- c(
+  "Age", "BMI", "BP_Sys_Ave", "BP_Dia_Ave", "Tot_Chol", "Direct_Chol",
+  "Pulse", "Sleep_Hrs_Night", "HH_Income_Mid", "Alcohol_Day"
+)
+
+nhanes <- NHANES |>
+  clean_names() |>
+  # Keep adults and remove obvious implausibles
+  filter(age >= 20) |>
+  # Keep only selected vars + a few identifiers for plotting
+  select(id, gender, race1, education, all_of(tolower(vars))) |>
+  # Drop rows with missingness in our selected variables
+  drop_na() |>
+  # The NHANES package is a resampled data set, so the same person can appear
+  # several times. Keep one row per participant (id).
+  distinct(id, .keep_all = TRUE)
+
+nhanes |> skimr::skim()  # quick profile
+```
+
+**Note:** Without the `distinct(id)` step, about a third of the rows are exact copies of another row. That would make "similar people" trivially identical (and `Rtsne` refuses to run with duplicates), so we remove them up front.
+
+Many lifestyle/behavior variables are skewed. We’ll log-transform nonnegative skewed features and standardize all features before applying methods.
+
+```{r}
+# Identify which to log-transform (nonnegative, skewed)
+to_log <- tolower(c("Tot_Chol", "Direct_Chol", "Sleep_Hrs_Night", "HH_Income_Mid", "Alcohol_Day"))
+
+nhanes_tr <- nhanes |>
+  mutate(
+    across(all_of(to_log), \(x) log(x + 1)),
+    # keep continuous variables for analysis matrix X
+    .keep = "all"
+  )
+
+# Final numeric matrix X (no IDs or categorical vars)
+X <- nhanes_tr |>
+  select(age, bmi, bp_sys_ave, bp_dia_ave, tot_chol, direct_chol, pulse, sleep_hrs_night,
+         hh_income_mid, alcohol_day) |>
+  as.data.frame()
+
+# Standardize
+X_s <- scale(X)
+```
+
+**Note:** Always record the centering/scale parameters if you want to apply the same transformation to future data.
+
+⸻
+
+# Principal Components Analysis (PCA)
+
+What you’ll do: Fit PCA, examine explained variance (scree), visualize individuals and variable loadings, and project scores.
+
+```{r}
+pca_res <- prcomp(X_s, center = FALSE, scale. = FALSE)  # already scaled
+
+# Variance explained (Scree plot)
+fviz_eig(pca_res, addlabels = TRUE, barcolor = "gray40", barfill = "gray80") +
+  labs(title = "PCA: Variance explained by components")
+
+
+# Compute proportion of variance explained
+var_explained <- pca_res$sdev^2 / sum(pca_res$sdev^2)
+
+# Cumulative proportion of variance
+cum_var <- cumsum(var_explained)
+
+#  Create data frame for plotting
+data.frame(
+  PC = 1:length(var_explained),
+  Variance = var_explained,
+  Cumulative = cum_var
+) |> kbl2(digits = 3)
+
+K <- which(cum_var >= 0.9)[1]
+cat("Keeping", K, "components explains ≥90% of variance.\n")
+
+X_pca_auto <- as.data.frame(pca_res$x[, 1:K])
+
+# Biplot by gender for a quick view (color any group you prefer)
+fviz_pca_biplot(
+  pca_res,
+  geom.ind = "point",
+  habillage = nhanes_tr$gender, addEllipses = TRUE, repel = TRUE
+) + labs(title = "PCA biplot: NHANES health indicators")
+```
+
+
+## PCA scores (for modeling or clustering):
+
+```{r}
+pc_scores <- as.data.frame(predict(pca_res, newdata = X_s))
+head(pc_scores)
+```
+
+**Projecting new data:** use `predict(pca_res, newdata = X_new_scaled)`.
+
+⸻
+
+
+
+## PCA loadings
+
+```{r}
+loadings_df <- data.frame(variable = rownames(pca_res$rotation), unclass(pca_res$rotation))
+# View all loadings
+pca_res$rotation[,1:3] |> kbl2(digits = 3)
+loadings_df |>
+  pivot_longer(cols = starts_with("PC"), names_to = "Component", values_to = "Loading") |>
+  filter(Component %in% c("PC1", "PC2")) |>
+  ggplot(aes(x = reorder(variable, Loading), y = Loading, fill = Component)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~ Component, scales = "free_y") +
+  coord_flip() +
+  theme_minimal(base_size = 13) +
+  labs(title = "PCA Loadings for First Two Components",
+       x = "Variable", y = "Loading weight")
+```
+
+•	A large positive or negative loading means that variable contributes strongly to that component.
+
+•	Signs can flip depending on conventions — only the relative magnitude matters.
+
+⸻
+
+## Varimax Rotation
+
+The `stats::varimax()` function can be applied to the loadings matrix (columns = components).
+
+```{r}
+# Apply varimax rotation to the first 3 components
+rotated <- varimax(pca_res$rotation[, 1:3])
+
+# Extract rotated loadings
+rotated$loadings[1:10,1:3] |> kbl2(digits = 3)
+```
+
+⸻
+
+## Compare Before and After
+
+```{r}
+load_unrotated <- as.data.frame(pca_res$rotation[, 1:3]) |>
+  rownames_to_column("variable")|>
+  pivot_longer(cols = starts_with("PC"), names_to = "Component", values_to = "Loading") |>
+  mutate(type = "Unrotated")
+
+load_rotated <- as.data.frame(rotated$loadings[, 1:3]) |>
+  rownames_to_column("variable") |>
+  pivot_longer(cols = starts_with("PC"), names_to = "Component", values_to = "Loading") |>
+  mutate(type = "Varimax Rotated")
+
+loadings_df <- rbind(load_unrotated, load_rotated)
+
+
+ggplot(loadings_df, aes(x = reorder(variable, Loading), y = Loading, fill = Component)) +
+  geom_col(show.legend = FALSE) +
+  facet_grid(type ~ Component, scales = "free_y") +
+  coord_flip() +
+  theme_minimal(base_size = 13) +
+  labs(title = "Comparison of PCA Loadings Before and After Varimax Rotation",
+       x = "Variable", y = "Loading Weight")
+```
+
+
+
+⸻
+
+# Factor Analysis (FA)
+
+Factor Analysis (FA) seeks to identify a smaller number of **latent factors** that explain the correlations among observed variables.  
+Unlike PCA, which summarizes total variance, FA focuses on **shared variance**—what variables have in common.
+
+For example, in a public health dataset, one latent factor might represent *“cardio-metabolic risk”* (capturing BMI, blood pressure, and cholesterol), while another could represent *“behavioral/lifestyle risk”* (capturing sleep, alcohol, and physical activity).
+
+---
+
+## Step 1: Assess Suitability
+
+Before performing FA, we verify that variables are sufficiently correlated to justify it.  
+Two common checks are the **Kaiser-Meyer-Olkin (KMO)** measure and **Bartlett’s test of sphericity**.
+
+```{r}
+library(psych)
+
+# KMO > 0.6 is acceptable; closer to 1 is better
+psych::KMO(X_s)$MSA
+
+# Bartlett's test (tests whether correlation matrix differs from identity)
+psych::cortest.bartlett(cor(X_s), n = nrow(X_s))
+```
+
+
+## Step 2: Determine the Number of Factors
+
+A parallel analysis compares observed eigenvalues to those from random data to help decide how many factors to retain.
+
+```{r}
+fa.parallel(X_s, fa = "fa", n.iter = 50, show.legend = FALSE)
+```
+
+•	The number of factors where the observed eigenvalue line drops below the simulated one indicates the cutoff.
+
+•	Typically, we retain factors before that point (often 2–4 in health datasets).
+
+## Step 3: Fit the Factor Analysis Model
+
+We’ll use Maximum Likelihood (ML) estimation with a varimax rotation (which keeps the factors uncorrelated and makes the loadings easier to read). An oblique rotation such as `rotate = "oblimin"` would allow the factors to be correlated, which is often more realistic for health data.
+
+
+```{r}
+fa_fit <- fa(X_s, nfactors = 2, rotate = "varimax", fm = "ml")
+print(fa_fit, sort = TRUE)
+```
+
+Factor loadings represent the correlation between each observed variable and the latent factor.
+
+•	Loadings close to +1 or −1 indicate a strong relationship.
+
+•	Loadings near 0 suggest weak or no relationship.
+
+•	Signs indicate the direction of association, not “good” or “bad.”
+
+
+You can view and sort loadings directly:
+
+```{r}
+loadings_df <- as.data.frame(unclass(fa_fit$loadings))
+loadings_df |> kbl2(digits = 3)
+```
+
+•	Factor 1 has its highest loadings on systolic and diastolic blood pressure (and age) → call it “Blood pressure.”
+
+•	Factor 2 has its highest loadings on age (positive) and alcohol (negative), with smaller loadings on HDL cholesterol and pulse → call it “Older / lower alcohol use.” Naming factors is a judgment call; with only 2 factors explaining about 22% of the variance, these data do not have strong latent structure.
+
+
+Factor scores represent each participant’s value on the latent constructs.
+
+```{r}
+fa_scores <- as.data.frame(fa_fit$scores) |> setNames(c("FA1", "FA2"))
+head(fa_scores)  |> kbl2(digits = 3)
+```
+
+You can then use these scores in regression models, clustering, or prediction tasks — they summarize the original correlated variables into smaller, interpretable dimensions.
+
+⸻
+
+
+# Independent Component Analysis (ICA)
+
+ICA attempts to find **statistically independent** components rather than uncorrelated ones (like PCA).  
+It’s useful when signals (e.g., EEG, fMRI, or mixed biological measurements) are thought to arise from independent sources.
+
+We’ll use the same dataset `X_s` (scaled continuous variables from NHANES).
+
+```{r}
+ica_fit <- fastICA(X_s, n.comp = 3)
+
+# Get independent component scores
+ica_scores <- data.frame(ica_fit$S, X_s)
+colnames(ica_scores)[1:3] <- paste0("IC", 1:3)
+
+# Add identifiers
+ica_scores$id <- 1:nrow(X_s)
+
+# Show highest and lowest scorers on IC1
+extreme_ica <- ica_scores |>
+  arrange(IC1) |>
+  slice(c(1:3, (n()-2):n()))
+
+extreme_ica |> kbl2(digits = 2)
+```
+
+**Interpretation:**
+These are the individuals whose data reflect the most negative and most positive expression of the first independent component — in a health context, this might correspond to distinct behavioral or physiological profiles.
+
+Now, find people with similar IC1 scores (local structure):
+
+```{r}
+# Find two participants with closest IC1 scores
+similar_ica <- ica_scores |>
+  mutate(diff = abs(IC1 - median(IC1))) |>
+  arrange(diff) |>
+  slice(1:3)
+
+similar_ica |> kbl2(digits = 2)
+```
+
+These subjects have almost identical IC1 values, but look at the other columns: their *other* measurements can still be quite different, because one component only summarizes part of the information. We come back to this idea for every method in the section *Do similar scores mean similar people?* below.
+
+
+⸻
+
+# Multidimensional Scaling (MDS)
+
+MDS focuses on preserving pairwise distances among individuals.
+It gives a geometric representation of similarity.
+
+```{r}
+#| cache: true
+dist_mat <- dist(X_s)
+mds_fit <- cmdscale(dist_mat, k = 2, eig = TRUE)
+mds_scores <- data.frame(mds_fit$points, X_s)
+colnames(mds_scores)[1:2] <- c("Dim1", "Dim2")
+mds_scores$id <- 1:nrow(X_s)
+
+# Classical MDS on Euclidean distances gives the same scores as PCA (up to sign)
+abs(cor(mds_scores$Dim1, pca_res$x[, 1]))
+abs(cor(mds_scores$Dim2, pca_res$x[, 2]))
+```
+
+With Euclidean distance, classical MDS and PCA give the same configuration (up to a sign flip), which is why the correlations above are 1. MDS becomes different from PCA when you use another dissimilarity (e.g., Gower distance for mixed data types).
+
+The first dimension (Dim1) captures the strongest pattern in pairwise similarity — individuals on opposite ends have very different overall health profiles, while those near each other are highly similar.
+
+⸻
+
+# t-SNE
+
+t-SNE preserves local neighborhoods — it’s designed to bring together individuals who are similar across many features.
+
+```{r}
+#| cache: true
+set.seed(42)
+tsne_fit <- Rtsne(X_s, dims = 2, perplexity = 40, verbose = FALSE)
+tsne_scores <- data.frame(Dim1 = tsne_fit$Y[, 1], Dim2 = tsne_fit$Y[, 2], X_s)
+tsne_scores$id <- 1:nrow(X_s)
+
+ggplot(tsne_scores, aes(Dim1, Dim2, color = age)) +
+  geom_point(size = 0.8) +
+  scale_color_viridis_c() +
+  theme_minimal() +
+  labs(title = "t-SNE (perplexity = 40), colored by standardized age")
+```
+
+Notice that the axes have no meaning: only *which points are near each other* is informative.
+
+⸻
+
+# UMAP
+
+UMAP, like t-SNE, preserves local structure, but also does better at maintaining some global context.
+
+```{r}
+#| cache: true
+set.seed(42)
+umap_fit <- umap(X_s)
+umap_scores <- data.frame(Dim1 = umap_fit[, 1], Dim2 = umap_fit[, 2], X_s)
+umap_scores$id <- 1:nrow(X_s)
+
+ggplot(umap_scores, aes(Dim1, Dim2, color = age)) +
+  geom_point(size = 0.8) +
+  scale_color_viridis_c() +
+  theme_minimal() +
+  labs(title = "UMAP (n_neighbors = 15), colored by standardized age")
+```
+
+We can use the model with `umap_transform()` -- with the same centering/scaling -- to predict for new data.
+
+**UMAP vs t-SNE:**
+
+•	UMAP retains more of the large-scale structure (distance between groups still roughly meaningful).
+
+•	t-SNE zooms in on fine-scale neighborhoods — good for cluster visualization.
+
+•	Both methods show smooth transitions in the “embedding” space.
+
+⸻
+
+
+# Do similar scores mean similar people?
+
+All of these methods turn each person's 10 measurements into 2 numbers. A natural question is: **if two people have similar scores, are their original data similar? And if their scores are far apart, are they really different?** The answer depends on the method, and it is the main thing to understand before reading a t-SNE or UMAP plot.
+
+We'll collect the 2-D scores from PCA, MDS, t-SNE and UMAP for the same people, and compare each to the "truth": distances in the original 10-dimensional standardized data.
+
+```{r}
+#| cache: true
+# 2-D scores from each method (rows are the same people, in the same order)
+emb <- list(
+  PCA     = pca_res$x[, 1:2],
+  MDS     = as.matrix(mds_scores[, c("Dim1", "Dim2")]),
+  `t-SNE` = as.matrix(tsne_scores[, c("Dim1", "Dim2")]),
+  UMAP    = as.matrix(umap_scores[, c("Dim1", "Dim2")])
+)
+n <- nrow(X_s)
+
+# Distances between all pairs of people in the ORIGINAL standardized data
+D_orig <- as.matrix(dist(X_s))
+
+# For each person (row), the k closest other people
+knn_idx <- function(D, k) t(apply(D, 1, function(d) order(d)[2:(k + 1)]))
+k <- 15
+true_nn <- knn_idx(D_orig, k)
+```
+
+## One person's neighbors
+
+Pick one person (the "anchor") and find the 15 people who are closest to them in the original data (**true neighbors**, orange). Then find the 15 people closest to the anchor in each 2-D picture (**embedding neighbors**, blue). Green points are in both groups.
+
+```{r}
+#| fig-width: 6
+#| fig-height: 6
+#| cache: true
+set.seed(76)
+anchor <- sample(n, 1)
+true_nb <- true_nn[anchor, ]
+
+# Put every picture on a common scale: center it and divide by its root-mean-square
+# distance from the center, so all four panels have the same overall spread.
+rescale_emb <- function(Y) {
+  Y <- sweep(Y, 2, colMeans(Y))
+  Y / sqrt(mean(rowSums(Y^2)))
+}
+
+nb_long <- imap_dfr(emb, function(Y, m) {
+  Y <- rescale_emb(Y)
+  d <- sqrt((Y[, 1] - Y[anchor, 1])^2 + (Y[, 2] - Y[anchor, 2])^2)
+  e_nb <- order(d)[2:(k + 1)]
+  tibble(Method = m, id = 1:n, x = Y[, 1], y = Y[, 2],
+         role = case_when(
+           id == anchor                          ~ "Anchor",
+           id %in% e_nb & id %in% true_nb        ~ "In both",
+           id %in% e_nb                          ~ "Embedding neighbor",
+           id %in% true_nb                       ~ "True neighbor",
+           TRUE                                  ~ "Everyone else"))
+}) |>
+  mutate(Method = factor(Method, names(emb)),
+         role = factor(role, c("Everyone else", "True neighbor", "Embedding neighbor", "In both", "Anchor")))
+
+nb_long |>
+  arrange(role) |>
+  ggplot(aes(x, y, color = role, size = role, alpha = role, shape = role)) +
+  geom_point(stroke = 1.2) +
+  facet_wrap(~ Method) +
+  coord_equal() +
+  scale_color_manual(values = c("Everyone else" = "grey70", "True neighbor" = "#E69F00",
+                                "Embedding neighbor" = "#0072B2", "In both" = "#009E73", "Anchor" = "black")) +
+  scale_size_manual(values = c(0.6, 2.2, 2.2, 2.6, 5)) +
+  # the anchor is an open ring so the neighbors sitting right next to it stay visible
+  scale_shape_manual(values = c(16, 16, 16, 16, 1)) +
+  scale_alpha_manual(values = c(0.35, 1, 1, 1, 1)) +
+  theme_minimal() +
+  theme(axis.title = element_blank(), axis.text = element_blank(), legend.title = element_blank()) +
+  labs(title = "Where do one person's closest matches land?",
+       subtitle = "All four pictures are rescaled to the same overall spread and drawn on the same scale")
+```
+
+Now look at what the people near the anchor in each picture actually look like in the original data. Each line is one person's 10 standardized measurements; the black line is the anchor. If the picture is trustworthy locally, the blue lines should hug the black one.
+
+```{r}
+#| fig-width: 8
+#| fig-height: 6
+#| cache: true
+prof <- nb_long |>
+  filter(role %in% c("Embedding neighbor", "In both", "Anchor")) |>
+  select(Method, id, role) |>
+  left_join(
+    as_tibble(X_s) |> mutate(id = 1:n) |>
+      pivot_longer(-id, names_to = "variable", values_to = "z") |>
+      mutate(variable = factor(variable, levels = colnames(X_s))),
+    by = "id", relationship = "many-to-many")
+
+ggplot() +
+  geom_line(data = filter(prof, role != "Anchor"), aes(variable, z, group = id),
+            color = "#0072B2", alpha = 0.5) +
+  geom_line(data = filter(prof, role == "Anchor"), aes(variable, z, group = id),
+            color = "black", linewidth = 1.2) +
+  facet_wrap(~ Method) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 60, hjust = 1)) +
+  labs(x = NULL, y = "Standardized value",
+       title = "Original measurements of the anchor (black) and the people nearest to them in each picture")
+```
+
+Things to notice:
+
+- **PCA/MDS:** the neighbors in the picture are only similar on the directions that the two components capture (here about 35% of the total variance). People who share the same two scores can differ a lot on everything else, so the blue lines spread out.
+- **t-SNE/UMAP:** the neighbors in the picture are much closer to the anchor on *all* 10 variables, because these methods are built to keep each person's neighborhood together.
+- In every picture, some of the true (orange) neighbors are missing from the embedding neighbors; two dimensions can't hold all of the neighbor relationships of a 10-dimensional data set.
+
+## Neighborhoods across all people
+
+One person can be lucky or unlucky, so we repeat this for everyone. For each method we compute
+
+- **Neighbor overlap:** the share of a person's 15 nearest neighbors in the original data that are also among their 15 nearest in the picture (1 = perfect).
+- **Average true distance to the embedding neighbors:** how far, in the original data, the people who look close in the picture really are. For reference, the best possible value is the average distance to the *true* 15 nearest neighbors, and the value for random pairs of people shows what "unrelated" looks like.
+- **Closest true neighbor lost:** the share of people whose single most similar person in the original data is *not* within their 15 nearest neighbors in the picture.
+- **Rank correlation of all distances:** do pairs that are far apart in the data stay far apart in the picture? This measures global structure.
+
+```{r}
+#| cache: true
+set.seed(1)
+pairs <- cbind(sample(n, 2e5, TRUE), sample(n, 2e5, TRUE))   # random pairs for the global comparison
+pairs <- pairs[pairs[, 1] != pairs[, 2], ]
+D_emb_list <- map(emb, ~ as.matrix(dist(.x)))
+
+nb_stats <- imap_dfr(D_emb_list, function(D_emb, m) {
+  emb_nn <- knn_idx(D_emb, k)
+  tibble(
+    Method = m,
+    `Neighbor overlap` = mean(map_dbl(1:n, ~ length(intersect(emb_nn[.x, ], true_nn[.x, ])) / k)),
+    `Avg. true distance to embedding neighbors` = mean(map_dbl(1:n, ~ mean(D_orig[.x, emb_nn[.x, ]]))),
+    `Closest true neighbor lost` = mean(map_lgl(1:n, ~ !(true_nn[.x, 1] %in% emb_nn[.x, ]))),
+    `Rank correlation of all distances` = cor(D_orig[pairs], D_emb[pairs], method = "spearman")
+  )
+})
+
+# Reference values
+best_possible   <- mean(map_dbl(1:n, ~ mean(D_orig[.x, true_nn[.x, ]])))
+random_pairs    <- mean(D_orig[pairs])
+
+nb_stats |> kbl2(digits = 3, caption = "How well does each 2-D picture preserve neighborhoods?")
+```
+
+For reference, the average distance to a person's *true* 15 nearest neighbors is `r round(best_possible, 2)`, and the average distance between two random people is `r round(random_pairs, 2)`.
+
+- t-SNE and UMAP are the best at keeping neighborhoods: their embedding neighbors are much closer to the best possible value than PCA/MDS, and far fewer true neighbors are lost.
+- Even so, neither one is perfect. A neighbor overlap well below 1 means a "neighborhood" in a t-SNE or UMAP plot is only partly the neighborhood in the data.
+- On the *global* measure, PCA/MDS are not worse (they are typically better): t-SNE and UMAP will happily put people who are very different next to each other, or tear similar people apart, to make a good 2-D layout.
+
+## Far apart in the plot does not mean different
+
+The next plot shows every pair of people (a random sample): the true distance on the x-axis and the distance in the picture on the y-axis. If the picture preserved distances, the cloud would be tight around a rising curve.
+
+```{r}
+#| fig-width: 8
+#| fig-height: 6
+#| cache: true
+imap_dfr(D_emb_list, function(D_emb, m) {
+  tibble(Method = m, true_dist = D_orig[pairs], emb_dist = D_emb[pairs])
+}) |>
+  mutate(Method = factor(Method, names(emb))) |>
+  ggplot(aes(true_dist, emb_dist)) +
+  geom_bin2d(bins = 50) +
+  scale_fill_viridis_c(trans = "log10") +
+  facet_wrap(~ Method, scales = "free_y") +
+  theme_minimal() +
+  labs(x = "Distance in the original 10-D data", y = "Distance in the 2-D picture", fill = "Pairs",
+       title = "Do distances in the picture track distances in the data?")
+```
+
+For PCA/MDS the picture distance can never be larger than the true distance (a projection can only shrink distances), so the cloud sits below a line, and large true distances are still large in the picture. For t-SNE and UMAP, the relationship is much looser: for a given distance in the picture, the true distance can be almost anything. **That is why you should read t-SNE and UMAP plots only locally** (who is near whom), not globally (how far apart two groups are, or how large a cluster is).
+
+## Tuning parameters change the picture
+
+t-SNE (`perplexity`) and UMAP (`n_neighbors`) both have a "neighborhood size" setting. The same data can look quite different, and the neighborhood overlap changes too.
+
+```{r}
+#| fig-width: 9
+#| fig-height: 6
+#| cache: true
+set.seed(42)
+tsne_alt <- map(c(5, 40, 150), ~ Rtsne(X_s, perplexity = .x, verbose = FALSE)$Y) |>
+  set_names(paste0("t-SNE, perplexity = ", c(5, 40, 150)))
+umap_alt <- map(c(5, 15, 100), ~ umap(X_s, n_neighbors = .x)) |>
+  set_names(paste0("UMAP, n_neighbors = ", c(5, 15, 100)))
+alt <- c(tsne_alt, umap_alt)
+
+alt_overlap <- imap_dfr(alt, function(Y, m) {
+  emb_nn <- knn_idx(as.matrix(dist(Y)), k)
+  tibble(Setting = m,
+         overlap = mean(map_dbl(1:n, ~ length(intersect(emb_nn[.x, ], true_nn[.x, ])) / k)))
+})
+
+imap_dfr(alt, ~ tibble(Setting = .y, Dim1 = .x[, 1], Dim2 = .x[, 2], age = X_s[, "age"])) |>
+  mutate(Setting = factor(Setting, names(alt))) |>
+  left_join(alt_overlap, by = "Setting") |>
+  mutate(label = factor(paste0(Setting, "\nneighbor overlap = ", round(overlap, 2)),
+                        levels = unique(paste0(Setting, "\nneighbor overlap = ", round(overlap, 2))))) |>
+  ggplot(aes(Dim1, Dim2, color = age)) +
+  geom_point(size = 0.5) +
+  scale_color_viridis_c() +
+  facet_wrap(~ label, scales = "free", ncol = 3) +
+  theme_minimal() +
+  theme(axis.text = element_blank(), axis.title = element_blank())
+```
+
+Here the data are a continuum (there are no real clusters), so every setting gives one blob, but notice that the *layout* changes: the oldest participants (yellow) end up in a different corner each time, and the picture is grainier with small settings. Small values focus on very local structure (which is why the neighbor overlap, computed with 15 neighbors, is highest for them), and in other data sets they can break a continuum into little islands that look like clusters. Large values spread the points out and tell a more global story, but lose some local detail. There is no single "right" setting, so **try several, and only trust patterns that show up in all of them**.
+
+**Take-aways**
+
+- Similar scores on PCA/MDS (a projection): the people are only guaranteed to be similar on the directions kept.
+- Similar position on t-SNE/UMAP: the people are probably similar on all variables, but not guaranteed, and some truly similar people will be placed apart.
+- Large gaps, cluster sizes and shapes in t-SNE/UMAP are not reliable. Use them to *generate hypotheses*, then check with the original data (as we did with the line plots).
+
+⸻
+
+Practical Guidance & Method Selection
+
+•	PCA (global, linear projection):
+
+  - *Pros:* interpretable loadings; stable; easy to use in regression/ML pipelines; projectable to new data.
+  - *Use when:* you want compact, reproducible features and global structure.
+
+•	FA (latent constructs):
+
+  - *Pros:* interpretable latent factors; models shared covariance.
+  - *Use when:* you hypothesize underlying constructs (e.g., “cardio-metabolic risk”).
+
+•	ICA (independence):
+
+  - *Pros:* separates independent signals; useful in biomedical signal processing.
+  - *Use when:* looking for statistically independent patterns (exploratory).
+
+•	MDS (global distances):
+
+  - *Pros:* preserves pairwise global geometry.
+  - *Caveat:* no straightforward projection for new data.
+
+•	t-SNE (local neighborhoods):
+
+  - *Pros:* reveals clusters/subgroups; great for visualization.
+  - *Caveat:* not a projection; sensitive to settings; don’t interpret global distances.
+
+•	UMAP (local + some global):
+
+  - *Pros:* fast; often clearer cluster structure; transform available via uwot.
+  - *Caveat:* embedding can vary with hyperparameters; still primarily for visualization.
+
+⸻
+
+Appendix: Reproducibility Notes
+
+•	Centering/Scaling: save the means/SDs and reapply to new data.
+
+•	PCA/FA/ICA for modeling: save fitted objects; apply same transforms to holdout or future data.
+
+•	Local methods (t-SNE/MDS): use for visualization/exploration; avoid as features in regression unless you know the implications.
+
+•	UMAP (uwot) can transform new data: more convenient than t-SNE/MDS but still not as stable/interpretable as PCA/FA.
+

@@ -1,0 +1,463 @@
+---
+title: "Clustering"
+subtitle: "Biostatistics 735/794 — Machine Learning in Public Health"
+author: "Alexander McLain"
+date: today
+format:
+  html:
+    toc: true
+    toc-location: left
+    toc-depth: 3
+    number-sections: true
+    smooth-scroll: true
+    theme: cosmo
+    code-fold: false
+    highlight-style: github
+    embed-resources: true
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+```{r}
+#| include: false
+library(ISLR)
+library(tidyverse)
+library(cluster)
+library(factoextra)
+library(mclust)
+library(NbClust)
+library(fpc)
+library(ggplot2)
+library(GGally)
+library(Rtsne)
+library(uwot)
+library(knitr)
+```
+
+# Introduction
+
+This example explores several clustering techniques—K-means, PAM, Gaussian Mixture Models (GMM), and Hierarchical Clustering—applied to the NCI60 gene expression dataset.
+We also cluster the **t-SNE and UMAP scores** (clustering in a low-dimensional embedding rather than in the original 6,830 genes), and we choose the number of clusters using Elbow, Gap Statistic, and silhouette methods.
+
+We **compare all of the methods** using internal validation (do the clusters look good?), external validation (do they match the known cancer types?), and stability (do we get the same answer if we change the random seed?).
+
+# Load and Prepare the Data
+
+The data are a NCI microarray dataset. The data contains expression levels on 6830 genes from 64 cancer cell lines. Cancer type is also recorded.
+
+```{r}
+#| cache: true
+data("NCI60")
+X <- NCI60$data
+dim(X)
+# Standardize features
+X.scaled <- scale(X)
+```
+
+
+## Choosing the Number of Clusters
+
+### Elbow Method
+
+```{r}
+#| cache: true
+fviz_nbclust(X.scaled, kmeans, method = "wss") +
+  labs(title = "Elbow Method for K-means")
+```
+
+### Gap Statistic
+
+```{r}
+#| cache: true
+set.seed(123)
+gap_kmeans <- clusGap(X.scaled, FUN = kmeans, nstart = 25, K.max = 15, B = 50)
+fviz_gap_stat(gap_kmeans)
+```
+
+One widely used criterion is to use the smallest $k$ such that $f(k) \geq f(k+1) - s_{k+1}$. 
+
+# K-means Clustering
+
+```{r}
+#| cache: true
+set.seed(123)
+km_res <- kmeans(X.scaled, centers = 4, nstart = 25)
+fviz_cluster(km_res, data = X.scaled, geom = "point", ellipse.type = "norm") +
+  labs(title = "K-means Clustering (K=4)")
+table(NCI60$labs, km_res$cluster)
+```
+
+# Silhouette Width
+
+For each observation i, the silhouette width measures how well it fits within its assigned cluster compared to other clusters.
+It’s defined as:
+
+$$ s(i) = \frac{b(i) - a(i)}{\max\{a(i), b(i)\}}$$
+
+where:
+
+•	$a(i)$: the average distance from $i$ to all other points in its own cluster (cohesion).
+
+•	$b(i)$: the lowest average distance from $i$ to all points in another cluster (separation).
+
+
+## Average Silhouette Width
+
+The average silhouette width across all observations gives an overall summary of clustering quality:
+
+$$ S = \frac{1}{n} \sum_{i=1}^n s(i)$$
+
+•	$S$ ranges between $-1$ and $+1$.
+
+•	Higher $S$ means better-defined and more separated clusters.
+
+•	When comparing cluster solutions with different $K$ values, choose the $K$ that maximizes $S$.
+
+
+```{r}
+#| cache: true
+sil_widths <- sapply(2:10, function(k){
+  km <- kmeans(X.scaled, centers = k, nstart = 25)
+  mean(silhouette(km$cluster, dist(X.scaled))[, 3])
+})
+qplot(2:10, sil_widths, geom="line") + 
+  labs(title="Average Silhouette Widths for K-means", x="K", y="Silhouette Width")
+```
+
+
+```{r}
+#| cache: true
+set.seed(123)
+km_res8 <- kmeans(X.scaled, centers = 8, nstart = 25)
+fviz_silhouette(silhouette(km_res8$cluster, dist(X.scaled)))
+fviz_silhouette(silhouette(km_res$cluster, dist(X.scaled)))
+
+```
+
+
+# Partitioning Around Medoids (PAM)
+
+```{r}
+#| cache: true
+pam_res <- pam(X.scaled, k = 4, metric = "euclidean")
+fviz_cluster(pam_res, data = X.scaled, geom = "point", ellipse.type = "norm") +
+  labs(title = "PAM Clustering (K=4)")
+table(NCI60$labs, pam_res$clustering)
+fviz_silhouette(pam_res)
+```
+
+
+
+# Gaussian Mixture Model (Model-based Clustering)
+
+![Ellipses of isodensity for each of the 14 Gaussian models obtained by eigen-decomposition in case of three groups in two dimensions.](model.names.jpeg)
+
+```{r}
+#| cache: true
+gmm_res <- Mclust(X.scaled, G = 1:10)
+summary(gmm_res)
+fviz_mclust(gmm_res, "BIC") +
+  labs(title = "BIC-based Model Selection for GMMs")
+
+table(NCI60$labs, gmm_res$classification)
+fviz_cluster(list(data = X.scaled, cluster = gmm_res$classification)) +
+  labs(title = "Gaussian Mixture Model Clustering")
+```
+
+
+
+# Hierarchical Clustering
+
+## 1. Compute Dissimilarity Matrix
+
+```{r}
+#| cache: true
+d <- dist(X.scaled, method = "euclidean")
+hc_complete <- hclust(d, method = "complete")
+hc_average  <- hclust(d, method = "average")
+hc_single   <- hclust(d, method = "single")
+```
+
+## 2. Dendrograms
+
+```{r}
+#| cache: true
+par(mfrow = c(1,3))
+plot(hc_single, main = "Single Linkage", xlab = "", sub = "")
+plot(hc_complete, main = "Complete Linkage", xlab = "", sub = "")
+plot(hc_average, main = "Average Linkage", xlab = "", sub = "")
+```
+
+## 3. Cut Tree and Visualize
+
+```{r}
+#| cache: true
+cut_complete <- cutree(hc_complete, k = 4)
+fviz_cluster(list(data = X.scaled, cluster = cut_complete)) +
+  labs(title = "Hierarchical Clustering (Complete Linkage, K=4)")
+table(NCI60$labs,cut_complete)
+```
+
+
+# Clustering t-SNE and UMAP Scores
+
+t-SNE and UMAP (see the Dimension Reduction notes) compress the 6,830 genes into 2 coordinates that preserve *local* neighborhoods. A common workflow is to cluster those 2-D scores, since in two dimensions the clusters are easy to see and the distance calculations are cheap.
+
+Two cautions:
+
+- With only $n = 64$ cell lines, the t-SNE perplexity must be small (it has to be less than $(n-1)/3 \approx 21$), and UMAP needs a small `n_neighbors`.
+- t-SNE and UMAP do not preserve global distances, so the size of, and gaps between, clusters in the embedding should not be over-interpreted. Both are also stochastic: different seeds give different embeddings. Because of this we judge any clustering of the scores by the original data (see the comparison section below), not just by how the 2-D picture looks.
+
+## Compute the Embeddings
+
+```{r}
+#| cache: true
+set.seed(123)
+tsne_fit <- Rtsne(X.scaled, dims = 2, perplexity = 5, check_duplicates = FALSE)
+tsne_scores <- tsne_fit$Y
+
+set.seed(123)
+umap_scores <- umap(X.scaled, n_neighbors = 10, min_dist = 0.1)
+
+emb <- bind_rows(
+  tibble(Dim1 = tsne_scores[, 1], Dim2 = tsne_scores[, 2], Method = "t-SNE", Type = NCI60$labs),
+  tibble(Dim1 = umap_scores[, 1], Dim2 = umap_scores[, 2], Method = "UMAP",  Type = NCI60$labs)
+)
+ggplot(emb, aes(Dim1, Dim2, color = Type)) +
+  geom_point(size = 2) +
+  facet_wrap(~Method, scales = "free") +
+  labs(title = "t-SNE and UMAP scores, colored by known cancer type")
+```
+
+## K-means and GMM on the Scores
+
+```{r}
+#| cache: true
+set.seed(123)
+km_tsne  <- kmeans(tsne_scores, centers = 4, nstart = 25)
+km_umap  <- kmeans(umap_scores, centers = 4, nstart = 25)
+gmm_tsne <- Mclust(tsne_scores, G = 4, verbose = FALSE)
+gmm_umap <- Mclust(umap_scores, G = 4, verbose = FALSE)
+
+score_clusters <- bind_rows(
+  tibble(Dim1 = scale(tsne_scores[, 1]), Dim2 = scale(tsne_scores[, 2]), Method = "t-SNE", Clustering = "K-means", Cluster = km_tsne$cluster),
+  tibble(Dim1 = scale(tsne_scores[, 1]), Dim2 = scale(tsne_scores[, 2]), Method = "t-SNE", Clustering = "GMM",     Cluster = gmm_tsne$classification),
+  tibble(Dim1 = scale(umap_scores[, 1]), Dim2 = scale(umap_scores[, 2]), Method = "UMAP",  Clustering = "K-means", Cluster = km_umap$cluster),
+  tibble(Dim1 = scale(umap_scores[, 1]), Dim2 = scale(umap_scores[, 2]), Method = "UMAP",  Clustering = "GMM",     Cluster = gmm_umap$classification)
+)
+ggplot(score_clusters, aes(Dim1, Dim2, color = factor(Cluster))) +
+  geom_point(size = 2) +
+  facet_grid(Method ~ Clustering, scales = "free") +
+  labs(color = "Cluster", title = "Clusters found in the t-SNE / UMAP scores (K = 4)")
+```
+
+Compare the clusters to the known cancer types:
+
+```{r}
+table(NCI60$labs, km_umap$cluster)
+```
+
+### Choosing K in the embedding
+
+The same tools apply to the scores. Here we use the silhouette width and the GMM BIC on the UMAP scores.
+
+```{r}
+#| cache: true
+fviz_nbclust(umap_scores, kmeans, method = "silhouette") +
+  labs(title = "Silhouette Method: K-means on UMAP scores")
+fviz_mclust(Mclust(umap_scores, G = 1:10, verbose = FALSE), "BIC") +
+  labs(title = "BIC: GMM on UMAP scores")
+```
+
+# Comparing Methods
+
+Different clustering methods will always return *some* partition, so we need a principled way to say which is better. There are three complementary views:
+
+1. **Internal validation** uses only the data: are clusters compact and well separated?
+2. **External validation** uses known labels (here, the 14 cancer types) as a benchmark. This is a luxury: in real applications there is usually no truth, but it is a useful check on a teaching dataset.
+3. **Stability**: would we get the same clusters with a different random seed?
+
+## Measures
+
+**Internal.**
+
+- *Average silhouette width* (defined above).
+- *Calinski–Harabasz index*: ratio of between-cluster to within-cluster variance (adjusted for $K$ and $n$); larger is better.
+- *Dunn index*: smallest between-cluster distance divided by largest cluster diameter; larger is better, but very sensitive to a single outlier.
+
+**External.**
+
+- *Adjusted Rand Index (ARI)*: the fraction of pairs of observations on which two partitions agree (both together or both apart), corrected for chance. ARI = 1 is perfect agreement and ARI $\approx$ 0 is what random labels give.
+- *Normalized Mutual Information (NMI)*: how much knowing the cluster tells you about the cancer type, scaled to [0, 1].
+- *Purity*: the share of observations that belong to the majority cancer type of their cluster. Purity is easy to read, but it can be inflated by using more clusters.
+
+::: {.callout-important}
+All internal measures below are computed in the **original standardized gene space** for every method. If we computed the silhouette of the UMAP clusters in the UMAP space, it would look artificially good, because UMAP is designed to pull points together.
+:::
+
+```{r}
+nmi <- function(a, b) {
+  tab <- table(a, b); p <- tab / sum(tab)
+  pa <- rowSums(p); pb <- colSums(p)
+  mi <- sum(p[p > 0] * log(p[p > 0] / outer(pa, pb)[p > 0]))
+  ha <- -sum(pa[pa > 0] * log(pa[pa > 0])); hb <- -sum(pb[pb > 0] * log(pb[pb > 0]))
+  mi / sqrt(ha * hb)
+}
+purity <- function(cl, truth) sum(apply(table(cl, truth), 1, max)) / length(cl)
+
+d_orig <- dist(X.scaled)
+
+evaluate <- function(cl, truth = NCI60$labs, d = d_orig) {
+  st <- fpc::cluster.stats(d, as.integer(factor(cl)))
+  tibble(
+    Silhouette = st$avg.silwidth,
+    CH         = st$ch,
+    Dunn       = st$dunn,
+    ARI        = adjustedRandIndex(cl, truth),
+    NMI        = nmi(cl, truth),
+    Purity     = purity(cl, truth)
+  )
+}
+```
+
+## All Methods at K = 4
+
+```{r}
+#| cache: true
+partitions <- list(
+  "K-means (genes)"      = km_res$cluster,
+  "PAM (genes)"          = pam_res$clustering,
+  "GMM (genes, BIC)"     = gmm_res$classification,
+  "Hier. complete"       = cut_complete,
+  "Hier. average"        = cutree(hc_average, k = 4),
+  "Hier. Ward"           = cutree(hclust(d, method = "ward.D2"), k = 4),
+  "K-means (t-SNE)"      = km_tsne$cluster,
+  "GMM (t-SNE)"          = gmm_tsne$classification,
+  "K-means (UMAP)"       = km_umap$cluster,
+  "GMM (UMAP)"           = gmm_umap$classification
+)
+
+results <- bind_rows(lapply(partitions, evaluate), .id = "Method") |>
+  mutate(K = sapply(partitions, function(x) length(unique(x))))
+results |>
+  arrange(desc(ARI)) |> 
+  mutate(across(where(is.numeric) & !K, ~ round(.x, 3))) |>
+  kable()
+```
+
+Note that the GMM on the genes used the K chosen by BIC rather than K = 4 (see the `K` column).
+
+```{r}
+results |>
+  select(Method, Silhouette, ARI, NMI, Purity) |>
+  pivot_longer(-Method, names_to = "Measure") |>
+  ggplot(aes(value, reorder(Method, value), fill = Measure)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~Measure, scales = "free_x", nrow = 1) +
+  labs(x = NULL, y = NULL, title = "Internal (Silhouette) and external (ARI, NMI, Purity) validation")
+```
+
+How the partitions agree with each other (pairwise ARI):
+
+```{r}
+ari_mat <- outer(seq_along(partitions), seq_along(partitions),
+                 Vectorize(function(i, j) adjustedRandIndex(partitions[[i]], partitions[[j]])))
+dimnames(ari_mat) <- list(names(partitions), names(partitions))
+as_tibble(ari_mat, rownames = "A") |>
+  pivot_longer(-A, names_to = "B", values_to = "ARI") |>
+  ggplot(aes(A, B, fill = ARI)) +
+  geom_tile() +
+  geom_text(aes(label = round(ARI, 2)), size = 3) +
+  scale_fill_gradient(low = "white", high = "steelblue", limits = c(0, 1)) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(x = NULL, y = NULL, title = "Agreement between clusterings")
+```
+
+## Sensitivity to K
+
+The best method at K = 4 may not be the best at K = 8. We sweep K for the methods that let us set it directly.
+
+```{r}
+#| cache: true
+run_k <- function(k) {
+  set.seed(k)
+  list(
+    "K-means (genes)" = kmeans(X.scaled, k, nstart = 25)$cluster,
+    "PAM (genes)"     = pam(X.scaled, k)$clustering,
+    "Hier. Ward"      = cutree(hclust(d, method = "ward.D2"), k),
+    "K-means (t-SNE)" = kmeans(tsne_scores, k, nstart = 25)$cluster,
+    "K-means (UMAP)"  = kmeans(umap_scores, k, nstart = 25)$cluster
+  )
+}
+sweep <- map_dfr(2:10, function(k) {
+  parts <- run_k(k)
+  bind_rows(lapply(parts, evaluate), .id = "Method") |> mutate(K = k)
+})
+sweep |>
+  select(Method, K, Silhouette, ARI) |>
+  pivot_longer(c(Silhouette, ARI), names_to = "Measure") |>
+  ggplot(aes(K, value, color = Method)) +
+  geom_line() + geom_point() +
+  facet_wrap(~Measure, scales = "free_y") +
+  scale_x_continuous(breaks = 2:10) +
+  labs(y = NULL, title = "Internal and external validation across K")
+```
+
+## Stability
+
+t-SNE, UMAP, and K-means all depend on random starts. A method whose answer changes substantially from seed to seed is hard to trust. We refit each pipeline (embedding + clustering) with 20 different seeds and record the ARI against the cancer types.
+
+```{r}
+#| cache: true
+stab <- map_dfr(1:20, function(s) {
+  set.seed(s)
+  ts <- Rtsne(X.scaled, perplexity = 10, check_duplicates = FALSE)$Y
+  um <- umap(X.scaled, n_neighbors = 10, min_dist = 0.1)
+  tibble(
+    Seed = s,
+    "K-means (genes)" = adjustedRandIndex(kmeans(X.scaled, 4, nstart = 25)$cluster, NCI60$labs),
+    "K-means (t-SNE)" = adjustedRandIndex(kmeans(ts, 4, nstart = 25)$cluster, NCI60$labs),
+    "K-means (UMAP)"  = adjustedRandIndex(kmeans(um, 4, nstart = 25)$cluster, NCI60$labs)
+  )
+}) |> pivot_longer(-Seed, names_to = "Method", values_to = "ARI")
+
+ggplot(stab, aes(Method, ARI)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = 0.1, alpha = 0.5) +
+  labs(title = "ARI vs. cancer type over 20 random seeds (K = 4)")
+stab |> group_by(Method) |> summarise(mean = mean(ARI), sd = sd(ARI)) |> kable(digits = 3)
+```
+
+## Reading the Results
+
+- No single index is the "answer." Internal measures reward compact, separated clusters; external measures reward agreement with one particular labeling (cancer type), which need not be the only biologically meaningful structure.
+- Clustering an embedding is not automatically better or worse. In this run, K-means on the UMAP scores had the best ARI/NMI and was stable across seeds, whereas t-SNE scores gave the worst clusters (negative silhouette in the gene space) and varied more from seed to seed. The embedding plots look appealing either way, so use the original-space measures and the stability check to decide.
+- All average silhouettes are small (under 0.1) because 64 samples in 6,830 dimensions do not form tight, well-separated groups. Compare methods relative to each other rather than against a "good" threshold.
+- Methods that agree with each other (high pairwise ARI) and are stable across seeds give more reason to believe the clusters reflect real structure.
+- With $n = 64$, differences of a few hundredths in ARI or silhouette are within noise; look for large, consistent gaps.
+
+## Selecting the Best Number of Clusters
+
+- Elbow Method: visual inspection of total within-cluster sum of squares.
+
+- Gap Statistic: choose ($K$) with the highest gap value.
+
+- BIC (GMM): the model with the largest BIC (mclust's convention) is preferred.
+
+- Silhouette width: can be used to confirm cluster separation.
+
+- ARI/NMI against known labels: only if labels exist.
+
+# Summary
+
+- **K-means**	Fast, easy to interpret, but	sensitive to scaling, outliers
+
+- **PAM**	Robust to outliers, but slower on large datasets.
+
+- **GMM** Captures overlapping/elliptical clusters, but requires distributional assumptions.
+
+- **Hierarchical** Dendrogram visualization, no K needed a priori, but is computationally intensive.
+
+- **Clustering t-SNE/UMAP scores** Easy to visualize and often separates groups well, but distances in the embedding are distorted and results vary with the seed and tuning parameters (perplexity, `n_neighbors`); validate in the original space.

@@ -1,0 +1,801 @@
+---
+title: "17b - Mock Analysis: Dimension Reduction and Clustering"
+subtitle: "Biostatistics 735/794 — Machine Learning in Public Health"
+author: "Alexander McLain"
+date: today
+format:
+  html:
+    toc: true
+    toc-location: left
+    toc-depth: 3
+    number-sections: true
+    smooth-scroll: true
+    theme: cosmo
+    code-fold: false
+    highlight-style: github
+    embed-resources: true
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+These are the worked analyses for the three in-class mock-analysis handouts
+(`Mock-Analysis-Handouts-DR-Clustering.docx`). In each scenario we go
+step by step:
+
+1. **Look at the data** before running anything.
+2. **Try the "obvious" analysis** and see what goes wrong.
+3. **Fix the problem** and redo the analysis.
+4. **Check the answer**: is the structure real, and can we use it?
+
+The big lesson across all three: dimension reduction and clustering methods
+will *always* give you an answer. They never warn you that you put the wrong
+variables in. Most of the work is deciding what goes in.
+
+| Group | Data | Main issue | Method we end up with |
+|---|---|---|---|
+| 1 | NHANES adults | What goes into the distance; are there clusters at all? | PAM on the numeric measures (and a new idea: Gower distance) |
+| 2 | `bfi` personality survey | Finding a few underlying traits and scoring new people the same way | Factor analysis |
+| 3 | Communities and Crime | ~100 overlapping variables, size variables, the outcome in the data, and new communities | PCA, then K-means on the PC scores |
+
+```{r}
+#| include: true
+set.seed(735794)
+library(tidyverse)
+library(janitor)
+library(kableExtra)
+library(NHANES)
+library(psych)
+library(GPArotation)  # needed for the oblimin rotation in fa()
+library(cluster)      # daisy(), pam(), silhouette(), clusGap()
+library(factoextra)
+library(mclust)       # Mclust(), adjustedRandIndex()
+library(uwot)
+
+select <- dplyr::select
+count  <- dplyr::count
+kbl2 <- function(x, ...) kable(x, ...) |> kable_styling(full_width = FALSE)
+```
+
+# Scenario 1: Cardiometabolic Phenotypes in NHANES
+
+**Goal:** Find subgroups ("phenotypes") of U.S. adults with similar
+cardiometabolic profiles, and report how diabetes prevalence differs across
+them.
+
+## Step 1: Look at the Data
+
+```{r}
+adults <- NHANES |>
+  clean_names() |>
+  filter(age >= 20)
+
+# Rows vs. people
+c(rows = nrow(adults), people = n_distinct(adults$id))
+```
+
+There are about 2,600 more rows than people. The `NHANES` package was made by
+*resampling* the real survey, so many people appear two or more times. If we
+keep the copies, every copied person has a "twin" at distance 0, and those
+twins make tight little groups that aren't real. **Keep one row per person.**
+
+```{r}
+adults |>
+  select(age, gender, bmi, weight, height, bp_sys_ave, bp_dia_ave, pulse,
+         tot_chol, direct_chol, smoke100, phys_active, diabetes) |>
+  glimpse()
+```
+
+Some variables are numbers (`<dbl>`, `<int>`) and some are categories
+(`<fct>`): gender, smoking (`smoke100` = smoked at least 100 cigarettes),
+physical activity, and diabetes.
+
+```{r}
+adults |>
+  select(bmi, weight, height, bp_sys_ave, bp_sys1, bp_sys2, bp_sys3) |>
+  cor(use = "complete.obs") |>
+  round(2)
+```
+
+BMI and weight are correlated about 0.9, and the individual BP readings are
+correlated about 0.95 with their average. They measure nearly the same thing.
+
+```{r}
+#| fig-width: 8
+#| fig-height: 3
+adults |>
+  select(bmi, tot_chol, direct_chol) |>
+  pivot_longer(everything()) |>
+  ggplot(aes(value)) + geom_histogram(bins = 40) +
+  facet_wrap(~ name, scales = "free") + theme_minimal()
+```
+
+The cholesterol variables (especially HDL, `direct_chol`) are right skewed.
+We will log them so a few very large values don't dominate the distances.
+
+**What we learned from looking:**
+
+- Remove duplicate people.
+- Use one body-size measure (BMI) and one SBP and one DBP measure (the
+  averages).
+- Diabetes is what we want to *report by cluster*, so it should not be used
+  to *make* the clusters.
+- We have a mix of numeric and categorical variables. Keep this in mind.
+
+```{r}
+nh <- adults |>
+  distinct(id, .keep_all = TRUE) |>
+  select(id, age, gender, bmi, weight, height, bp_sys_ave, bp_dia_ave,
+         pulse, tot_chol, direct_chol, smoke100, phys_active, diabetes) |>
+  drop_na()
+
+glimpse(nh)
+```
+
+## Step 2: The "Obvious" Analysis (and What Goes Wrong)
+
+Suppose we turn every variable into a number (categories become 0/1),
+standardize, and run K-means with $K = 3$, the way we did in the clustering
+notes.
+
+```{r}
+# Turning factors into numeric variables
+X_wrong <- nh |>
+  mutate(across(c(gender, smoke100, phys_active, diabetes), \(x) as.numeric(x) - 1)) |>
+  select(-id) |>
+  scale()
+
+set.seed(1)
+km_wrong <- kmeans(X_wrong, centers = 3, nstart = 25)
+
+nh |>
+  mutate(cluster = km_wrong$cluster) |>
+  group_by(cluster) |>
+  summarize(n = n(), pct_diabetes = mean(diabetes == "Yes") * 100,
+            pct_male = mean(gender == "male") * 100,
+            mean_bmi = mean(bmi), .groups = "drop") |>
+  kbl2(digits = 1, caption = "K-means on everything, including diabetes")
+```
+
+The three clusters are basically "people with diabetes", "men without
+diabetes" and "women without diabetes". Two problems:
+
+1. **Diabetes was an input**, so of course one cluster is ~100% diabetic. If
+   we then report "diabetes prevalence differs a lot across clusters," we
+   are reporting something we built in.
+2. **0/1 variables dominate.** A 0/1 variable only takes two values, so after
+   standardizing, everyone is either at one end or the other. That makes a
+   big gap, and K-means likes to cut along big gaps. Numeric variables, by
+   contrast, spread people out smoothly.
+
+## Step 3: A New Idea, Gower Distance
+
+K-means and PAM, as we used them in the notes, measure similarity with
+**Euclidean distance** on numbers. That doesn't make much sense for a
+category like gender. A common fix for mixed data is **Gower distance**.
+
+For two people $i$ and $j$, Gower distance takes the average over the
+variables of a per-variable distance between 0 and 1:
+
+- **Numeric variable:** $|x_i - x_j| \,/\, \text{range}(x)$, the difference
+  as a fraction of the variable's range.
+- **Categorical variable:** 0 if the two people are in the same category,
+  1 if they are different.
+
+Here is a small example with three people and three variables:
+
+```{r}
+toy <- tibble(
+  person = c("A", "B", "C"),
+  age    = c(30, 40, 70),          # range = 70 - 30 = 40
+  bmi    = c(25, 26, 35),          # range = 35 - 25 = 10
+  gender = factor(c("female", "male", "female"))
+)
+toy
+```
+
+By hand, for A vs. B: age $= |30-40|/40 = 0.25$, BMI $= |25-26|/10 = 0.1$,
+gender $= 1$ (different). Gower $= (0.25 + 0.1 + 1)/3 = 0.45$.
+
+For A vs. C: age $= 40/40 = 1$, BMI $= 10/10 = 1$, gender $= 0$.
+Gower $= (1 + 1 + 0)/3 = 0.67$.
+
+The `daisy()` function in the `cluster` package does this for us:
+
+```{r}
+daisy(toy |> select(-person), metric = "gower")
+```
+
+Notice that B differs from A by only 10 years and 1 BMI point, but still
+gets a distance of 0.45, mostly because of gender. **A categorical variable
+always contributes a full 0 or 1, while a numeric variable usually
+contributes a small fraction.** Keep that in mind.
+
+### Gower + PAM on NHANES
+
+K-means needs the actual data values (to compute means), but PAM only needs
+the distances between people, so it works with Gower distance. We tell
+`pam()` that we're giving it distances with `diss = TRUE`.
+
+Inputs: age, BMI, average SBP and DBP, pulse, log total cholesterol, log
+HDL, plus gender, smoking and physical activity. Diabetes stays out.
+
+```{r}
+nh_in <- nh |>
+  transmute(age, bmi, bp_sys_ave, bp_dia_ave, pulse,
+            log_tot_chol = log(tot_chol), log_hdl = log(direct_chol),
+            gender, smoke100, phys_active)
+
+d_gower <- daisy(nh_in, metric = "gower")
+```
+
+```{r}
+#| cache: true
+sil_pam <- map_dbl(2:8, function(k) pam(d_gower, k = k, diss = TRUE)$silinfo$avg.width)
+
+tibble(K = 2:8, silhouette = sil_pam) |>
+  ggplot(aes(K, silhouette)) + geom_line() + geom_point() +
+  labs(title = "PAM on Gower distance: average silhouette width") +
+  theme_minimal()
+```
+
+The silhouette keeps going up as $K$ increases. That looks like good news,
+but let's look at what the $K = 8$ clusters are:
+
+```{r}
+#| cache: true
+pam_g8 <- pam(d_gower, k = 8, diss = TRUE)
+nh_in |>
+  mutate(cluster = pam_g8$clustering) |>
+  count(cluster, gender, smoke100, phys_active) |>
+  group_by(cluster) |> slice_max(n, n = 1) |> ungroup() |>
+  kbl2(caption = "Most common gender / smoking / activity group in each cluster (K = 8)")
+```
+
+Each cluster is one combination of gender (2) × smoking (2) × activity (2)
+$= 8$ combinations. The clustering just rebuilt a cross-table of the three
+categorical variables, which we could have made with `table()`. This is the
+point from the toy example: in Gower distance, the 0/1 differences of the
+categorical variables swamp the numeric ones.
+
+**Lesson:** Gower distance is a useful tool for mixed data, but check what
+the clusters are made of. Here, we want phenotypes based on cardiometabolic
+*measurements*, so we cluster on the numeric measures and use gender,
+smoking and activity to *describe* the clusters afterwards.
+
+## Step 4: Cluster the Numeric Measures
+
+```{r}
+#| cache: true
+X_cont <- scale(nh_in |> select(where(is.numeric)))
+
+sil_cont <- map_dbl(2:8, function(k) pam(X_cont, k = k)$silinfo$avg.width)
+round(setNames(sil_cont, 2:8), 3)
+```
+
+The average silhouette widths are all between about 0.10 and 0.18. Recall
+that values near 1 mean tight, well-separated clusters and values near 0
+mean points sit between clusters. No choice of $K$ gives clearly separated
+groups. We use $K = 3$ (the second largest silhouette, and a small number of
+groups is easier to describe).
+
+```{r}
+#| cache: true
+pam_fit <- pam(X_cont, k = 3)
+
+# Medoids are real participants: a "typical person" for each cluster
+nh_in[pam_fit$id.med, ] |> kbl2(digits = 2, caption = "PAM medoids (K = 3)")
+```
+
+## Step 5: Are There Clusters at All?
+
+K-means and PAM always return $K$ groups, even if the data are one big
+cloud. Two checks from the notes:
+
+**A GMM with $G = 1$ allowed.** If BIC picks one component, there's no
+evidence of groups.
+
+```{r}
+#| cache: true
+gmm_fit <- Mclust(X_cont, G = 1:8, verbose = FALSE)
+summary(gmm_fit)
+fviz_mclust(gmm_fit, "BIC") + labs(title = "GMM BIC (G = 1 allowed)")
+```
+
+BIC picks many components, not one. But a GMM uses components to fit
+*shape*, too: one skewed cloud can need several normal components to
+describe it. So this doesn't prove there are 7 kinds of people.
+
+**A picture.** UMAP of the numeric measures, colored by PAM cluster:
+
+```{r}
+#| cache: true
+set.seed(1)
+umap_nh <- umap(X_cont, n_neighbors = 30)
+tibble(Dim1 = umap_nh[, 1], Dim2 = umap_nh[, 2], cluster = factor(pam_fit$clustering)) |>
+  ggplot(aes(Dim1, Dim2, color = cluster)) +
+  geom_point(size = 0.6, alpha = 0.6) +
+  theme_minimal() +
+  labs(title = "UMAP of the numeric measures, colored by PAM cluster")
+```
+
+One continuous cloud with the clusters as regions of it, not separate
+islands.
+
+**Do we get the same clusters from different data?** Split the people into
+two random halves, run PAM on each half separately, and assign *everyone* to
+the nearest medoid from each half. If the clusters are real, the two halves
+should give nearly the same assignments (ARI near 1).
+
+```{r}
+#| cache: true
+nearest_medoid <- function(X, medoids) {
+  apply(X, 1, function(x) which.min(colSums((t(medoids) - x)^2)))
+}
+
+set.seed(2)
+split_ari <- map_dbl(1:10, function(r) {
+  half <- sample(nrow(X_cont), nrow(X_cont) / 2)
+  fit_a <- pam(X_cont[half, ], k = 3)
+  fit_b <- pam(X_cont[-half, ], k = 3)
+  adjustedRandIndex(nearest_medoid(X_cont, fit_a$medoids),
+                    nearest_medoid(X_cont, fit_b$medoids))
+})
+round(split_ari, 2)
+```
+
+The average ARI is `r round(mean(split_ari), 2)`. Use this together with the
+low silhouette and the UMAP picture to judge how much to trust the clusters:
+these data look like a **continuum**, and the clusters are a convenient way
+to divide it, not distinct types of people. That's a perfectly good answer
+if we report it honestly.
+
+## Step 6: Describe the Clusters
+
+Now we bring back the variables we kept out, including diabetes.
+
+```{r}
+nh |>
+  mutate(cluster = pam_fit$clustering) |>
+  group_by(cluster) |>
+  summarize(n = n(),
+            age = mean(age), bmi = mean(bmi), sbp = mean(bp_sys_ave),
+            hdl = mean(direct_chol), pct_male = mean(gender == "male") * 100,
+            pct_smoked = mean(smoke100 == "Yes") * 100,
+            pct_diabetes = mean(diabetes == "Yes") * 100, .groups = "drop") |>
+  kbl2(digits = 1, caption = "Cluster profiles and diabetes prevalence")
+```
+
+The three clusters: a younger, high-BMI / low-HDL group; an older,
+high-blood-pressure group; and a young, lean, low-BP group. Diabetes
+prevalence differs across them, and this time that is a real finding,
+because diabetes was not used to form the clusters. Gender and smoking are
+now spread across all three clusters instead of defining them.
+
+::: {.callout-important}
+**Don't test the variables you clustered on.** It's fine to compare diabetes
+across clusters. It is *not* meaningful to run an ANOVA showing that BMI
+"differs significantly" across clusters: PAM chose the clusters to make BMI
+(and the other inputs) differ. You'd get tiny p-values even from random
+noise.
+:::
+
+---
+
+# Scenario 2: Building Scales from a Personality Survey
+
+**Goal:** Turn 25 survey items into a few scores to use as covariates in a
+study of health behaviors, and compute the same scores for a new group of
+people next year.
+
+## Step 1: Look at the Data
+
+```{r}
+data(bfi)
+dim(bfi)
+head(bfi)
+```
+
+The first 25 columns are survey items; the last three (`gender`,
+`education`, `age`) are **not**. They describe the person, and they will
+probably be separate covariates in the health-behavior regression, so they
+shouldn't be mixed into a personality score.
+
+```{r}
+table(bfi$A1, useNA = "ifany")
+```
+
+Each item is an answer from 1 (very inaccurate) to 6 (very accurate), and
+some people skipped items.
+
+```{r}
+round(cor(bfi[, c("A1", "A2", "A3", "A4", "A5")], use = "pairwise.complete.obs"), 2)
+```
+
+`A2`–`A5` are positively correlated, but `A1` is *negatively* correlated
+with all of them. Check the wording (`?bfi`): A1 is "Am indifferent to the
+feelings of others." It's worded in the opposite direction (**reverse
+keyed**). `bfi.keys` lists which items are reversed (the "-" sign):
+
+```{r}
+bfi.keys
+```
+
+```{r}
+mean(!complete.cases(bfi[, 1:25]))   # share of people who skipped at least one item
+```
+
+**What we learned from looking:** use the 25 items only; some items are
+reversed; about 13% of people skipped at least one item; and the survey was
+*designed* to measure five traits.
+
+## Step 2: Set Aside "Next Year's" People
+
+We want a scoring rule we can apply to new people. To mimic that, we set
+aside 800 people as "next year's cohort" and build the scores using only the
+other 2,000.
+
+```{r}
+set.seed(3)
+idx_new    <- sample(nrow(bfi), 800)
+bfi_now    <- bfi[-idx_new, ]
+bfi_next   <- bfi[idx_new, ]
+items      <- bfi_now |> select(A1:O5)
+next_items <- bfi_next |> select(A1:O5)
+```
+
+## Step 3: The "Obvious" Analysis (and What Goes Wrong)
+
+PCA on the whole data frame:
+
+```{r}
+pca_wrong <- prcomp(drop_na(bfi_now), scale. = TRUE)
+round(pca_wrong$rotation[c("gender", "education", "age"), 1:5], 2)
+```
+
+Two problems. `drop_na()` quietly threw away everyone who skipped any item
+(about 13%), and age and education load on PC5 along with the items. A
+"personality" score that partly measures age is a problem when age is also
+a covariate in the regression.
+
+A second, subtler issue: PCA summarizes *all* the variance in the items. Our
+goal is different. We think there are a few underlying traits that cause
+people to answer the items the way they do, which is exactly what **factor
+analysis** is built for (see the Dimension Reduction notes).
+
+## Step 4: Factor Analysis
+
+Same steps as the notes: check suitability, choose the number of factors,
+fit.
+
+```{r}
+KMO(items)$MSA   # > 0.6 is acceptable
+```
+
+```{r}
+#| cache: true
+fa.parallel(items, fa = "fa", n.iter = 20, show.legend = FALSE)
+```
+
+Parallel analysis suggests about 6 factors. The survey was designed for 5,
+so we fit 5 and check that they match the 5 traits. (A 6th factor is often a
+small one picking up a couple of items with similar wording.)
+
+In the notes we used `rotate = "varimax"`, which forces the factors to be
+**uncorrelated**. But personality traits can be correlated (people who are
+more extraverted also tend to be more agreeable). `rotate = "oblimin"` allows
+the factors to be correlated, and we can look at how correlated they turn
+out to be.
+
+```{r}
+fa_fit <- fa(items, nfactors = 5, rotate = "oblimin", fm = "ml")
+print(fa_fit$loadings, cutoff = 0.3, sort = TRUE)
+```
+
+Read down each column: each factor picks up mostly the five items of one
+trait (in this run ML4 = neuroticism, ML5 = extraversion, ML3 =
+agreeableness, ML1 = conscientiousness, ML2 = openness). Within a factor,
+the reversed items have the **opposite sign** from the other items (e.g.,
+A1 is negative while A2–A5 are positive). The overall sign of a factor is
+arbitrary: ML5 came out "backwards" (E1 and E2 are positive, E3–E5
+negative), so ML5 is really *introversion*. Flipping all its signs gives the
+same model. A few items load on two factors (look for items with two
+numbers in their row, like N4 and O4); those items don't cleanly measure
+just one trait.
+
+```{r}
+round(fa_fit$Phi, 2)   # correlations between the factors
+```
+
+Several factors are correlated at about 0.2–0.3 (in absolute value), so letting them be correlated
+(oblimin) was reasonable. With varimax, these would have been forced to 0.
+
+## Step 5: Scoring Next Year's People
+
+The key idea: **build the scoring rule from this year's data, then apply the
+same rule to next year's people.** Don't redo the factor analysis on next
+year's data: you'd get slightly different factors, and the scores wouldn't
+be comparable across years.
+
+**Option 1, factor scores.** `predict()` uses the weights from this year's
+fit:
+
+```{r}
+fs_next <- predict(fa_fit, data = next_items, old.data = items)
+head(round(fs_next, 2))
+sum(!complete.cases(fs_next))   # people with no factor scores
+```
+
+Anyone who skipped even one item gets `NA` for all factor scores.
+
+**Option 2, simple scale scores.** For each trait, flip the reversed items
+(on a 1–6 scale, a reversed answer $x$ becomes $7 - x$) and average the five
+items, using whatever items the person answered.
+
+```{r}
+reversed <- c("A1", "C4", "C5", "E1", "E2", "O2", "O5")
+
+scale_scores <- function(dat) {
+  dat |>
+    mutate(across(all_of(reversed), \(x) 7 - x)) |>
+    transmute(
+      agree         = rowMeans(across(A1:A5), na.rm = TRUE),
+      conscientious = rowMeans(across(C1:C5), na.rm = TRUE),
+      extraversion  = rowMeans(across(E1:E5), na.rm = TRUE),
+      neuroticism   = rowMeans(across(N1:N5), na.rm = TRUE),
+      openness      = rowMeans(across(O1:O5), na.rm = TRUE)
+    )
+}
+ss_next <- scale_scores(next_items)
+head(round(ss_next, 2))
+```
+
+How similar are the two options?
+
+```{r}
+round(cor(fs_next, ss_next, use = "pairwise.complete.obs"), 2)
+```
+
+Each factor matches one scale score with a correlation of 0.92 to 0.98
+(ML5 is negative with extraversion because, as we saw, ML5 is
+introversion). Since the simple scale scores are nearly the same, easy to explain,
+and work for people who skipped an item, they're a good choice for the
+regression. Factor analysis did its job: it confirmed that the items group
+into the five intended traits, so averaging within each trait makes sense.
+
+
+---
+
+# Scenario 3: Community Types from the Communities and Crime Data
+
+**Goal:** Find a few community "types" to guide where a violence-prevention
+program sends resources, compare violent crime across the types, and assign
+communities that join next year to an existing type.
+
+## Step 1: Look at the Data
+
+```{r}
+crime <- readRDS("community_crime.RDS")
+dim(crime)
+names(crime)
+```
+
+`ViolentCrime` is the **outcome**: we want to compare it across types, so it
+should not be used to make them.
+
+```{r}
+summary(crime[, c("population", "NumUnderPov", "PctPopUnderPov", "medIncome", "ViolentCrime")])
+```
+
+Everything is already between 0 and 1 (the data provider rescaled each
+variable). But notice the difference between `NumUnderPov` (the *number*
+of people in poverty) and `PctPopUnderPov` (the *percent* in poverty). A big
+city has a large number of poor people even if its poverty rate is low.
+
+```{r}
+round(cor(crime$population, crime[, c("numbUrban", "NumUnderPov", "NumIlleg",
+                                      "NumImmig", "HousVacant")]), 2)
+```
+
+The count variables are almost copies of `population`: they mostly measure
+**how big** the community is. We want types based on what a community is
+like, not its size, so we leave the counts out.
+
+```{r}
+round(cor(crime[, c("medIncome", "medFamInc", "perCapInc", "PctPopUnderPov")]), 2)
+
+r <- cor(crime)
+sum(abs(r[upper.tri(r)]) > 0.9)   # pairs of variables that are nearly copies of each other
+```
+
+Many variables measure the same idea (income is measured several ways,
+immigration 8 ways, divorce 4 ways). In a Euclidean distance, an idea that
+is measured 8 times counts 8 times. This is exactly the situation where
+**PCA first** helps: PCA combines highly correlated variables into one
+component.
+
+**What we learned from looking:** leave out `ViolentCrime` and the count
+variables; expect PCA to absorb the overlapping variables.
+
+```{r}
+count_vars <- c("population", "numbUrban", "NumUnderPov", "NumIlleg", "NumImmig",
+                "NumInShelters", "NumStreet", "HousVacant", "LandArea")
+```
+
+## Step 2: Set Aside "Next Year's" Communities
+
+```{r}
+set.seed(4)
+idx_new   <- sample(nrow(crime), round(0.2 * nrow(crime)))
+crime_now <- crime[-idx_new, ]
+crime_new <- crime[idx_new, ]
+```
+
+## Step 3: The "Obvious" Analysis (and What Goes Wrong)
+
+K-means on all 100 columns:
+
+```{r}
+set.seed(1)
+km_all <- kmeans(scale(crime_now), centers = 4, nstart = 25)
+
+crime_now |>
+  mutate(cluster = km_all$cluster) |>
+  group_by(cluster) |>
+  summarize(n = n(), population = mean(population),
+            violent_crime = mean(ViolentCrime), .groups = "drop") |>
+  kbl2(digits = 3, caption = "K-means on everything (including counts and the outcome)")
+```
+
+One small cluster is just the biggest cities (look at its average
+population), because they are extreme on every count variable at once. And
+since `ViolentCrime` was an input, the "high crime" cluster is partly
+high-crime by construction.
+
+## Step 4: PCA on the Rate Variables
+
+```{r}
+X_now <- crime_now |> select(-ViolentCrime, -all_of(count_vars))
+ncol(X_now)
+
+pca_fit <- prcomp(X_now, center = TRUE, scale. = TRUE)
+fviz_eig(pca_fit, ncp = 15, addlabels = TRUE) + labs(title = "Scree plot")
+round(cumsum(pca_fit$sdev^2 / sum(pca_fit$sdev^2))[1:10], 2)
+```
+
+The first 6 components explain about 70% of the variance in 91 variables.
+After that, each extra component adds only a few percent. We keep 6.
+
+What do the components mean? Look at the variables with the largest
+loadings:
+
+```{r}
+map_dfr(1:4, function(j) {
+  l <- pca_fit$rotation[, j]
+  top <- names(sort(abs(l), decreasing = TRUE))[1:6]
+  tibble(PC = paste0("PC", j), variable = top, loading = round(l[top], 2))
+}) |>
+  kbl2(caption = "Largest loadings on PCs 1–4")
+```
+
+PC1 is income and poverty (an economic advantage axis), PC2 is
+immigration and language, PC3 is household size, and PC4 is age of the
+population and how long people have lived there. The 8 immigration variables
+now count *once* (in PC2) instead of 8 times.
+
+## Step 5: Cluster the PC Scores
+
+```{r}
+#| cache: true
+n_pc <- 6
+S_now <- pca_fit$x[, 1:n_pc]
+
+fviz_nbclust(S_now, kmeans, method = "silhouette", k.max = 10) +
+  labs(title = "K-means on the first 6 PC scores")
+
+set.seed(5)
+gap <- clusGap(S_now, FUN = kmeans, nstart = 25, iter.max = 50, K.max = 10, B = 30)
+fviz_gap_stat(gap)
+```
+
+The silhouette is highest at $K = 3$, but only about 0.28 (weak structure).
+The gap statistic keeps increasing all the way to 9, which usually means
+there are no clearly separated groups. We go with $K = 3$; a program also
+needs a small number of types to be useful.
+
+```{r}
+set.seed(6)
+K <- 3
+km_pc <- kmeans(S_now, centers = K, nstart = 50)
+
+crime_now |>
+  mutate(type = km_pc$cluster) |>
+  group_by(type) |>
+  summarize(n = n(),
+            medIncome = mean(medIncome), PctPopUnderPov = mean(PctPopUnderPov),
+            PctKids2Par = mean(PctKids2Par), PctForeignBorn = mean(PctForeignBorn),
+            pctUrban = mean(pctUrban),
+            violent_crime = mean(ViolentCrime), .groups = "drop") |>
+  kbl2(digits = 2, caption = "Community types (K-means on 6 PCs) and violent crime")
+```
+
+The three types: (1) a small group of urban communities with many
+immigrants, (2) higher-income communities with many two-parent families,
+and (3) a larger group of lower-income, less urban communities. Average
+violent crime is highest in type 1 and lowest in type 2.
+
+Comparing crime across types is fair now, because `ViolentCrime` wasn't
+used to make them. It is still a description, though: it doesn't show that
+these community characteristics *cause* crime.
+
+## Step 6: A Picture with UMAP
+
+```{r}
+#| cache: true
+set.seed(7)
+umap_fit <- umap(scale(X_now), n_neighbors = 30)
+tibble(Dim1 = umap_fit[, 1], Dim2 = umap_fit[, 2], type = factor(km_pc$cluster)) |>
+  ggplot(aes(Dim1, Dim2, color = type)) +
+  geom_point(size = 0.8) + theme_minimal() +
+  labs(title = "UMAP of the rate variables, colored by community type")
+```
+
+We found the types with PCA + K-means and only use UMAP to *look*. The types
+are regions of one cloud rather than separate islands, which matches the low
+silhouette.
+
+## Step 7: Assigning Next Year's Communities
+
+To assign a new community, we apply this year's steps without refitting
+anything:
+
+1. Use this year's PCA (same centering, scaling and loadings) to compute the
+   new community's 6 PC scores. `predict()` does this for `prcomp` objects.
+2. Put the community in the type whose K-means center is closest.
+
+```{r}
+X_new <- crime_new |> select(-ViolentCrime, -all_of(count_vars))
+S_new <- predict(pca_fit, newdata = X_new)[, 1:n_pc]
+
+nearest_center <- function(S, centers) {
+  apply(S, 1, function(s) which.min(colSums((t(centers) - s)^2)))
+}
+type_new <- nearest_center(S_new, km_pc$centers)
+table(type_new)
+```
+
+Would we get the same types if we had refit everything with the new
+communities included?
+
+```{r}
+X_all   <- bind_rows(X_now, X_new)
+pca_all <- prcomp(X_all, center = TRUE, scale. = TRUE)
+set.seed(6)
+km_all2 <- kmeans(pca_all$x[, 1:n_pc], centers = K, nstart = 50)
+
+adjustedRandIndex(type_new, km_all2$cluster[(nrow(X_now) + 1):nrow(X_all)])
+```
+
+An ARI near 1 means the fixed rule and a full refit agree, so the types
+don't depend much on which communities happened to be in this year's data.
+
+::: {.callout-important}
+**Why not t-SNE or MDS?** Neither one has a way to place a new community
+into an existing picture. Adding communities means rerunning the whole
+embedding, which moves *everyone* and can change the types. PCA (plus
+K-means centers) gives a fixed rule we can reuse.
+:::
+
+---
+
+# Summary of the Debrief
+
+| | Group 1 (NHANES) | Group 2 (bfi) | Group 3 (Communities) |
+|---|---|---|---|
+| What we found by looking | duplicate people, overlapping variables, mixed types, outcome in the data | demographic columns, reversed items, skipped items | outcome in the data, count variables, many overlapping variables |
+| What we left out | duplicates, `diabetes`, extra body-size and BP measures | `gender`, `education`, `age` | `ViolentCrime`, count variables |
+| Method | PAM on the numeric measures (Gower was tried and explained) | Factor analysis (oblimin), then simple scale scores | PCA, then K-means on 6 PC scores |
+| How many? | silhouette | parallel analysis + the survey design | scree plot; silhouette and gap |
+| Is it real? | low silhouette, GMM, UMAP, split-half ARI: a continuum | loadings match the 5 designed traits | low silhouette, UMAP: a continuum, but a stable one |
+| New data | not needed | same scoring rule applied to next year | `predict()` PCA, nearest center |

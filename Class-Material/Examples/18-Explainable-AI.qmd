@@ -1,0 +1,818 @@
+---
+title: "PR-AUC + SMOTE + Explainable AI"
+subtitle: "Biostatistics 735 — Machine Learning in Public Health"
+author: "Alexander McLain"
+date: today
+format:
+  html:
+    toc: true
+    toc-location: left
+    toc-depth: 3
+    number-sections: true
+    smooth-scroll: true
+    theme: cosmo
+    code-fold: false
+    highlight-style: github
+    embed-resources: true
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+```{r}
+#| include: false
+set.seed(735)
+```
+
+
+# Overview
+
+This notebook demonstrates **explainable AI** methods on a classic public-health dataset: **Pima Indians Diabetes**. We will:
+
+- Prepare data (imputation, scaling)
+- Fit a **Random Forest** classifier (primary model) and a **Logistic Regression** baseline
+- Evaluate discrimination and calibration, including **precision–recall (PR) curves and PR-AUC**
+- Handle class imbalance with **SMOTE**, and compare it to weighting the loss function and moving the classification threshold
+- Explain the model with:
+  - **Variable Importance (permutation)**
+  - **Partial Dependence Plots (PDPs)**
+  - **Accumulated Local Effects (ALE)**
+  - **SHAP values** (local + global summaries)
+  - **LIME** (local surrogate explanations)
+
+We use `tidymodels` for modeling, `themis` for SMOTE, and `vip`, `pdp`, `iml`/`fastshap`, and `lime` for interpretability.
+
+# Packages
+
+```{r}
+# Core modeling
+library(tidymodels)     # rsample, recipes, parsnip, workflows, tune, yardstick
+library(tidyverse) 
+library(pROC)
+# Class imbalance
+library(themis)         # step_smote() and other sampling steps for recipes
+# Interpretability
+library(vip)            # variable importance + handy plots
+library(pdp)            # partial dependence
+library(ALEPlot)        # ALE for classical interface
+library(iml)            # model-agnostic interface (PDP/ALE/SHAP)
+library(fastshap)       # fast SHAP approximations
+library(lime)           # LIME local explanations
+# Misc
+library(ranger)         # Fast implementation of random forests
+library(kableExtra)
+kbl2 <- function(x, ...) kable(x, align = "lrrrrrr", ...) %>% kable_styling(full_width = FALSE)
+```
+
+# Data: Pima Indians Diabetes
+
+```{r}
+data(pima, package = "pdp")   # Pima Indians Diabetes data (with NAs), from the pdp package
+df <- pima %>%
+  as_tibble()
+
+glimpse(df)
+summary(df$diabetes)
+```
+
+**Outcome:** `diabetes` (factor: `"pos"` vs `"neg"`).  
+**Predictors:** 
+
+- **pregnant**:  Number of times pregnant                             
+
+- **glucose**:  Plasma glucose concentration (glucose tolerance test)
+
+- **pressure**:  Diastolic blood pressure (mm Hg)                     
+
+- **triceps**:  Triceps skin fold thickness (mm)                    
+
+- **insulin**:  2-Hour serum insulin (mu U/ml)                      
+
+- **mass**:  Body mass index                                      
+
+- **pedigree**:  Diabetes pedigree function                           
+
+- **age**:  Age (years)                                         
+
+- **diabetes**:  Class variable (test for diabetes)
+
+
+# Train/Test Split and Preprocessing
+
+```{r}
+set.seed(735)
+split <- initial_split(df, prop = 0.75, strata = diabetes)
+train <- training(split)
+test  <- testing(split)
+
+# Recipe: median imputation for numeric; mode for nominal; standardization
+rec <- recipe(diabetes ~ ., data = train) %>%
+  step_impute_median(all_numeric_predictors()) %>%
+  step_impute_mode(all_nominal_predictors()) %>%
+  step_normalize(all_numeric_predictors())
+
+prep_rec <- prep(rec)
+train_baked <- bake(prep_rec, new_data = train)
+test_baked  <- bake(prep_rec, new_data = test)
+
+```
+
+# Models
+
+We fit a **Random Forest** (primary ML model) with basic tuning and a **Logistic Regression** baseline.
+
+```{r}
+set.seed(735)
+
+# Random Forest (tuned mtry, trees fixed moderate)
+rf_spec <- rand_forest(mtry = tune(), trees = 1000, min_n = 5) %>%
+  set_engine("ranger", importance = "permutation", probability = TRUE) %>%
+  set_mode("classification")
+
+log_spec <- logistic_reg(penalty = 0, mixture = 1) %>%
+  set_engine("glm")
+
+wf_rf  <- workflow() %>% add_model(rf_spec)  %>% add_recipe(rec)
+wf_log <- workflow() %>% add_model(log_spec) %>% add_recipe(rec)
+
+# 5-fold CV
+set.seed(735)
+folds <- vfold_cv(train, v = 5, strata = diabetes)
+
+grid <- grid_regular(mtry(range = c(2L, ncol(train) - 1L)), levels = 5)
+
+rf_tuned <- tune_grid(
+  wf_rf,
+  resamples = folds,
+  grid = grid,
+  metrics = metric_set(roc_auc, pr_auc, accuracy, kap),
+  # "pos" is the second level of diabetes; this makes pr_auc about the pos class
+  control = control_grid(event_level = "second")
+)
+
+show_best(rf_tuned, metric = "roc_auc", n = 3)
+
+best_params <- select_best(rf_tuned, metric = "roc_auc")
+rf_final <- finalize_workflow(wf_rf, best_params)
+
+# Fit final models on training data
+fit_rf  <- fit(rf_final, data = train)
+fit_log <- fit(wf_log,  data = train)
+```
+
+# Performance on Test Set
+
+```{r}
+pred_rf  <- predict(fit_rf,  test, type = "prob") %>% bind_cols(predict(fit_rf,  test)) %>% bind_cols(test %>% select(diabetes))
+pred_log <- predict(fit_log, test, type = "prob") %>% bind_cols(predict(fit_log, test)) %>% bind_cols(test %>% select(diabetes))
+
+# ROC AUC / PR AUC / Accuracy
+# event_level = "second" means the event of interest is "pos" (the second level)
+roc_rf <- pred_rf  %>% roc_auc(truth = diabetes, .pred_pos, event_level = "second")
+metrics_rf  <-  roc_rf %>% 
+  bind_rows(pr_auc(pred_rf, truth = diabetes, .pred_pos, event_level = "second")) %>% 
+  bind_rows(accuracy(pred_rf, truth = diabetes, .pred_class)) %>% 
+  rename(RF_estimate = .estimate)
+roc_log <- pred_log %>% roc_auc(truth = diabetes, .pred_pos, event_level = "second")
+metrics_log <- roc_log %>% 
+  bind_rows(pr_auc(pred_log, truth = diabetes, .pred_pos, event_level = "second")) %>% 
+  bind_rows(accuracy(pred_log, truth = diabetes, .pred_class)) %>% 
+  rename(Logit_estimate = .estimate)
+
+metrics_rf %>% left_join(metrics_log) %>% kbl2(digits = 3)
+
+
+# Calibration 
+pred_rf_cal <- pred_rf %>% mutate(bin = ntile(.pred_pos, 10)) %>% group_by(bin) %>%
+  summarise(mean_pred = mean(.pred_pos), obs = mean(diabetes == "pos"), n = n())
+
+ggplot(pred_rf_cal, aes(x = mean_pred, y = obs)) +
+  geom_point() + geom_abline(slope = 1, intercept = 0, linetype = 2) +
+  labs(title = "Random Forest Calibration (Test)", x = "Mean predicted risk", y = "Observed fraction positive")
+
+# Calibration (optional, simple reliability plot)
+pred_log_cal <- pred_log %>% mutate(bin = ntile(.pred_pos, 10)) %>% group_by(bin) %>%
+  summarise(mean_pred = mean(.pred_pos), obs = mean(diabetes == "pos"), n = n())
+
+ggplot(pred_log_cal, aes(x = mean_pred, y = obs)) +
+  geom_point() + geom_abline(slope = 1, intercept = 0, linetype = 2) +
+  labs(title = "Logistic Regression Calibration (Test)", x = "Mean predicted risk", y = "Observed fraction positive")
+```
+
+## Precision–Recall Curves and PR-AUC
+
+The ROC curve plots sensitivity against 1 − specificity. Specificity is computed
+from the **negatives**, so when most people are negative, a model can make a lot of
+false positives and still have a small false positive rate. A precision–recall (PR)
+curve focuses on the **positive** class instead.
+
+Using the confusion matrix at a given threshold:
+
+- **Recall** $= \frac{TP}{TP + FN}$, which is the sensitivity: of the people with
+  diabetes, what fraction did we flag?
+- **Precision** $= \frac{TP}{TP + FP}$, which is the positive predictive value (PPV):
+  of the people we flagged, what fraction actually have diabetes?
+
+The PR curve plots precision against recall as the threshold moves from 1 down to 0,
+and **PR-AUC** is the area under it (also called *average precision*). Precision is
+often the number a public health program cares about: if we send everyone above the
+threshold to follow-up testing, precision is the share of those visits that find a
+case.
+
+```{r}
+#| fig-width: 9
+#| fig-height: 7
+#| out-width: "100%"
+pr_both <- bind_rows(
+  pr_curve(pred_rf,  truth = diabetes, .pred_pos, event_level = "second") %>% mutate(Model = "Random Forest"),
+  pr_curve(pred_log, truth = diabetes, .pred_pos, event_level = "second") %>% mutate(Model = "Logistic")
+)
+
+prevalence <- mean(test$diabetes == "pos")
+
+ggplot(pr_both, aes(x = recall, y = precision, color = Model)) +
+  geom_path(linewidth = 1) +
+  geom_hline(yintercept = prevalence, linetype = 2) +
+  annotate("text", x = 0.2, y = prevalence - 0.03,
+           label = paste0("No-skill baseline = prevalence = ", round(prevalence, 2))) +
+  coord_cartesian(ylim = c(0, 1)) +
+  labs(title = "Precision–Recall Curves (Test Set)", x = "Recall (sensitivity)", y = "Precision (PPV)") +
+  theme_minimal(base_size = 13)
+```
+
+**Reading the plot.** On the left (high threshold) we only flag the highest-risk
+people, so precision is high but recall is low. Moving right, we flag more people,
+catch more cases, and precision falls.
+
+**The baseline is different from ROC.** For ROC-AUC, a useless model scores 0.5. For
+PR-AUC, a useless model (random guessing) has precision equal to the **prevalence** at
+every recall, so its PR-AUC is about the prevalence (`r round(prevalence, 2)` here).
+Always report PR-AUC next to the prevalence.
+
+```{r}
+pr_tab <- tibble(
+  Model  = c("Random Forest", "Logistic", "No-skill baseline"),
+  PR_AUC = c(pr_auc_vec(pred_rf$diabetes,  pred_rf$.pred_pos,  event_level = "second"),
+             pr_auc_vec(pred_log$diabetes, pred_log$.pred_pos, event_level = "second"),
+             prevalence)
+) %>%
+  mutate(Times_baseline = PR_AUC / prevalence)
+
+pr_tab %>% kbl2(digits = 3, caption = "PR-AUC on the test set")
+```
+
+**What the PR-AUC is.** PR-AUC is the area under the PR curve. Since precision is on
+the y-axis and recall runs from 0 to 1 on the x-axis, the area is the **average
+precision over all levels of recall**. It summarizes the whole curve in one number,
+without picking a threshold.
+
+**Interpretation.** The random forest has PR-AUC = `r round(pr_tab$PR_AUC[1], 2)`.
+Averaged over all levels of recall, from a strict threshold that catches only a few
+of the cases to a loose one that catches nearly all of them, about
+`r round(100 * pr_tab$PR_AUC[1])`% of the women the model flags actually have
+diabetes. If we flagged women at random, only `r round(100 * prevalence)`% would
+(the prevalence). So the model's flags are about `r round(pr_tab$Times_baseline[1], 1)`
+times as precise as random flagging. Logistic regression is a little lower
+(`r round(pr_tab$PR_AUC[2], 2)`). That gap is small compared with the bootstrap
+standard errors below, so the two models are roughly equally good at finding cases.
+
+::: {.callout-important}
+**Tell yardstick which class is the event.** `diabetes` has levels `neg`, `pos`, and
+yardstick treats the *first* level as the event by default. ROC-AUC is the same either
+way, but PR-AUC is not:
+
+```{r}
+c(pos_is_event = pr_auc_vec(pred_rf$diabetes, pred_rf$.pred_pos, event_level = "second"),
+  neg_is_event = pr_auc_vec(pred_rf$diabetes, pred_rf$.pred_neg))
+```
+
+The second number answers "how well do we find people **without** diabetes?", which is
+not what we want, and it looks better because negatives are the majority. That's why
+we used `event_level = "second"` above (and `control_grid(event_level = "second")` in
+`tune_grid()`).
+:::
+
+### PR-AUC depends on prevalence
+
+To see why the baseline matters, keep the **same fitted random forest** and the same
+test-set predictions, but randomly drop positive cases so that the prevalence in the
+test set is 35%, 20%, 10%, or 5%. Repeat 200 times at each prevalence.
+
+```{r}
+set.seed(735)
+pos_idx <- which(pred_rf$diabetes == "pos")
+neg_idx <- which(pred_rf$diabetes == "neg")
+
+prev_demo <- map_dfr(c(0.35, 0.20, 0.10, 0.05), function(prev) {
+  n_pos <- round(prev / (1 - prev) * length(neg_idx))
+  map_dfr(1:200, function(r) {
+    d <- pred_rf[c(neg_idx, sample(pos_idx, n_pos)), ]
+    tibble(
+      Prevalence = prev,
+      ROC_AUC = roc_auc_vec(d$diabetes, d$.pred_pos, event_level = "second"),
+      PR_AUC  = pr_auc_vec(d$diabetes, d$.pred_pos, event_level = "second")
+    )
+  })
+}) %>%
+  group_by(Prevalence) %>%
+  summarise(ROC_AUC = mean(ROC_AUC), PR_AUC = mean(PR_AUC), .groups = "drop") %>%
+  arrange(desc(Prevalence))
+
+prev_demo %>% kbl2(digits = 3, caption = "Same model, different prevalence")
+```
+
+ROC-AUC barely changes because it only depends on how positives are ranked relative to
+negatives. PR-AUC drops a lot, because with fewer cases a larger share of the people we
+flag are false positives. Two consequences:
+
+- For a **rare outcome**, PR-AUC shows how hard the problem really is; a ROC-AUC of
+  0.87 can look reassuring even when most flagged people are false positives.
+- **Don't compare PR-AUC across data sets (or subgroups) with different prevalence**
+  without also reporting the prevalence of each.
+
+## Estimating predictive SE using boostrapping
+
+```{r}
+set.seed(123)   # for reproducibility
+nboot <- 1000   # number of bootstrap replicates
+n <- nrow(test)
+
+# Storage for results
+auc_log <- acc_log <- prauc_log <- numeric(nboot)
+auc_rf  <- acc_rf  <- prauc_rf  <- numeric(nboot)
+
+# Begin bootstrap
+for (b in 1:nboot) {
+  # Get boostrap sample
+  idx <- sample(1:n, size = n, replace = TRUE)
+  test_b <- test[idx, ]
+
+  # Logistic model predictions
+  prob_log <- predict(fit_log, test_b, type = "prob")$.pred_pos
+  pred_log <- factor(ifelse(prob_log > 0.5, "pos", "neg"),
+                     levels = c("neg", "pos"))
+
+  # Random Forest predictions
+  prob_rf <- predict(fit_rf, test_b, type = "prob")$.pred_pos
+  pred_rf <- factor(ifelse(prob_rf > 0.5, "pos", "neg"),
+                     levels = c("neg", "pos"))
+
+  # --- Logistic model metrics ---
+  auc_log[b] <- as.numeric(roc(test_b$diabetes, prob_log, quiet = TRUE)$auc)
+  acc_log[b] <- mean(pred_log == test_b$diabetes)
+  prauc_log[b] <- pr_auc_vec(test_b$diabetes, prob_log, event_level = "second")
+
+  # --- Random forest metrics ---
+  auc_rf[b]  <- as.numeric(roc(test_b$diabetes, prob_rf, quiet = TRUE)$auc)
+  acc_rf[b]  <- mean(pred_rf == test_b$diabetes)
+  prauc_rf[b]  <- pr_auc_vec(test_b$diabetes, prob_rf, event_level = "second")
+}
+
+# Summarize results
+summary_stats <- tibble(
+  Model = c("Logistic", "Random Forest"),
+  AUC_mean = c(mean(auc_log), mean(auc_rf)),
+  AUC_se   = c(sd(auc_log), sd(auc_rf)),
+  AUC_95CI_lower = c(quantile(auc_log, 0.025), quantile(auc_rf, 0.025)),
+  AUC_95CI_upper = c(quantile(auc_log, 0.975), quantile(auc_rf, 0.975)),
+  PRAUC_mean = c(mean(prauc_log), mean(prauc_rf)),
+  PRAUC_se   = c(sd(prauc_log), sd(prauc_rf)),
+  PRAUC_95CI_lower = c(quantile(prauc_log, 0.025), quantile(prauc_rf, 0.025)),
+  PRAUC_95CI_upper = c(quantile(prauc_log, 0.975), quantile(prauc_rf, 0.975)),
+  Acc_mean = c(mean(acc_log), mean(acc_rf)),
+  Acc_se   = c(sd(acc_log), sd(acc_rf)),
+  Acc_95CI_lower = c(quantile(acc_log, 0.025), quantile(acc_rf, 0.025)),
+  Acc_95CI_upper = c(quantile(acc_log, 0.975), quantile(acc_rf, 0.975))
+)
+
+summary_stats %>% kbl2(digits = 3)
+```
+
+
+# Class Imbalance and SMOTE
+
+About 35% of the Pima women have diabetes, so the outcome is moderately imbalanced.
+At the default 0.5 threshold, both models miss a lot of cases (look at the sensitivity
+below). We have already seen some ways to deal with this:
+
+- **Downsampling** the majority class or **upsampling** the minority class by copying
+  rows (Data Preprocessing notes).
+- **Weighting the loss function** so that a missed case costs more than a missed
+  non-case (Neural Networks II).
+- **Moving the threshold** away from 0.5 (Neural Networks II).
+
+**SMOTE** (*Synthetic Minority Over-sampling TEchnique*) is a more refined version of
+upsampling. Copying rows means a random forest sees the *exact same* person many
+times, which encourages it to memorize those people. SMOTE instead creates new,
+*synthetic* minority-class observations that are similar to, but not copies of, the
+real ones.
+
+## How SMOTE works
+
+For each new synthetic observation:
+
+1. Pick a minority-class observation $x_i$ (here, a woman with diabetes).
+2. Find its $k$ nearest neighbors **among the minority class** (default $k = 5$).
+3. Pick one of those neighbors, $x_{nn}$, at random.
+4. Create a new point on the line segment between them:
+   $$x_{new} = x_i + u\,(x_{nn} - x_i), \qquad u \sim \text{Uniform}(0, 1).$$
+
+Repeat until the classes are the desired size (by default, equal). Because SMOTE uses
+nearest neighbors, it needs **numeric, standardized predictors with no missing
+values**, so it goes *after* imputation and normalization.
+
+Here is SMOTE on a small sample, using only two predictors so we can see it:
+
+```{r}
+set.seed(735)
+toy <- train_baked %>%
+  select(glucose, mass, diabetes) %>%
+  slice_sample(n = 150)
+
+toy_smote <- themis::smote(toy, var = "diabetes", k = 5, over_ratio = 1)
+
+count(toy, diabetes)
+count(toy_smote, diabetes)
+
+# Synthetic rows are the ones that aren't in the original data
+toy_plot <- bind_rows(
+  toy %>% mutate(type = "original"),
+  anti_join(toy_smote, toy, by = c("glucose", "mass", "diabetes")) %>% mutate(type = "synthetic")
+)
+
+ggplot(toy_plot, aes(glucose, mass, color = diabetes, shape = type)) +
+  geom_point(size = 2, alpha = 0.8) +
+  scale_shape_manual(values = c(original = 16, synthetic = 4)) +
+  scale_color_manual(values = c(neg = "grey60", pos = "#E74C3C")) +
+  labs(title = "SMOTE: synthetic 'pos' points (x) fill in between real 'pos' points",
+       x = "glucose (standardized)", y = "mass (standardized)") +
+  theme_minimal(base_size = 13)
+```
+
+The synthetic points (×) all fall between real diabetic women, so SMOTE fills in the
+region where the minority class already lives. It doesn't create cases in new places.
+
+## SMOTE goes in the recipe (training data only)
+
+The most important rule: **only apply SMOTE to the training data.** The test set (and
+each CV assessment fold) must keep the real prevalence, or our performance estimates
+describe a population that doesn't exist. Putting `step_smote()` in the recipe takes
+care of this:
+
+- Inside `fit_resamples()` / `tune_grid()`, the recipe is re-prepped within each fold,
+  so SMOTE only uses that fold's analysis data.
+- `step_smote()` has `skip = TRUE`, so it is **not** applied when we `bake()` or
+  `predict()` on new data.
+
+```{r}
+rec_smote <- rec %>%
+  step_smote(diabetes, over_ratio = 1, neighbors = 5)   # make pos as common as neg
+
+# Training data after the recipe: balanced
+prep(rec_smote) %>% bake(new_data = NULL) %>% count(diabetes)
+
+# Test data after the recipe: unchanged
+prep(rec_smote) %>% bake(new_data = test) %>% count(diabetes)
+```
+
+::: {.callout-warning}
+Running SMOTE on the full data *before* splitting is a form of leakage: synthetic
+training points are built from people who end up in the test set, and the test set
+itself becomes 50% positive. Both make the results look better than they will be.
+:::
+
+## Comparing the options
+
+We compare six versions on the test set:
+
+- Logistic regression and random forest, as fit above.
+- Each with SMOTE added to the recipe (the random forest keeps the `mtry` chosen above).
+- Logistic regression with a **weighted loss**, using the same weights as in Neural
+  Networks II: each class gets weight proportional to $1/n_{class}$, scaled so the
+  weights average to about 1. In tidymodels this is done with *case weights*.
+
+```{r}
+# Weighted loss: same formula as class_weights in Neural Networks II
+class_wts <- train %>%
+  count(diabetes) %>%
+  mutate(wt = (1 / n) / sum(1 / n) * 2)
+class_wts
+
+train_w <- train %>%
+  left_join(class_wts %>% select(diabetes, wt), by = "diabetes") %>%
+  mutate(wt = importance_weights(wt))
+
+# The recipe has to be built on data that includes the weight column
+rec_w <- recipe(diabetes ~ ., data = train_w) %>%
+  step_impute_median(all_numeric_predictors()) %>%
+  step_impute_mode(all_nominal_predictors()) %>%
+  step_normalize(all_numeric_predictors())
+
+set.seed(735)
+fit_log_smote <- workflow() %>% add_model(log_spec) %>% add_recipe(rec_smote) %>% fit(data = train)
+fit_log_wt    <- workflow() %>% add_model(log_spec) %>% add_recipe(rec_w) %>%
+  add_case_weights(wt) %>% fit(data = train_w)
+fit_rf_smote  <- rf_final %>% update_recipe(rec_smote) %>% fit(data = train)
+```
+
+The last option, from Neural Networks II, is to keep the original (unweighted, no
+SMOTE) logistic model and **lower the threshold**. The threshold is a tuning parameter,
+so we choose it using cross-validated predictions on the training data (maximizing
+Youden's $J = \text{Sens} + \text{Spec} - 1$), not the test set.
+
+```{r}
+set.seed(735)
+cv_log <- fit_resamples(wf_log, resamples = folds,
+                        control = control_resamples(save_pred = TRUE, event_level = "second"))
+
+thr_youden <- collect_predictions(cv_log) %>%
+  roc_curve(truth = diabetes, .pred_pos, event_level = "second") %>%
+  mutate(J = sensitivity + specificity - 1) %>%
+  slice_max(J, n = 1, with_ties = FALSE) %>%
+  pull(.threshold)
+thr_youden
+```
+
+```{r}
+test_metrics <- function(fit, threshold = 0.5) {
+  p <- predict(fit, test, type = "prob")$.pred_pos
+  truth <- test$diabetes
+  cls <- factor(ifelse(p >= threshold, "pos", "neg"), levels = c("neg", "pos"))
+  tibble(
+    ROC_AUC   = roc_auc_vec(truth, p, event_level = "second"),
+    PR_AUC    = pr_auc_vec(truth, p, event_level = "second"),
+    Sens      = sens_vec(truth, cls, event_level = "second"),
+    Spec      = spec_vec(truth, cls, event_level = "second"),
+    Precision = precision_vec(truth, cls, event_level = "second"),
+    Mean_pred_risk = mean(p),
+    Obs_prevalence = mean(truth == "pos")
+  )
+}
+
+imb_results <- bind_rows(
+  test_metrics(fit_log)                    %>% mutate(Model = "Logistic", Threshold = "0.5"),
+  test_metrics(fit_log_smote)              %>% mutate(Model = "Logistic + SMOTE", Threshold = "0.5"),
+  test_metrics(fit_log_wt)                 %>% mutate(Model = "Logistic + weighted loss", Threshold = "0.5"),
+  test_metrics(fit_log, thr_youden)        %>% mutate(Model = "Logistic", Threshold = "Youden (CV)"),
+  test_metrics(fit_rf)                     %>% mutate(Model = "Random Forest", Threshold = "0.5"),
+  test_metrics(fit_rf_smote)               %>% mutate(Model = "Random Forest + SMOTE", Threshold = "0.5")
+) %>%
+  relocate(Model, Threshold)
+
+imb_results %>% kbl2(digits = 3, caption = "Handling imbalance (test set)")
+```
+
+**What to notice:**
+
+- **ROC-AUC and PR-AUC hardly change.** SMOTE and weighting don't make the model
+  better at *ranking* people by risk. They mostly shift the predicted probabilities up.
+- **At the 0.5 threshold, sensitivity goes up and specificity and precision go down.**
+  We catch more cases at the cost of more false positives.
+- **SMOTE and the weighted loss give nearly the same logistic model.** Both tell the
+  model to act as if cases are as common as non-cases. One does it by adding
+  synthetic rows, the other by up-weighting the real ones.
+- **Moving the threshold** on the original model gives the same kind of trade-off
+  without changing the training data at all. Here Youden's $J$ picked a low threshold
+  (`r round(thr_youden, 2)`), so it moves further toward sensitivity than SMOTE did.
+  Notice that its `Mean_pred_risk` is unchanged: the predicted risks are still the
+  original model's.
+
+## SMOTE distorts predicted risks
+
+Look at the `Mean_pred_risk` column: after SMOTE or weighting, the average predicted
+risk is well above the observed prevalence. The model was trained on data where
+50% of people have diabetes, so its probabilities describe that population, not ours.
+
+```{r}
+bind_rows(
+  predict(fit_log,       test, type = "prob") %>% mutate(Model = "Logistic"),
+  predict(fit_log_smote, test, type = "prob") %>% mutate(Model = "Logistic + SMOTE")
+) %>%
+  mutate(diabetes = rep(test$diabetes, 2)) %>%
+  group_by(Model) %>%
+  mutate(bin = ntile(.pred_pos, 5)) %>%
+  group_by(Model, bin) %>%
+  summarise(mean_pred = mean(.pred_pos), obs = mean(diabetes == "pos"), .groups = "drop") %>%
+  ggplot(aes(mean_pred, obs, color = Model)) +
+  geom_point(size = 2) + geom_line() +
+  geom_abline(slope = 1, intercept = 0, linetype = 2) +
+  coord_equal(xlim = c(0, 1), ylim = c(0, 1)) +
+  labs(title = "Calibration: SMOTE pushes predicted risk too high",
+       x = "Mean predicted risk", y = "Observed fraction positive") +
+  theme_minimal(base_size = 13)
+```
+
+The SMOTE curve sits below the diagonal: people are predicted to be at higher risk
+than they really are. If predictions will be reported to patients or used to estimate
+how many cases to expect, this matters. If they're only used to rank people or to
+make a yes/no decision at a tuned threshold, it matters less.
+
+::: {.callout-note}
+**When should you use SMOTE?** It is most useful when the outcome is **rare** (say,
+under 10%) and the model, at the default settings, almost never predicts the minority
+class. With a moderately imbalanced outcome like this one, the gains are small and
+moving the threshold does about as well. In any case:
+
+- Apply it to the **training data only** (put it in the recipe).
+- Judge it with **ROC-AUC, PR-AUC, and sensitivity/specificity**, not accuracy.
+- If you need **calibrated risks**, either skip it or recalibrate the predictions
+  afterwards.
+:::
+
+# Explainable AI
+
+## Variable Importance (Permutation)
+
+Permutation importance measures the drop in performance when a feature is permuted in the test set.
+
+```{r}
+# Extract underlying ranger fit and plot permutation importance
+rf_obj <- fit_rf %>% extract_fit_parsnip() %>% pluck("fit")
+vip::vip(rf_obj, num_features = 10) +
+  labs(title = "Permutation Variable Importance (RF)")
+```
+
+## Partial Dependence Plots (PDP)
+
+PDP for feature \(X_j\): \( PD_j(x_j) = \frac{1}{n}\sum_i \hat{f}(x_j, x_{i,-j}). \)
+
+```{r}
+# PDP for key features (example: glucose, mass)
+rf_fit <- extract_fit_parsnip(fit_rf)$fit
+
+pdp::partial(
+  object   = rf_fit,
+  pred.var = "glucose",
+  train    = bake(prep_rec, new_data = train) %>% select(-diabetes),
+  prob     = TRUE
+) %>% autoplot() + ggtitle("PDP: glucose")
+
+pdp::partial(
+  object   = rf_fit,
+  pred.var = "mass",
+  train    = bake(prep_rec, new_data = train) %>% select(-diabetes),
+  prob     = TRUE
+) %>% autoplot() + ggtitle("PDP: mass")
+```
+
+## Accumulated Local Effects (ALE)
+
+ALE is less sensitive than PDP to correlated predictors by aggregating **local** effects.
+
+```{r}
+# Extract the underlying ranger model
+rf_fit <- extract_fit_parsnip(fit_rf)$fit
+
+# Prepare model matrix and response
+train_baked <- bake(prep_rec, new_data = train)
+X <- as.data.frame(train_baked %>% select(-diabetes))
+y <- train_baked$diabetes
+
+# Define a simple wrapper returning predicted probabilities for the "pos" class
+ rf_predict <- function(X.model, newdata) {
+   predict(rf_fit, newdata, type = "response")$predictions[, "pos"]
+ }
+
+# Compute ALE for glucose
+ par(mfrow = c(1,2))
+ALE_glu = ALEPlot::ALEPlot(
+  X = X,
+  X.model = rf_fit,
+  pred.fun = rf_predict,
+  J = which(names(X) == "glucose"),
+  K = 30
+  )
+ALE_mass = ALEPlot::ALEPlot(
+  X = X,
+  X.model = rf_fit,
+  pred.fun = rf_predict,
+  J = which(names(X) == "mass"),
+  K = 30
+  )
+ par(mfrow = c(1,1))
+ALE_glumass = ALEPlot::ALEPlot(
+  X = X,
+  X.model = rf_fit,
+  pred.fun = rf_predict,
+  J = which(names(X) == "glucose" | names(X) == "mass"),
+  K = 30
+  )
+
+```
+
+## SHAP Values (Local + Global)
+
+SHAP decomposes a prediction into additive feature contributions relative to a baseline.
+
+```{r}
+X_test <- test_baked %>% select(-diabetes)
+
+set.seed(735)
+sh_values <- fastshap::explain(
+  object        = fit_rf,
+  feature_names = names(X_test),
+  X             = X_test[1:200, , drop = FALSE],
+  pred_wrapper  = rf_predict,
+  nsim          = 50
+)
+
+# Looking at local importance with SHAP values
+X_test[1:200, , drop = FALSE] %>% 
+  mutate(
+    pred = predict(rf_fit, X_test[1:200, , drop = FALSE], type = "response")$predictions[, "pos"]
+  ) %>% 
+  bind_cols(
+    as_tibble(sh_values[,1:3]) %>% rename_with(~paste0(.x,"_sh"))
+    ) %>% 
+  # See who has high predictions due to their glucose
+  arrange(-glucose_sh) %>% 
+  head() %>% 
+  kbl2(digits = 3) 
+
+
+
+# Compute global importance: mean(|SHAP|)
+shap_importance <- data.frame(
+  Variable = colnames(sh_values),
+  Importance = apply(abs(sh_values), 2, mean)
+)
+
+# Sort and visualize
+shap_importance <- shap_importance[order(-shap_importance$Importance), ]
+
+ggplot(shap_importance,
+       aes(x = reorder(Variable, Importance), y = Importance)) +
+  geom_col(fill = "#2C3E50") +
+  coord_flip() +
+  labs(title = "Global Importance (mean |SHAP|)",
+       x = NULL, y = "Mean |SHAP value|")
+```
+
+## LIME (Local Surrogates)
+
+LIME fits a simple surrogate model in the neighborhood of a single observation to explain a complex model’s prediction.
+
+```{r}
+# Create the explainer using the baked training predictors (as data.frame)
+X_train <- as.data.frame(bake(prep_rec, new_data = train) %>% select(-diabetes))
+
+explainer <- lime::lime(
+  x = X_train,
+  model = rf_fit,              # raw ranger model, not workflow
+  bin_continuous = TRUE,
+  n_bins = 4
+)
+
+explanations <- lime::explain(
+  X_test[1:4, , drop = FALSE],
+  explainer = explainer,
+  n_features = 5,
+  n_labels = 1
+)
+
+# Pick one test observation to explore
+i <- 3
+
+# Filter LIME results for that specific individual
+lime_i <- explanations %>%
+  filter(case == unique(case)[i]) %>%
+  arrange(desc(feature_weight))
+
+# Print numeric summary table
+lime_i %>%
+  select(feature, feature_value, feature_weight, feature_desc, model_r2,label, label_prob) %>%
+  kbl2(digits = 3)
+
+# Plot bar chart of contributions
+ggplot(lime_i, aes(x = reorder(feature, feature_weight),
+                   y = feature_weight,
+                   fill = feature_weight > 0)) +
+  geom_col(show.legend = FALSE) +
+  coord_flip() +
+  labs(
+    title = paste("LIME feature contributions for test observation", i),
+    subtitle = paste0("Predicted probability of diabetes: ",
+                      round(unique(lime_i$label_prob), 3),"\n Explanation R2: ", round(lime_i$model_r2[1],2)),
+    x = NULL,
+    y = "Local contribution to prediction"
+  ) +
+  scale_fill_manual(values = c("#2C3E50", "#E74C3C")) +
+  theme_minimal(base_size = 13)
+
+plot_features(explanations)
+tibble(X_test[1:4,], pred = rf_predict(rf_fit, test_baked[1:4,])) %>% kbl2(digits = 3)
+```
+
+# Reporting Tips
+
+- **For imbalanced outcomes,** report PR-AUC alongside the prevalence (its no-skill baseline), and say whether SMOTE, weighting, or a tuned threshold was used. Note that SMOTE and weighting change the predicted risks.
+
+- Document how you chose features to visualize (e.g., top-5 by permutation importance).
+
+- **Acknowledge assumptions/limitations:** PDP assumes weak dependence; ALE mitigates this but is still an approximation. LIME is *explanatory*, not causal — it shows which features the model relied on, not which features cause the outcome.
+
+- **Quantify uncertainty where possible:** re-run interpretability summaries over resamples to assess stability.
+
+- **Communicate clearly:** convert technical findings to public-health implications (modifiable risks, thresholds, nonlinearity).
+

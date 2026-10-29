@@ -642,17 +642,19 @@ PDP for feature \(X_j\): \( PD_j(x_j) = \frac{1}{n}\sum_i \hat{f}(x_j, x_{i,-j})
 rf_fit <- extract_fit_parsnip(fit_rf)$fit
 
 pdp::partial(
-  object   = rf_fit,
-  pred.var = "glucose",
-  train    = bake(prep_rec, new_data = train) %>% select(-diabetes),
-  prob     = TRUE
-) %>% autoplot() + ggtitle("PDP: glucose")
+  object      = rf_fit,
+  pred.var    = "glucose",
+  train       = bake(prep_rec, new_data = train) %>% select(-diabetes),
+  prob        = TRUE,
+  which.class = 2
+) %>% autoplot() + ggtitle("PDP: glucose (P(pos))")
 
 pdp::partial(
   object   = rf_fit,
   pred.var = "mass",
   train    = bake(prep_rec, new_data = train) %>% select(-diabetes),
-  prob     = TRUE
+  prob     = TRUE,
+  which.class = 2
 ) %>% autoplot() + ggtitle("PDP: mass")
 ```
 

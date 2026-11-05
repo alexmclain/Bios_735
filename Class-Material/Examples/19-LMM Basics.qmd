@@ -1,0 +1,897 @@
+---
+title: "19 - Large Language Models: The Basics"
+subtitle: "Biostatistics 735 — Machine Learning in Public Health"
+author: "Alexander McLain"
+date: today
+format:
+  html:
+    toc: true
+    toc-location: left
+    toc-depth: 3
+    number-sections: true
+    smooth-scroll: true
+    theme: cosmo
+    code-fold: false
+    highlight-style: github
+    embed-resources: true
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+
+```{r}
+#| include: false
+library(tidyverse)
+library(kableExtra)
+library(tidytext)    # splitting text into words and n-grams
+library(janeaustenr) # the text of Jane Austen's six novels
+library(Matrix)      # sparse matrices
+library(irlba)       # fast SVD for large sparse matrices
+library(ggrepel)     # labels that don't overlap
+library(yardstick)   # sensitivity, specificity, etc.
+
+kbl2 <- function(x, ...) kable(x, align = "lrrrrrr", ...) |> kable_styling(full_width = FALSE)
+theme_set(theme_minimal(base_size = 13))
+```
+
+
+These notes go with the *Large Language Models: The Basics* slides. We can't train an LLM in a class example (GPT-3 took months on thousands of GPUs). Instead, we build each piece in miniature with ordinary R code:
+
+1. a **language model** that predicts the next word by counting (an $n$-gram model),
+2. a **tokenizer** (byte-pair encoding),
+3. **word embeddings** from a word-by-word count matrix and an SVD,
+4. **attention**, computed by hand with small matrices,
+5. **temperature** and sampling, and
+6. **evaluating** an LLM used as a classifier.
+
+Our text throughout is Jane Austen's novels, from the `janeaustenr` package.
+
+
+# A language model is a classifier
+
+A language model gives the probability of the next word given the words before it. In other words, it is a classification model where the outcome is the next word and there are $K$ classes, one for every word in the vocabulary.
+
+
+## The data
+
+We'll start with *Pride and Prejudice*. `unnest_tokens()` splits text into words, makes everything lower case, and drops punctuation.
+
+```{r}
+pp_words <- tibble(text = paste(prideprejudice, collapse = " ")) |>
+  unnest_tokens(word, text) |>
+  pull(word)
+
+length(pp_words)          # number of words in the book
+length(unique(pp_words))  # size of the vocabulary, K
+head(pp_words, 20)
+```
+
+So the "classification problem" has about $K = 6{,}500$ classes.
+
+
+## A bigram model
+
+The simplest language model is the **bigram model**: the next word depends only on the previous word. The estimate is just counting:
+
+$$
+\hat{P}(w_t \mid w_{t-1}) = \frac{\#(w_{t-1}, w_t)}{\#(w_{t-1})}.
+$$
+
+This is the MLE of a multinomial distribution, one for each previous word.
+
+```{r}
+bigrams <- tibble(prev = head(pp_words, -1),   # word t-1
+                  nxt  = pp_words[-1]) |>       # word t
+  count(prev, nxt) |>
+  group_by(prev) |>
+  mutate(prob = n / sum(n)) |>
+  ungroup()
+
+# The k most likely next words after word w
+next_word <- function(w, k = 5) {
+  bigrams |> filter(prev == w) |> slice_max(prob, n = k, with_ties = FALSE)
+}
+
+next_word("miss")   |> kbl2(digits = 3)
+next_word("dear")   |> kbl2(digits = 3)
+```
+
+This is the same table as the "type 2 \_\_\_\_" example on the slides, just from a much smaller model.
+
+
+## The problems with counting
+
+How many of the possible word pairs did we actually see?
+
+```{r}
+K <- length(unique(pp_words))
+c(possible_pairs = K^2,
+  observed_pairs = nrow(bigrams),
+  percent_seen   = 100 * nrow(bigrams) / K^2)
+```
+
+Only about 0.1% of the possible pairs ever occur, so almost every estimated probability is zero. That is a problem when we use the model on new text. Let's take the fitted model to another Austen book, *Sense and Sensibility*, and check how many of its word pairs were never seen in *Pride and Prejudice*:
+
+```{r}
+ss_words <- tibble(text = paste(sensesensibility, collapse = " ")) |>
+  unnest_tokens(word, text) |>
+  pull(word)
+
+ss_pairs <- tibble(prev = head(ss_words, -1), nxt = ss_words[-1]) |>
+  left_join(bigrams, by = c("prev", "nxt"))
+
+mean(is.na(ss_pairs$prob))   # share of pairs with estimated probability 0
+```
+
+About 40% of the word pairs in the new book get probability zero, so the cross-entropy loss, $-\sum_t \log \hat{P}(w_t \mid w_{t-1})$, is infinite. The model is badly **overfit** to the training book. The model also has no idea that "happy" and "glad" are similar, and it ignores everything except the previous word. Neural language models fix these problems with embeddings (Section 3) and attention (Section 4).
+
+
+## Generating text
+
+To generate text we repeat four steps: get the next-word probabilities, sample a word, add it to the text, and repeat. This is exactly how an LLM writes, one token at a time.
+
+```{r}
+generate <- function(start, n_words = 15) {
+  out <- start
+  for (i in 1:n_words) {
+    choices <- bigrams |> filter(prev == tail(out, 1))
+    out <- c(out, sample(choices$nxt, size = 1, prob = choices$prob))
+  }
+  paste(out, collapse = " ")
+}
+
+set.seed(735)
+generate("elizabeth")
+generate("elizabeth")
+generate("elizabeth")
+```
+
+The same starting word gives a different answer each time, because the next word is **sampled**. Each pair of words looks reasonable, but the sentences make no sense, because the model only sees one word back. We return to sampling in Section 5.
+
+
+# Tokenization
+
+LLMs don't use whole words. They use **subword tokens**: common words are one token and rare words are split into pieces. Here are the three options for one sentence.
+
+```{r}
+sentence <- "The patient was diagnosed with hypercholesterolemia"
+
+# Characters
+strsplit(tolower(sentence), "")[[1]]
+
+# Words
+strsplit(tolower(sentence), " ")[[1]]
+```
+
+Characters give a tiny vocabulary but very long sequences. Words give short sequences but a huge vocabulary, and any word not seen in training (e.g., "COVID-19" in 2019) is unknown. Subwords are in between.
+
+
+## Byte-pair encoding (BPE) from scratch
+
+BPE (Sennrich et al., 2016) learns subword tokens from data:
+
+1. Start with each word split into single characters (plus an end-of-word marker, `_`).
+2. Count every pair of adjacent symbols, across all words.
+3. Merge the most frequent pair into one new symbol.
+4. Repeat steps 2--3 a set number of times.
+
+We'll use a tiny made-up corpus: the word "low" appears 5 times, "lower" 2 times, and so on.
+
+```{r}
+corpus <- c(low = 5, lower = 2, newest = 6, widest = 3)
+
+# Each word as a vector of symbols
+splits <- lapply(names(corpus), function(w) c(strsplit(w, "")[[1]], "_"))
+names(splits) <- names(corpus)
+splits$low
+splits$newest
+```
+
+Two small functions: one counts adjacent pairs (weighted by how often the word appears), and one merges a pair everywhere it occurs in a word.
+
+```{r}
+count_pairs <- function(splits, freq) {
+  map2_dfr(splits, freq, function(s, f)
+    tibble(left = head(s, -1), right = s[-1], n = f)) |>
+    count(left, right, wt = n, sort = TRUE)
+}
+
+merge_pair <- function(s, a, b) {
+  out <- character(0)
+  i <- 1
+  while (i <= length(s)) {
+    if (i < length(s) && s[i] == a && s[i + 1] == b) {
+      out <- c(out, paste0(a, b))   # merge the pair
+      i <- i + 2
+    } else {
+      out <- c(out, s[i])
+      i <- i + 1
+    }
+  }
+  out
+}
+
+count_pairs(splits, corpus) |> head(5) |> kbl2()
+```
+
+The most common pair is "e" followed by "s" (in "newest" and "widest": $6 + 3 = 9$ times), so that is the first merge. Now we run 8 merges.
+
+```{r}
+merges <- tibble(step = integer(), left = character(), right = character(), n = numeric())
+
+for (step in 1:8) {
+  top <- count_pairs(splits, corpus) |> slice(1)
+  merges <- bind_rows(merges, tibble(step = step, left = top$left,
+                                     right = top$right, n = top$n))
+  splits <- lapply(splits, merge_pair, a = top$left, b = top$right)
+}
+
+merges |> mutate(new_token = paste0(left, right)) |> kbl2()
+
+# How each word is tokenized now
+sapply(splits, paste, collapse = " | ")
+```
+
+The common word "newest" became a single token. Words share pieces like "est\_" and "low". To tokenize a new word, apply the learned merges in the same order:
+
+```{r}
+tokenize <- function(word, merges) {
+  s <- c(strsplit(word, "")[[1]], "_")
+  for (m in seq_len(nrow(merges))) s <- merge_pair(s, merges$left[m], merges$right[m])
+  s
+}
+
+tokenize("lowest", merges)   # never seen, but built from known pieces
+tokenize("slow", merges)
+```
+
+"lowest" never appeared in the corpus, but it is still tokenized using known pieces. Real tokenizers do the same thing with tens of thousands of merges learned from a huge amount of text. You can try GPT's tokenizer at <https://platform.openai.com/tokenizer>; notice how medical terms and non-English words get split into many tokens.
+
+
+## Tokens and cost
+
+A rule of thumb is that 1 token is about 3/4 of an English word. So *Pride and Prejudice* is roughly
+
+```{r}
+round(length(pp_words) / 0.75)
+```
+
+tokens. LLM prices and context-window limits are measured in tokens, so this is how you estimate the cost of a project (e.g., coding 50,000 survey responses).
+
+
+# Embeddings
+
+## One-hot encoding
+
+A one-hot vector for word $k$ is all zeros except a 1 in position $k$. Every pair of different words has cosine similarity 0, so "fever" is as far from "pyrexia" as from "bicycle".
+
+```{r}
+cosine <- function(a, b) sum(a * b) / sqrt(sum(a^2) * sum(b^2))
+
+one_hot <- diag(3)
+rownames(one_hot) <- c("fever", "pyrexia", "bicycle")
+one_hot
+
+cosine(one_hot["fever", ], one_hot["pyrexia", ])
+cosine(one_hot["fever", ], one_hot["bicycle", ])
+```
+
+An **embedding** replaces this with a short, dense vector, so that similar words have similar vectors. Here are the made-up numbers from the slides:
+
+```{r}
+emb_toy <- rbind(fever   = c(0.82, -0.11, 0.45, 0.30),
+                 pyrexia = c(0.79, -0.05, 0.41, 0.36),
+                 bicycle = c(-0.20, 0.91, -0.33, 0.02))
+
+cosine(emb_toy["fever", ], emb_toy["pyrexia", ])
+cosine(emb_toy["fever", ], emb_toy["bicycle", ])
+```
+
+
+## Building embeddings from Jane Austen
+
+Where do the numbers come from? The idea is that **words used in similar contexts have similar meanings**. We'll build embeddings in three steps:
+
+1. **Count** how often each pair of words appears within 4 words of each other (a $K \times K$ co-occurrence matrix).
+2. **Reweight** the counts so that we measure whether two words appear together *more than expected by chance* (positive pointwise mutual information, PPMI).
+3. **Reduce** the $K$-dimensional rows to $d = 100$ dimensions with an SVD, the same calculation as PCA.
+
+LLMs learn their embeddings differently (as the first layer of the network, trained to predict the next token), but the result is similar: a short vector per word.
+
+### Step 1: count co-occurrences
+
+We use all six novels and the 6,000 most common words.
+
+```{r}
+#| cache: true
+tok <- austen_books() |>
+  group_by(book) |>
+  summarise(text = paste(text, collapse = " ")) |>
+  unnest_tokens(word, text)
+
+vocab <- tok |> count(word, sort = TRUE) |> filter(n >= 10) |> slice_head(n = 6000)
+tok <- tok |> mutate(id = match(word, vocab$word))  # NA for rare words
+V <- nrow(vocab)
+
+# All pairs of words that are 1, 2, 3, or 4 words apart (within a book)
+pairs <- map_dfr(1:4, function(k)
+  tok |> group_by(book) |> transmute(a = id, b = lead(id, k)) |> ungroup()) |>
+  filter(!is.na(a), !is.na(b))
+
+# Co-occurrence matrix (symmetric). sparseMatrix adds up repeated (i, j) pairs.
+C <- sparseMatrix(i = c(pairs$a, pairs$b), j = c(pairs$b, pairs$a), x = 1, dims = c(V, V))
+dimnames(C) <- list(vocab$word, vocab$word)
+
+C[c("sister", "brother", "letter"), c("dear", "my", "her", "write", "read")]
+```
+
+### Step 2: reweight with PPMI
+
+Common words like "the" and "her" co-occur with everything, so raw counts mostly measure how common a word is. Pointwise mutual information compares the observed co-occurrence with what we'd expect if the two words were independent:
+
+$$
+\text{PMI}(a, b) = \log \frac{P(a, b)}{P(a)\,P(b)}.
+$$
+
+PMI $> 0$ means the words appear together more than by chance. We set negative values to 0 (that's the "positive" in PPMI). Raising the column totals to the power 0.75 is a standard adjustment (Levy et al., 2015) that keeps very rare words from getting huge PMI values.
+
+```{r}
+#| cache: true
+tot <- sum(C)
+p_a <- rowSums(C) / tot
+p_b <- colSums(C)^0.75
+p_b <- p_b / sum(p_b)
+
+S <- summary(C)   # the non-zero entries: row i, column j, count x
+pmi <- log((S$x / tot) / (p_a[S$i] * p_b[S$j]))
+P <- sparseMatrix(i = S$i, j = S$j, x = pmax(pmi, 0), dims = c(V, V))
+
+set.seed(98302)
+rand_words <- sort(sample(1:nrow(P),5))
+colnames(C)[rand_words]
+P[rand_words,rand_words]
+```
+
+The diagonal of `P` is a "self-association" score. It is 0 for words that repeat no more often than chance (most common words like "the" and "her", whose negative PMI gets cut to 0). It is large for words that really do come in bursts ("ha", "no", "very", exclamations, and some names in dialogue). Note that the diagonal is inflated by a factor of 2 (on the log scale) relative to the off-diagonal. 
+
+
+
+
+### Step 3: reduce with an SVD
+
+`irlba()` computes the first 100 singular vectors of the sparse $4{,}000 \times 4{,}000$ matrix. Each word's embedding is its row of $\mathbf{U}\mathbf{D}^{1/2}$. Finally, we scale every embedding to length 1, so the cosine similarity is just a dot product.
+
+```{r}
+#| cache: true
+set.seed(1)
+sv <- irlba(P, nv = 100)
+E <- sv$u %*% diag(sqrt(sv$d))
+rownames(E) <- vocab$word
+E <- E / sqrt(rowSums(E^2))
+
+dim(E)          # 4,000 words, each a vector of length 100
+E["sister", 1:8]
+sum(E["sister",]^2)
+```
+
+`E["sister",]` is the 100 number summary of `P["sister",]` the PPMI between "sister" and every word in the vocabulary.
+
+SVD is similar to PCA. From the SVD, $\mathbf{P}\mathbf{V} = \mathbf{U}\mathbf{D}$ However, there are two differences:
+
+- **The power on D.** PCA scores use $\mathbf{U}\mathbf{D}$. Here we use $\mathbf{U}\mathbf{D}^{1/2}$, which splits $\mathbf{D}$ evenly between words and contexts: $\mathbf{P} \approx (\mathbf{U}\mathbf{D}^{1/2})(\mathbf{V}\mathbf{D}^{1/2})^\top$. The dot product of a word's embedding with a context word's vector then approximates their PPMI. Levy, Goldberg & Dagan (2015) found that downweighting $\mathbf{D}$ like this usually gives better word similarities.
+- **No centering.** `P` is not centered before the SVD, unlike `prcomp.`
+
+The SVD splits P into a product of two matrices, one with a row per word and one with a row per context word. Each entry of P is then a dot product of one row from each.
+
+**The algebra.** Write out a single entry of the rank-100 approximation of the PPMI:
+
+$$
+P_{ab} \approx \sum_{k=1}^{100} u_{ak}, d_k, v_{bk}.
+$$
+
+Split each $d_k$ into $\sqrt{d_k}\cdot\sqrt{d_k}$ and give one half to each side:
+
+$$
+P_{ab} \approx \sum_{k=1}^{100} \left(\sqrt{d_k},u_{ak}\right)\left(\sqrt{d_k},v_{bk}\right) = \mathbf{w}_a^\top \mathbf{c}_b,
+$$
+
+where
+
+- $\mathbf{w}_a$ = row $a$ of $\mathbf{U}\mathbf{D}^{1/2}$, the word vector for $a$ (our raw embedding), and
+- $\mathbf{c}_b$ = row $b$ of $\mathbf{V}\mathbf{D}^{1/2}$, the context vector for $b$.
+
+```{r}
+W  <- sv$u %*% diag(sqrt(sv$d))   # word vectors (before scaling to length 1)
+Cv <- sv$v %*% diag(sqrt(sv$d))   # context vectors
+rownames(W) <- rownames(Cv) <- vocab$word
+
+pick <- c("sister", "letter", "morning")
+ctx  <- c("dear", "my", "write", "read", "evening")
+
+round(W[pick, ] %*% t(Cv[ctx, ]), 2)                          # dot products
+round(as.matrix(P[match(pick, vocab$word), match(ctx, vocab$word)]), 2)  # PPMI
+```
+
+## Nearest neighbors
+
+Since every row of `E` has length 1, `E %*% E[w, ]` gives the cosine similarity between word `w` and every other word.
+
+```{r}
+nearest <- function(w, k = 5) {
+  s <- drop(E %*% E[w, ])
+  s <- sort(s, decreasing = TRUE)[-1]   # drop the word itself
+  tibble(word = w, neighbor = names(s)[1:k], cosine = s[1:k])
+}
+
+map_dfr(c("sister", "morning", "letter", "happy"), nearest, k = 4) |>
+  kbl2(digits = 2)
+```
+
+Nobody told the method that "sister" and "brother" are both family members. It learned that from how the words are used.
+
+**Try it:** look up some other words, e.g. `nearest("ball")`, `nearest("walk")`, or `nearest("rich")`. Which neighbors make sense? Which are odd, and why might that be in Austen's writing?
+
+
+## Plotting the embeddings
+
+We can't plot 100 dimensions, so we use PCA (on a few groups of words) to get two dimensions, as on the slides.
+
+```{r}
+#| fig-width: 8
+#| fig-height: 7
+groups <- list(
+  Family   = c("sister", "brother", "mother", "father", "aunt", "uncle", "daughter", "cousin"),
+  Time     = c("morning", "evening", "night", "day", "week", "tomorrow", "hour", "year"),
+  Places   = c("house", "room", "park", "garden", "church", "village", "town", "parlour"),
+  Writing  = c("letter", "note", "read", "write", "written", "book", "wrote", "pen"),
+  Feelings = c("happy", "glad", "pleased", "sorry", "delighted", "unhappy", "afraid", "angry")
+)
+sel <- enframe(groups, "group", "word") |> unnest(word)
+
+pc <- prcomp(E[sel$word, ])
+sel <- sel |> mutate(PC1 = pc$x[, 1], PC2 = pc$x[, 2])
+
+ggplot(sel, aes(PC1, PC2, color = group, label = word)) +
+  geom_point(size = 2.5) +
+  geom_text_repel(size = 4.5, show.legend = FALSE, seed = 1) +
+  scale_color_brewer(palette = "Dark2") +
+  labs(color = NULL, title = "Word embeddings from Jane Austen's novels",
+       subtitle = "100-dimensional embeddings, first two principal components") +
+  theme(legend.position = "bottom")
+```
+
+The groups mostly separate, even though only two of the 100 dimensions are shown.
+
+
+## Embeddings as features
+
+Once each word is a vector, we can make a vector for a whole document, for example by averaging the embeddings of its words. Then the methods we already know (penalized regression, random forests, clustering) can use the document vectors as features. We'll do this with real public health text in the NLP applications notes.
+
+Here is a quick example: one vector per **chapter** (the average of its word embeddings, leaving out stop words like "the" and "of"), followed by PCA.
+
+```{r}
+#| fig-width: 8
+#| fig-height: 6
+chapters <- austen_books() |>
+  group_by(book) |>
+  mutate(chapter = cumsum(str_detect(text, regex("^chapter [\\divxlc]+", ignore_case = TRUE)))) |>
+  ungroup() |>
+  filter(chapter > 0) |>
+  unnest_tokens(word, text) |>
+  anti_join(stop_words, by = "word") |>
+  filter(word %in% rownames(E))
+
+chapter_emb <- chapters |>
+  group_by(book, chapter) |>
+  group_modify(~ as_tibble(t(colMeans(E[.x$word, , drop = FALSE])))) |>
+  ungroup()
+
+pc_ch <- prcomp(chapter_emb |> select(-book, -chapter))
+chapter_emb |>
+  mutate(PC1 = pc_ch$x[, 1], PC2 = pc_ch$x[, 2]) |>
+  ggplot(aes(PC1, PC2, color = book)) +
+  geom_point(alpha = 0.7) +
+  labs(title = "One embedding per chapter, first two principal components", color = NULL)
+```
+
+Chapters from the same book tend to sit together, mostly because each book has its own characters and places. With clinical notes, the same steps give one vector per note that can be fed into a classifier.
+
+
+## The problem: one vector per word
+
+Our embeddings give "cold" the same vector in "the patient has a cold" and "the patient's hands are cold". To fix this, each word's vector needs to depend on the words around it. That is what attention does.
+
+
+# Attention
+
+## Attention by hand
+
+We'll compute one attention layer (Vaswani et al., 2017) for the 4-token phrase "no fever or cough". In a real model, the embeddings and the weight matrices $\mathbf{W}_Q, \mathbf{W}_K, \mathbf{W}_V$ are learned during training, and their numbers are hard to interpret. Here we **build them by hand** so that we can see what each step does.
+
+Each token gets a $d = 4$ dimensional embedding, and we give each dimension a meaning: is the word a negation, a symptom, a conjunction, or a respiratory term?
+
+```{r}
+features <- c("negation", "symptom", "conjunction", "respiratory")
+d <- 4
+
+X <- rbind(no    = c(1, 0, 0, 0),
+           fever = c(0, 1, 0, 0),
+           or    = c(0, 0, 1, 0),
+           cough = c(0, 1, 0, 1))
+colnames(X) <- features
+tokens <- rownames(X)
+X
+```
+
+We want an attention head that does one job: **a symptom looks for a negation word**. We set up the weights so that
+
+* a symptom's **query** says "I am looking for a negation" (the symptom feature is sent to the first query dimension),
+* a negation word's **key** says "I am a negation" (the negation feature is sent to the first key dimension), and
+* each token's **value** is just its own features ($\mathbf{W}_V$ is the identity matrix).
+
+We store the token vectors as **rows** of $\mathbf{X}$, so the queries for all tokens at once are $\mathbf{Q} = \mathbf{X}\mathbf{W}_Q$. (The slides write $\mathbf{q}_i = \mathbf{W}_Q \mathbf{x}_i$ for a single column vector; it's the same calculation.)
+
+```{r}
+W_Q <- matrix(0, d, d, dimnames = list(features, NULL))
+W_Q["symptom", 1] <- 3       # symptoms ask: "is there a negation?"
+
+W_K <- matrix(0, d, d, dimnames = list(features, NULL))
+W_K["negation", 1] <- 3      # negation words answer: "I am a negation"
+
+W_V <- diag(d)
+dimnames(W_V) <- list(features, features)
+
+Q <- X %*% W_Q   # queries: "what am I looking for?"
+K <- X %*% W_K   # keys:    "what do I contain?"
+V <- X %*% W_V   # values:  "what do I pass on?"
+Q
+K
+```
+
+Only "fever" and "cough" have a non-zero query, and only "no" has a non-zero key.
+
+**Step 1: scores.** How well does each query match each key? Entry $(i, j)$ is $\mathbf{q}_i^\top \mathbf{k}_j / \sqrt{d}$.
+
+```{r}
+scores <- Q %*% t(K) / sqrt(d)
+dimnames(scores) <- list(tokens, tokens)
+round(scores, 2)
+```
+
+The only non-zero scores are a symptom's query matched with the key of "no": $3 \times 3 / \sqrt{4} = 4.5$.
+
+**Step 2: causal mask.** When generating text, a token may only look at itself and earlier tokens. Setting the future scores to $-\infty$ makes their weights exactly 0 after the softmax.
+
+```{r}
+scores[upper.tri(scores)] <- -Inf
+round(scores, 2)
+```
+
+**Step 3: softmax of each row.** This is the same softmax as the output layer of a neural network for classification. Each row now sums to 1.
+
+```{r}
+softmax <- function(z) exp(z) / sum(exp(z))
+
+A <- t(apply(scores, 1, softmax))   # apply() returns columns, so transpose back
+round(A, 2)
+rowSums(A)
+```
+
+**Step 4: weighted average of the values.** The new vector for each token is $\mathbf{h}_i = \sum_j a_{ij}\mathbf{v}_j$, or $\mathbf{H} = \mathbf{A}\mathbf{V}$ for all tokens at once.
+
+```{r}
+H <- A %*% V
+round(H, 2)
+```
+
+`A` tells us *how much* each token borrows from the others; `H` is *what it gets*. To see this, compare `H` with the value vectors:
+
+```{r}
+round(V, 2)
+
+# The new vector for "fever" is a weighted average of two value vectors
+A["fever", "no"] * V["no", ] + A["fever", "fever"] * V["fever", ]
+H["fever", ]
+```
+
+Reading the rows of `A`:
+
+* **"no"** is the first word, so it can only look at itself: `H["no", ]` is just `V["no", ]`.
+* **"fever"** puts weight `r round(A["fever", "no"], 2)` on "no", so its new vector is almost entirely the value of "no". In `H`, the negation column for "fever" is now `r round(H["fever", "negation"], 2)`.
+* **"or"** is not a symptom, so its query is all zeros and every score in its row is 0. With no preference, the softmax gives equal weights (1/3 each), and its new vector is a plain average of "no", "fever", and "or".
+* **"cough"** also looks back to "no" (weight `r round(A["cough", "no"], 2)`), even though "fever" and "or" are in between. Its negation column in `H` is `r round(H["cough", "negation"], 2)`.
+
+So the head has done what we built it to do: both symptoms now carry the information that they were negated.
+
+There is one problem: "cough" took almost all of its new vector from "no", so `H` has nearly lost the fact that "cough" is a respiratory symptom. Transformers fix this with the **"add"** step on the slides (a *residual connection*): the output of attention is added to the original embedding, $\mathbf{X} + \mathbf{H}$.
+
+```{r}
+round(X + H, 2)
+```
+
+Now "cough" is roughly (negation, symptom, respiratory): a **negated respiratory symptom**. This is a contextual embedding: the vector for "cough" depends on the words before it. Without "no" in front, the negation column for "cough" would stay at 0.
+
+In a trained model, nobody chooses these weights. They are learned from data, a single head usually mixes several jobs, and the dimensions don't have names like "negation". But the calculation is exactly the one above.
+
+Put together, the whole layer is one line of matrix algebra:
+
+$$
+\text{Attention}(\mathbf{Q}, \mathbf{K}, \mathbf{V}) = \text{softmax}\!\left(\mathbf{Q}\mathbf{K}^\top/\sqrt{d}\right)\mathbf{V}.
+$$
+
+```{r}
+attention <- function(X, W_Q, W_K, W_V, causal = TRUE) {
+  Q <- X %*% W_Q; K <- X %*% W_K; V <- X %*% W_V
+  scores <- Q %*% t(K) / sqrt(ncol(K))
+  if (causal) scores[upper.tri(scores)] <- -Inf
+  A <- t(apply(scores, 1, softmax))
+  A %*% V
+}
+
+all.equal(attention(X, W_Q, W_K, W_V), H)
+```
+
+
+## Attention is a weighted average
+
+Attention is a lot like a kernel smoother or $K$-nearest neighbors: each token's new value is a weighted average of the others, and the weights come from similarity ($\mathbf{q}_i^\top\mathbf{k}_j$). The difference is that the similarity is **learned**.
+
+Below are the illustrative weights from the slides for "The nurse gave the patient her medication because she was in pain." These are made-up numbers chosen to show what a trained attention head might do, not output from a real model.
+
+```{r}
+#| fig-width: 8.5
+#| fig-height: 7
+words <- c("The", "nurse", "gave", "the", "patient", "her", "medication",
+           "because", "she", "was", "in", "pain")
+n <- length(words)
+
+score <- matrix(0, n, n)
+score[cbind(2:n, 1:(n - 1))] <- 1          # look at the previous word
+score[, 1] <- 1.5                           # spare weight goes to the first token
+score[6, 2] <- 3                            # her -> nurse
+score[7, c(3, 6)] <- c(1.5, 2)              # medication -> gave, her
+score[9, c(2, 5)] <- c(2.2, 3.4)            # she -> nurse, patient
+score[12, c(9, 5)] <- c(2.5, 1.5)           # pain -> she, patient
+score[upper.tri(score)] <- -Inf             # causal mask
+A_she <- t(apply(score, 1, softmax))
+
+expand_grid(i = 1:n, j = 1:n) |>
+  mutate(a = A_she[cbind(i, j)], masked = j > i) |>
+  ggplot(aes(j, n + 1 - i)) +
+  geom_tile(aes(fill = ifelse(masked, NA, a)), color = "white") +
+  geom_text(aes(label = ifelse(!masked & a >= 0.1, sprintf("%.2f", a), "")), size = 3.2) +
+  scale_fill_gradient(low = "white", high = "firebrick", na.value = "grey85", limits = c(0, 1)) +
+  scale_x_continuous(breaks = 1:n, labels = words, expand = c(0, 0)) +
+  scale_y_continuous(breaks = n:1, labels = words, expand = c(0, 0)) +
+  labs(x = "Key (word being looked at)", y = "Query (word being updated)", fill = "Weight",
+       caption = "Grey = masked (future words). Illustrative weights.") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), panel.grid = element_blank())
+```
+
+The row for "she" puts most of its weight on "patient", some on "nurse", and a little on everything else.
+
+What about words like "gave" or "patient", which have nothing in particular to look up? Each row has to sum to 1, so their weight must go *somewhere*. One option is the word itself, but that adds little, because the "add" step (the residual connection, $\mathbf{X} + \mathbf{H}$) already keeps each word's own vector. Studies of trained models find that heads with nothing to do often put their spare weight on the **first token** (or on punctuation and special tokens), which acts like a "no-op" (Clark et al., 2019; Xiao et al., 2024). This is called an **attention sink**, and it is why the first column of the plot is dark. Our made-up scores have three parts: a few specific links ("she" $\to$ "patient", "her" $\to$ "nurse", ...), a small score for the previous word, and a default score for the first token.
+
+Notice also that the first few rows are forced by the causal mask: "The" can only look at itself (weight 1), and "nurse" can only choose between "The" and itself.
+
+
+## Why we need positions
+
+Attention by itself doesn't know the order of the words. To see this, turn off the causal mask, shuffle the tokens, and run attention again. The outputs are the same vectors, just shuffled.
+
+```{r}
+shuffle <- c(4, 2, 3, 1)   # "cough fever or no"
+H_full     <- attention(X, W_Q, W_K, W_V, causal = FALSE)
+H_shuffled <- attention(X[shuffle, ], W_Q, W_K, W_V, causal = FALSE)
+
+all.equal(H_shuffled, H_full[shuffle, ])
+```
+
+So "dog bites man" and "man bites dog" would look the same. The fix is to add a vector that depends on each token's **position** to its embedding before attention. Now shuffling changes the result:
+
+```{r}
+set.seed(4)
+pos <- matrix(rnorm(4 * d, sd = 0.5), nrow = 4)   # one vector per position 1, 2, 3, 4
+
+H_pos          <- attention(X + pos, W_Q, W_K, W_V, causal = FALSE)
+H_pos_shuffled <- attention(X[shuffle, ] + pos, W_Q, W_K, W_V, causal = FALSE)
+
+isTRUE(all.equal(H_pos_shuffled, H_pos[shuffle, ]))
+```
+
+
+## Multi-head attention
+
+A **multi-head** layer runs several attention operations side by side, each with its own weight matrices, and joins the results. Each head can learn a different kind of relationship (the previous word, pronouns, negation, ...).
+
+```{r}
+set.seed(3)
+head1 <- attention(X, matrix(rnorm(16), 4), matrix(rnorm(16), 4), matrix(rnorm(16), 4))
+head2 <- attention(X, matrix(rnorm(16), 4), matrix(rnorm(16), 4), matrix(rnorm(16), 4))
+
+multi <- cbind(head1, head2)   # in a real model, this is multiplied by one more weight matrix
+dim(multi)
+```
+
+A Transformer block is this multi-head attention followed by a small feed-forward neural network (like the ones we fit with `torch`), applied to each token. GPT-3 stacks 96 of these blocks, each with 96 heads.
+
+
+# From scores to the next token
+
+## Temperature
+
+At the end of the network, the model produces a score $z_k$ for every token in the vocabulary, and a softmax turns the scores into probabilities. **Temperature** $\tau$ divides the scores before the softmax:
+
+$$
+p_k(\tau) = \frac{\exp(z_k/\tau)}{\sum_j \exp(z_j/\tau)}.
+$$
+
+Here are illustrative scores for the next token after "Common symptoms of influenza are".
+
+```{r}
+next_tokens <- c("fever", "cough", "body", "headache", "sore", "chills", "fatigue", "nausea")
+z <- c(3.0, 2.4, 1.6, 1.4, 1.0, 0.8, 0.6, -0.5)
+
+softmax_temp <- function(z, tau) softmax(z / tau)
+
+temp_tab <- tibble(token = next_tokens,
+                   `tau = 0.3` = softmax_temp(z, 0.3),
+                   `tau = 1`   = softmax_temp(z, 1),
+                   `tau = 2`   = softmax_temp(z, 2))
+temp_tab |> kbl2(digits = 3)
+```
+
+A low temperature puts almost all the probability on "fever"; a high temperature spreads it out. We can see this by sampling 15 next tokens at each temperature:
+
+```{r}
+set.seed(735)
+for (tau in c(0.3, 1, 2)) {
+  draws <- sample(next_tokens, 15, replace = TRUE, prob = softmax_temp(z, tau))
+  cat("tau =", tau, ":", paste(draws, collapse = ", "), "\n\n")
+}
+```
+
+As $\tau \to 0$, sampling becomes "always pick the most likely token" (greedy). For research use, a low temperature makes results more repeatable, and you should report the setting you used.
+
+
+## Top-$p$ sampling
+
+**Top-$p$** (or "nucleus") sampling keeps only the most likely tokens whose probabilities add up to at least $p$, and samples from those.
+
+```{r}
+top_p <- function(prob, p = 0.9) {
+  o <- order(prob, decreasing = TRUE)
+  keep <- o[seq_len(which(cumsum(prob[o]) >= p)[1])]
+  out <- rep(0, length(prob))
+  out[keep] <- prob[keep] / sum(prob[keep])   # renormalize
+  out
+}
+
+p1 <- softmax_temp(z, 1)
+tibble(token = next_tokens, original = p1, `top-p (p = 0.8)` = top_p(p1, 0.8)) |>
+  kbl2(digits = 3)
+```
+
+The unlikely tokens ("chills", "fatigue", "nausea") can no longer be chosen.
+
+
+## Greedy generation can get stuck
+
+Let's go back to our bigram model and always pick the most likely next word (temperature $\to 0$):
+
+```{r}
+generate_greedy <- function(start, n_words = 15) {
+  out <- start
+  for (i in 1:n_words) {
+    choices <- bigrams |> filter(prev == tail(out, 1))
+    out <- c(out, choices$nxt[which.max(choices$prob)])
+  }
+  paste(out, collapse = " ")
+}
+
+generate_greedy("elizabeth")
+```
+
+Greedy generation quickly falls into a loop. Real LLMs see far more context than one word, so this happens much less, but it is one reason chat models use some randomness by default.
+
+
+# Evaluating an LLM as a classifier
+
+When an LLM labels data for a study (e.g., "is this ED triage note fall-related?"), it is a **measurement instrument**, and we evaluate it like any other classifier: compare its labels with expert labels on a random sample.
+
+The data below are **simulated** to show the steps. We pretend that 600 triage notes were labeled by an expert (the gold standard) and by an LLM, and that about a third of the notes were written in Spanish. In our simulation the LLM is less sensitive on the Spanish notes.
+
+```{r}
+set.seed(735)
+n_notes <- 600
+notes <- tibble(
+  id       = 1:n_notes,
+  language = sample(c("English", "Spanish"), n_notes, replace = TRUE, prob = c(2, 1)),
+  truth    = rbinom(n_notes, 1, 0.2)
+) |>
+  mutate(
+    sens = ifelse(language == "English", 0.92, 0.75),   # P(LLM says yes | fall)
+    spec = 0.95,                                        # P(LLM says no | no fall)
+    llm  = ifelse(truth == 1, rbinom(n(), 1, sens), rbinom(n(), 1, 1 - spec)),
+    truth = factor(truth, levels = c(1, 0), labels = c("fall", "no fall")),
+    llm   = factor(llm,   levels = c(1, 0), labels = c("fall", "no fall"))
+  )
+
+conf_mat(notes, truth = truth, estimate = llm)
+```
+
+Overall and by subgroup:
+
+```{r}
+llm_metrics <- metric_set(sens, spec, ppv, f_meas)
+
+bind_rows(
+  notes |> llm_metrics(truth = truth, estimate = llm) |> mutate(group = "All notes"),
+  notes |> group_by(language) |> llm_metrics(truth = truth, estimate = llm) |>
+    rename(group = language)
+) |>
+  select(group, .metric, .estimate) |>
+  pivot_wider(names_from = .metric, values_from = .estimate) |>
+  kbl2(digits = 2)
+```
+
+The overall numbers look good, but the LLM misses almost a quarter of the falls in the Spanish notes. Without checking by subgroup we would not see this.
+
+**Measurement error biases downstream estimates.** Suppose the goal is to estimate the share of ED visits that are falls. Using the LLM labels in place of the truth gives
+
+```{r}
+notes |>
+  group_by(language) |>
+  summarise(true_prevalence = mean(truth == "fall"),
+            llm_prevalence  = mean(llm == "fall")) |>
+  kbl2(digits = 3)
+```
+
+The error is different in the two groups, so a comparison of fall rates between English- and Spanish-speaking patients would be biased.
+
+**Stability.** If the temperature is above 0, running the same prompt twice can give different labels. A simple check is to run the LLM twice and measure agreement. Here we simulate a second run that disagrees with the first on about 4% of notes:
+
+```{r}
+notes <- notes |>
+  mutate(flip = rbinom(n(), 1, 0.04),
+         llm_run2 = if_else(flip == 1,
+                            if_else(llm == "fall", "no fall", "fall"),
+                            as.character(llm)),
+         llm_run2 = factor(llm_run2, levels = c("fall", "no fall")))
+
+mean(notes$llm == notes$llm_run2)                    # proportion of notes with the same label
+kap(notes, truth = llm, estimate = llm_run2)         # Cohen's kappa
+```
+
+
+# Summary
+
+* A language model is a classifier for the **next token**. A bigram model does this by counting, which fails because most word pairs are never seen and it uses only one word of context.
+* **Tokenizers** like BPE split text into subword pieces learned from data.
+* **Embeddings** are a form of dimension reduction: similar words get similar vectors. We built them with counts, PPMI, and an SVD.
+* **Attention** turns each token's vector into a weighted average of the other tokens' vectors, with weights from a softmax. It needs **positional** information to know word order.
+* **Temperature** and top-$p$ control how random the generated text is.
+* An LLM used to label data is a **measurement instrument**: evaluate it against a gold standard, by subgroup, and check its stability.
+
+
+## Exercises
+
+1. Change the bigram model to a **trigram** model (the next word depends on the previous two words). Generate text from it. Is it better? What share of the word pairs in *Sense and Sensibility* (now word triples) were never seen?
+2. Run the BPE code with 15 merges instead of 8. What tokens does it learn? Add the word "slowest" (with a count of 4) to the corpus and repeat.
+3. Rebuild the Austen embeddings with a window of 2 words instead of 4 (change `1:4` to `1:2`). How do the nearest neighbors of "sister" and "letter" change?
+4. In the "attention by hand" example, change the 3 in `W_Q["symptom", 1] <- 3` to 1, and then to 10, and recompute `A` and `H`. What happens to the attention weights? How is this like changing the temperature?
+5. In the simulated evaluation, change the sensitivity for Spanish notes to 0.92. How do the subgroup results and the prevalence table change?
+
+
+# References {.unnumbered}
+
+* Clark K, Khandelwal U, Levy O, Manning CD (2019). What does BERT look at? An analysis of BERT's attention. *Proceedings of the ACL Workshop BlackboxNLP*.
+* Kaplan J, et al. (2020). Scaling laws for neural language models. *arXiv:2001.08361*.
+* Levy O, Goldberg Y, Dagan I (2015). Improving distributional similarity with lessons learned from word embeddings. *Transactions of the Association for Computational Linguistics*, 3, 211--225.
+* Sennrich R, Haddow B, Birch A (2016). Neural machine translation of rare words with subword units. *Proceedings of ACL*.
+* Vaswani A, et al. (2017). Attention is all you need. *NeurIPS*.
+* Xiao G, Tian Y, Chen B, Han S, Lewis M (2024). Efficient streaming language models with attention sinks. *ICLR*.
+* Jurafsky D, Martin JH. *Speech and Language Processing*, 3rd ed. draft. <https://web.stanford.edu/~jurafsky/slp3/> (see the chapters on embeddings and Transformers).
+* Alammar J. The Illustrated Transformer. <https://jalammar.github.io/illustrated-transformer/>

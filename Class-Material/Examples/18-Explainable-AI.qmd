@@ -59,6 +59,7 @@ library(ALEPlot)        # ALE for classical interface
 library(iml)            # model-agnostic interface (PDP/ALE/SHAP)
 library(fastshap)       # fast SHAP approximations
 library(lime)           # LIME local explanations
+library(ggbeeswarm)     # beeswarm layout for SHAP summary plots
 # Misc
 library(ranger)         # Fast implementation of random forests
 library(kableExtra)
@@ -714,15 +715,15 @@ set.seed(735)
 sh_values <- fastshap::explain(
   object        = fit_rf,
   feature_names = names(X_test),
-  X             = X_test[1:200, , drop = FALSE],
+  X             = X_test,
   pred_wrapper  = rf_predict,
   nsim          = 50
 )
 
 # Looking at local importance with SHAP values
-X_test[1:200, , drop = FALSE] %>% 
+X_test %>% 
   mutate(
-    pred = predict(rf_fit, X_test[1:200, , drop = FALSE], type = "response")$predictions[, "pos"]
+    pred = predict(rf_fit, X_test, type = "response")$predictions[, "pos"]
   ) %>% 
   bind_cols(
     as_tibble(sh_values[,1:3]) %>% rename_with(~paste0(.x,"_sh"))
@@ -750,6 +751,47 @@ ggplot(shap_importance,
   labs(title = "Global Importance (mean |SHAP|)",
        x = NULL, y = "Mean |SHAP value|")
 ```
+
+### SHAP Beeswarm Plot
+
+The bar chart shows *how much* each feature matters on average, but hides the *direction* and the spread. A **beeswarm plot** shows every individual's SHAP value as a point:
+
+- each row is a feature, ordered by mean |SHAP|;
+- the horizontal position is that person's SHAP value (pushes the predicted probability up or down);
+- the color is the person's (standardized) feature value, so you can see whether *high* values raise or lower risk.
+
+```{r}
+#| fig-width: 8
+#| fig-height: 5
+# Long format: one row per (person, feature), with SHAP value and feature value
+
+shap_long <- as_tibble(unclass(sh_values)) %>%
+  mutate(id = row_number()) %>%
+  pivot_longer(-id, names_to = "Variable", values_to = "shap") %>%
+  left_join(
+    X_test %>%
+      mutate(id = row_number()) %>%
+      pivot_longer(-id, names_to = "Variable", values_to = "value"),
+    by = c("id", "Variable")
+  ) %>%
+  # Rescale feature values to [0, 1] within each feature so one color scale works for all
+  group_by(Variable) %>%
+  mutate(value_scaled = (value - min(value)) / (max(value) - min(value))) %>%
+  ungroup() %>%
+  mutate(Variable = factor(Variable, levels = rev(shap_importance$Variable)))
+
+ggplot(shap_long, aes(x = shap, y = Variable, color = value_scaled)) +
+  geom_vline(xintercept = 0, color = "grey60") +
+  geom_quasirandom(orientation = "y", size = 1.5, alpha = 0.8, width = 0.35) +
+  scale_color_gradient(low = "#2C7BB6", high = "#D7191C",
+                       breaks = c(0, 1), labels = c("Low", "High"),
+                       name = "Feature\nvalue") +
+  labs(title = "SHAP Beeswarm (Random Forest, test set)",
+       x = "SHAP value (impact on predicted P(diabetes))", y = NULL) +
+  theme_minimal()
+```
+
+Reading the plot: for `glucose`, red points (high glucose) sit to the right of zero and blue points to the left, so high glucose raises the predicted risk. A feature whose colors are mixed along the axis has a weaker or non-monotone relationship, or interacts with other features.
 
 ## LIME (Local Surrogates)
 

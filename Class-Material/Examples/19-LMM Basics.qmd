@@ -504,11 +504,58 @@ Chapters from the same book tend to sit together, mostly because each book has i
 Our embeddings give "cold" the same vector in "the patient has a cold" and "the patient's hands are cold". To fix this, each word's vector needs to depend on the words around it. That is what attention does.
 
 
+
 # Attention
+
+## Where do $\mathbf{X}$, $\mathbf{W}_Q$, $\mathbf{W}_K$, and $\mathbf{W}_V$ come from?
+
+Attention starts from the embeddings we just built. To process a phrase, look up the embedding of each token and stack them as the rows of a matrix $\mathbf{X}$: one row per token, one column per embedding dimension.
+
+```{r}
+phrase <- c("my", "dear", "sister", "wrote", "a", "letter")
+X_demo <- E[phrase, ]
+dim(X_demo)    # 6 tokens x 100 embedding dimensions
+```
+
+This is the same table `E` as before. (In an LLM this table is the first layer of the network and its numbers are learned.) The problem from the last section is visible here: each row depends only on its own word, not on the words around it.
+
+Attention turns each row of $\mathbf{X}$ into three new vectors, using three weight matrices:
+
+* the **query** $\mathbf{Q} = \mathbf{X}\mathbf{W}_Q$: what this token is looking for,
+* the **key** $\mathbf{K} = \mathbf{X}\mathbf{W}_K$: what this token offers to be found by, and
+* the **value** $\mathbf{V} = \mathbf{X}\mathbf{W}_V$: what this token passes along.
+
+Each weight matrix is just a table of numbers with one row per embedding dimension and one column per new dimension. Here they are $100 \times 16$ (the 16 is a choice).
+
+```{r}
+set.seed(1)
+d_k <- 16
+W_Q_demo <- matrix(rnorm(100 * d_k, sd = 0.1), 100, d_k)
+W_K_demo <- matrix(rnorm(100 * d_k, sd = 0.1), 100, d_k)
+W_V_demo <- matrix(rnorm(100 * d_k, sd = 0.1), 100, d_k)
+
+Q_demo <- X_demo %*% W_Q_demo
+K_demo <- X_demo %*% W_K_demo
+V_demo <- X_demo %*% W_V_demo
+dim(Q_demo)                                  # 6 tokens x 16
+
+scores_demo <- Q_demo %*% t(K_demo) / sqrt(d_k)
+dim(scores_demo)                             # 6 x 6: one score for every pair of tokens
+```
+
+These weights are random, so the scores mean nothing. In a real model nobody sets them. $\mathbf{W}_Q$, $\mathbf{W}_K$, and $\mathbf{W}_V$ start random and are learned by gradient descent, together with the embedding table, to minimize the same next-token cross-entropy loss we used for the bigram model. The embeddings we built from counts and an SVD have no counterpart of these matrices.
+
+There is a direct link to the last section. There, $\mathbf{w}_a^\top \mathbf{c}_b \approx \text{PPMI}(a, b)$ scored how strongly word $a$ goes with context word $b$. In attention, the score between tokens $i$ and $j$ is $\mathbf{q}_i^\top \mathbf{k}_j$: again a dot product between a "center" vector and a "context" vector. What changes is where the vectors come from and what they are computed for:
+
+| | Embeddings (last section) | Attention |
+|---|---|---|
+| Where the numbers come from | Counts, PPMI, SVD | Learned by gradient descent on the prediction loss |
+| Score for a pair of words | $\mathbf{w}_a^\top \mathbf{c}_b$, the same in every sentence | $\mathbf{q}_i^\top \mathbf{k}_j$, computed for the tokens in *this* sentence |
+| Depends on context? | No: one vector per word | Yes: each token's output is a weighted average of the other tokens' values |
 
 ## Attention by hand
 
-We'll compute one attention layer (Vaswani et al., 2017) for the 4-token phrase "no fever or cough". In a real model, the embeddings and the weight matrices $\mathbf{W}_Q, \mathbf{W}_K, \mathbf{W}_V$ are learned during training, and their numbers are hard to interpret. Here we **build them by hand** so that we can see what each step does.
+To see what each step does, we shrink the example. We'll compute one attention layer (Vaswani et al., 2017) for the 4-token phrase "no fever or cough", with $d = 4$ embedding dimensions instead of 100. Instead of learning $\mathbf{W}_Q, \mathbf{W}_K, \mathbf{W}_V$, we **build the embeddings and the weights by hand**, so each number has a meaning we can follow.
 
 Each token gets a $d = 4$ dimensional embedding, and we give each dimension a meaning: is the word a negation, a symptom, a conjunction, or a respiratory term?
 
@@ -720,9 +767,44 @@ A Transformer block is this multi-head attention followed by a small feed-forwar
 
 # From scores to the next token
 
+## Where do the scores come from?
+
+Here is the whole path so far:
+
+tokens $\rightarrow$ embeddings ($\mathbf{X}$) $\rightarrow$ attention (and add) $\rightarrow$ one vector per token $\rightarrow$ **scores for every word in the vocabulary** $\rightarrow$ softmax $\rightarrow$ next token
+
+The last step before the softmax works like this. Because of the causal mask, the vector for the **last** token in the phrase is the only one that has seen all the others, so the model uses that vector. It compares it with an **output vector** for every word in the vocabulary, using a dot product:
+
+$$
+z_k = \mathbf{h}_{\text{last}}^\top \mathbf{u}_k,
+$$
+
+where $\mathbf{h}_{\text{last}}$ is the final vector for the last token and $\mathbf{u}_k$ is the output vector for word $k$. This is the same kind of score as $\mathbf{q}_i^\top\mathbf{k}_j$ in attention and $\mathbf{w}_a^\top\mathbf{c}_b$ in the embeddings section. It is also the "language model as a classifier" idea from the start of the notes: a softmax regression with one class per word in the vocabulary, where the features are $\mathbf{h}_{\text{last}}$. Many models reuse the embedding table for the output vectors.
+
+We can try this with the embeddings we built. Our context vectors `Cv` play the role of the output vectors, and the vector for "sister" plays the role of $\mathbf{h}_{\text{last}}$:
+
+```{r}
+h <- W["sister", ]                      # vector for the last token
+z_vocab <- drop(Cv %*% h)               # one score per word: w_sister . c_k
+names(z_vocab) <- vocab$word
+
+p_vocab <- softmax(z_vocab)
+
+tibble(token = names(p_vocab), score = z_vocab, prob = p_vocab) |>
+  slice_max(prob, n = 6) |>
+  kbl2(digits = 3)
+```
+
+Each score approximates PPMI("sister", $k$) from the embeddings section, so these are the words that appear near "sister". This is not a real next-word predictor. Our window looks in both directions, and nothing was trained to predict the next word. Two things are missing:
+
+* **Context.** We used the plain vector for "sister". In a Transformer, $\mathbf{h}_{\text{last}}$ comes out of the attention layers, so the scores depend on every earlier word in the phrase.
+* **Training.** In a real LLM, the embedding table, the attention weights, and the output vectors are all learned by minimizing the next-token cross-entropy loss, as in the bigram model.
+
+Temperature and top-$p$ act on these scores, which is what the rest of this section covers.
+
 ## Temperature
 
-At the end of the network, the model produces a score $z_k$ for every token in the vocabulary, and a softmax turns the scores into probabilities. **Temperature** $\tau$ divides the scores before the softmax:
+The scores $z_k$ from the step above go through a softmax. **Temperature** $\tau$ divides the scores before the softmax:
 
 $$
 p_k(\tau) = \frac{\exp(z_k/\tau)}{\sum_j \exp(z_j/\tau)}.

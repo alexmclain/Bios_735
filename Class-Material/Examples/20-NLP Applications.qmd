@@ -1,0 +1,804 @@
+---
+title: "20 - Modern NLP Applications"
+subtitle: "Biostatistics 735 — Machine Learning in Public Health"
+author: "Alexander McLain"
+date: today
+format:
+  html:
+    toc: true
+    toc-location: left
+    toc-depth: 3
+    number-sections: true
+    smooth-scroll: true
+    theme: cosmo
+    code-fold: false
+    highlight-style: github
+    embed-resources: true
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+
+```{r}
+#| include: false
+library(tidyverse)
+library(kableExtra)
+library(tidytext)   # splitting text into words and bigrams
+library(Matrix)     # sparse matrices
+library(glmnet)     # lasso
+library(irlba)      # SVD of a large sparse matrix
+library(rsample)    # train/test split
+library(yardstick)  # sensitivity, PPV, etc.
+
+kbl2 <- function(x, ...) kable(x, align = "lrrrrrr", ...) |> kable_styling(full_width = FALSE)
+theme_set(theme_minimal(base_size = 13))
+```
+
+
+These notes go with the *Modern NLP Applications in Public Health* slides. The slides describe four ways to turn text into an answer. Here we try them on real public health text, and we work through the study-design ideas (validation sampling and misclassification) with simulations.
+
+
+# The data: OSHA severe injury reports
+
+Since 2015, US employers must report to OSHA (the Occupational Safety and Health Administration) every work-related injury that leads to a hospitalization, an amputation, or the loss of an eye. Each report has a short **narrative** of what happened. OSHA staff then code the type of event using the Occupational Injury and Illness Classification System (OIICS). The data are public: <https://www.osha.gov/severe-injury-reports>. Our file covers January 2015 to November 2025.
+
+The first digit of the OIICS event code is the **division**:
+
+| Division | Event type |
+|:--|:--|
+| 1 | Violence and other injuries by persons or animals |
+| 2 | Transportation incidents |
+| 3 | Fires and explosions |
+| 4 | **Falls, slips, trips** |
+| 5 | Exposure to harmful substances or environments |
+| 6 | Contact with objects and equipment |
+| 7 | Overexertion and bodily reaction |
+| 9 | Nonclassifiable |
+
+Our main task: **from the narrative alone, was the event a fall, slip, or trip (division 4)?** The OSHA codes are our gold standard. Keep in mind they were assigned by people, who could make mistakes too.
+
+```{r}
+#| cache: true
+osha <- read_csv("January2015toNovember2025.csv",
+                 col_select = c(EventDate, `Primary NAICS`, `Final Narrative`, Event, EventTitle),
+                 show_col_types = FALSE) |>
+  rename(naics = `Primary NAICS`, narrative = `Final Narrative`) |>
+  filter(!is.na(Event), !is.na(narrative)) |>
+  distinct(narrative, .keep_all = TRUE) |>        # drop repeated narratives
+  mutate(doc      = row_number(),
+         division = substr(as.character(Event), 1, 1),
+         fall     = factor(if_else(division == "4", "yes", "no"), levels = c("yes", "no")),
+         heat     = coalesce(str_detect(EventTitle, "environmental heat"), FALSE),
+         sector   = substr(naics, 1, 2))
+
+nrow(osha)
+osha |> count(fall) |> mutate(percent = 100 * n / sum(n)) |> kbl2(digits = 1)
+```
+
+About a third of the reports are falls, slips, or trips. Here are a few narratives:
+
+```{r}
+set.seed(20)
+osha |> slice_sample(n = 6) |> select(fall, EventTitle, narrative) |> kbl2()
+```
+
+The narratives are written in plain English by employers and OSHA staff, so they are much cleaner than clinical notes. They are still messy in their own ways ("lost his footing", "came down off the ladder").
+
+To keep the computing time reasonable, we'll work with a random sample of 20,000 reports, split into training (75%) and test (25%) sets.
+
+```{r}
+set.seed(735)
+osha_s <- osha |> slice_sample(n = 20000)
+split  <- initial_split(osha_s, prop = 0.75, strata = fall)
+train  <- training(split)
+test   <- testing(split)
+c(train = nrow(train), test = nrow(test))
+```
+
+
+# A keyword search
+
+The simplest approach, and the one used in most surveillance systems, is a keyword search. Let's flag every narrative that contains a word starting with "fall" or "fell".
+
+```{r}
+kw_fall <- function(text) str_detect(text, regex("\\bf(a|e)ll", ignore_case = TRUE))
+
+train <- train |>
+  mutate(kw = factor(if_else(kw_fall(narrative), "yes", "no"), levels = c("yes", "no")))
+
+class_metrics <- metric_set(sens, spec, ppv, f_meas)
+
+conf_mat(train, truth = fall, estimate = kw)
+class_metrics(train, truth = fall, estimate = kw) |> kbl2(digits = 3)
+```
+
+The keyword search does reasonably well, but it is far from perfect. **Reading the errors** is the most useful thing we can do. First, false positives: the keyword is there, but the event was not a fall.
+
+```{r}
+set.seed(1)
+train |> filter(kw == "yes", fall == "no") |> slice_sample(n = 6) |>
+  select(EventTitle, narrative) |> kbl2()
+```
+
+There are two kinds of false positives. In some, an **object** fell, not the worker ("the machine fell over", "a tree limb fell"; also "felling a tree" and "fall protection"). In others, the worker did fall, but OSHA coded the event as something else, because something else happened first (e.g., the worker was struck by a boom and then fell). The keyword can't tell these apart. Now false negatives: a fall, slip, or trip with no "fall" or "fell".
+
+```{r}
+set.seed(2)
+train |> filter(kw == "no", fall == "yes") |> slice_sample(n = 6) |>
+  select(EventTitle, narrative) |> kbl2()
+```
+
+Here the worker "slipped", "tripped", or was "found on the ground" next to a ladder. We could keep adding words and exceptions to the search, and surveillance programs do exactly that. But each rule fixes some errors and creates others, and the rules must be tuned by hand. The alternative is to **learn** the rules from labeled data.
+
+
+# Bag of words + lasso, step by step
+
+Instead of choosing the words ourselves, we let the lasso choose them. We need to turn the narratives into a matrix $\mathbf{X}$ with one row per narrative and one column per word.
+
+## Step 1: tokens
+
+We split each narrative into single words **and** pairs of adjacent words (bigrams). Bigrams keep a little word order: "fell from" and "falling object" are different features.
+
+```{r}
+#| cache: true
+make_tokens <- function(df) {
+  bind_rows(
+    df |> unnest_tokens(term, narrative), # (1) unigrams
+    df |> unnest_tokens(term, narrative, token = "ngrams", n = 2) # (2) bigrams
+  ) |>
+    filter(!is.na(term)) |>
+    count(doc, term)           # how many times each term appears in each narrative
+}
+
+train_tok <- make_tokens(train |> select(doc, narrative))
+test_tok  <- make_tokens(test  |> select(doc, narrative))
+head(train_tok)
+```
+
+**Should we remove stop words?** Many tutorials remove common words using a stop-word list. Look at some of the words in the `tidytext` list:
+
+```{r}
+stop_words |> filter(word %in% c("no", "not", "off", "down", "from", "over", "without")) |>
+  distinct(word) |> pull(word)
+```
+
+For this task, "off" ("fell off a ladder"), "down" ("fell down the stairs"), and "from" are some of the most useful words, and in clinical text "no" and "not" carry negation. So we **keep** the stop words and let the lasso decide.
+
+## Step 2: the vocabulary (from the training data only)
+
+Most terms are rare. We keep those that appear in at least 20 training narratives. The vocabulary must come from the **training** data only: if we used the test data to choose features, information from the test set would leak into the model.
+
+```{r}
+vocab <- train_tok |>
+  count(term, name = "df") |>      # df = number of narratives containing the term
+  filter(df >= 20)
+
+nrow(vocab)
+```
+
+This consists of one- and two-word phrases.
+
+## Step 3: document-term matrix and TF-IDF
+
+Recal that
+$$
+\text{tf-idf}(t, d) = \text{tf}(t, d) \times \log \frac{N}{\text{df}(t)},
+$$
+where $\text{tf}(t,d)$ is the count of term $t$ in document $d$, $N$ the number of narratives, and $\text{df}(t)$ the number of narratives that contain $t$. If every narrative contains $t$ then $\text{tf-idf}(t, d)=0$ for all $d$.
+
+The function below builds a sparse matrix: one row per document, one column per vocabulary term, with the counts as entries. Terms not in the vocabulary are dropped, so the test matrix has exactly the same columns as the training matrix.
+
+```{r}
+make_dtm <- function(tok, docs, vocab) {
+  tok <- tok |> filter(term %in% vocab$term)
+  sparseMatrix(i = match(tok$doc, docs),
+               j = match(tok$term, vocab$term),
+               x = tok$n,
+               dims = c(length(docs), nrow(vocab)),
+               dimnames = list(NULL, vocab$term))
+}
+```
+
+Next, the TF-IDF weights from the slides, $\log(N / \text{df}(t))$. Like the vocabulary, the weights are computed from the training data and then applied to the test data.
+
+```{r}
+idf <- log(nrow(train) / vocab$df)
+
+tfidf <- function(dtm) {
+  X <- dtm %*% Diagonal(x = idf)    # multiply column t by idf[t]
+  colnames(X) <- vocab$term
+  X
+}
+
+X_train <- tfidf(make_dtm(train_tok, train$doc, vocab))
+X_test  <- tfidf(make_dtm(test_tok,  test$doc,  vocab))
+dim(X_train)
+
+# What share of the entries are zero?
+1 - nnzero(X_train) / prod(dim(X_train))
+```
+
+More than 99% of the entries are zero, which is why we store $\mathbf{X}$ as a sparse matrix. A regular matrix this size would take about `r round(prod(dim(X_train)) * 8 / 1e9, 1)` GB of memory.
+
+Here are the terms with the largest and smallest IDF:
+
+```{r}
+tibble(term = vocab$term, df = vocab$df, idf = idf) |>
+  arrange(idf) |> slice(c(1:5, (n() - 4):n())) |> kbl2(digits = 2)
+```
+
+Words like "an" and "employee" appear in almost every narrative, so their IDF is near 0 and they get almost no weight.
+
+## Step 4: the lasso
+
+`glmnet` works directly with sparse matrices. We use 5-fold cross-validation to choose $\lambda$.
+
+```{r}
+#| cache: true
+y_train <- as.numeric(train$fall == "yes")
+
+set.seed(735)
+cv_fit <- cv.glmnet(X_train, y_train, family = "binomial", alpha = 1, nfolds = 5)
+
+# number of terms selected at lambda.1se
+sum(coef(cv_fit, s = "lambda.1se")[-1] != 0)
+```
+
+Out of about `r format(ncol(X_train), big.mark = ",")` terms, the lasso keeps about five-hundred. Which terms matter most? A first try is to sort the coefficients:
+
+```{r}
+b <- coef(cv_fit, s = "lambda.1se")
+coefs <- tibble(term = rownames(b), beta = as.numeric(b)) |>
+  filter(term != "(Intercept)", beta != 0)
+
+coefs |> slice_min(beta, n = 6) |> kbl2(digits = 2)
+```
+
+The most negative coefficients are on "was", "a", and "the". These words don't tell us anything about falls. They have large coefficients because of their **scale**: their IDF is close to 0, so their TF-IDF values are tiny, and a tiny column needs a big coefficient to have any effect. (`glmnet` standardizes the columns while fitting, but it reports the coefficients on the original scale.)
+
+To compare terms, we use **standardized coefficients**: the coefficient times the standard deviation of its column. This is the change in the log-odds for a one-SD change in the term's TF-IDF value, so it is comparable across terms.
+
+```{r}
+#| fig-width: 9
+#| fig-height: 6
+col_sd <- sqrt(colMeans(X_train^2) - colMeans(X_train)^2)   # SD of each column of the sparse matrix
+
+coefs <- coefs |> mutate(std_beta = beta * col_sd[term])
+
+bind_rows(slice_max(coefs, std_beta, n = 15), slice_min(coefs, std_beta, n = 15)) |>
+  mutate(direction = if_else(std_beta > 0, "More likely a fall", "Less likely a fall"),
+         term = fct_reorder(term, std_beta)) |>
+  ggplot(aes(std_beta, term, fill = direction)) +
+  geom_col() +
+  labs(x = "Standardized lasso coefficient", y = NULL, fill = NULL) +
+  theme(legend.position = "bottom")
+```
+
+The lasso found the words we would have added to a keyword search by hand ("tripped", "slipped", "ladder", "ground", "feet"). It also found words that point **away** from a fall: body parts and events from other divisions ("finger", "amputation", "struck", "heat", "forklift"). Notice "fell on": the bigram has a *negative* coefficient, even though "fell" alone is strongly positive. "A beam fell on his foot" describes a falling object, and the bigram lets the model tell the two uses apart. Some terms, like "was" and "the", are still on the list; they act as stand-ins for the style or length of the narrative and have no meaning on their own. This is one advantage of the lasso over a black box: we can read the model and check that it makes sense.
+
+We can also look up the terms behind the keyword search's false positives:
+
+```{r}
+tibble(term = c("fell", "fall", "falling", "struck", "fall protection", "felling")) |>
+  left_join(coefs, by = "term") |>
+  mutate(across(c(beta, std_beta), ~ replace_na(.x, 0))) |>
+  kbl2(digits = 2)
+```
+
+A coefficient of 0 means the lasso dropped the term.
+
+## Test-set performance
+
+```{r}
+test <- test |>
+  mutate(kw       = factor(if_else(kw_fall(narrative), "yes", "no"), levels = c("yes", "no")),
+         p_lasso  = as.numeric(predict(cv_fit, X_test, s = "lambda.1se", type = "response")),
+         lasso    = factor(if_else(p_lasso > 0.5, "yes", "no"), levels = c("yes", "no")))
+
+bind_rows(
+  class_metrics(test, truth = fall, estimate = kw)    |> mutate(method = "Keyword"),
+  class_metrics(test, truth = fall, estimate = lasso) |> mutate(method = "TF-IDF + lasso")
+) |>
+  select(method, .metric, .estimate) |>
+  pivot_wider(names_from = .metric, values_from = .estimate) |>
+  kbl2(digits = 3)
+
+pr_auc(test, truth = fall, p_lasso)
+```
+
+The lasso is much better than the keyword search on both specificity and PPV.
+
+## Error analysis
+
+The test-set numbers tell us *how often* the model is wrong. To learn *why*, read the errors the model was most confident about.
+
+```{r}
+# Falls the model was most sure were not falls
+test |> filter(fall == "yes") |> slice_min(p_lasso, n = 5) |>
+  select(p_lasso, EventTitle, narrative) |> kbl2(digits = 3)
+
+# Non-falls the model was most sure were falls
+test |> filter(fall == "no") |> slice_max(p_lasso, n = 5) |>
+  select(p_lasso, EventTitle, narrative) |> kbl2(digits = 3)
+```
+
+Look closely at these. Some are true model errors (unusual wording). Others are hard cases where the narrative describes more than one event (e.g., a worker fell *and* was struck), and OSHA's coders had to pick one. A few may be coding errors in the gold standard. In a real study, you would review cases like these with the people who wrote the codebook. This kind of review often leads to better rules for the human coders, not just a better model.
+
+
+# Embeddings as features
+
+## Document vectors from an SVD
+
+In the LLM notes we built word embeddings by taking an SVD of a word-by-word matrix. We can do the same thing with the document-term matrix to get one short vector per **narrative**. This is called **latent semantic analysis** (LSA).
+
+The truncated SVD gives $\mathbf{X}_{\text{train}} \approx \mathbf{U}\mathbf{D}\mathbf{V}^\top$. The vector for training narrative $i$ is row $i$ of $\mathbf{U}\mathbf{D}$. Since $\mathbf{X}\mathbf{V} = \mathbf{U}\mathbf{D}$, any *new* narrative is mapped the same way: multiply its TF-IDF row by $\mathbf{V}$. This uses the training $\mathbf{V}$, so nothing is learned from the test data.
+
+```{r}
+#| cache: true
+set.seed(1)
+sv <- irlba(X_train, nv = 100)
+
+Z_train <- as.matrix(X_train %*% sv$v)   # same as sv$u %*% diag(sv$d)
+Z_test  <- as.matrix(X_test  %*% sv$v)
+dim(Z_train)
+```
+
+Now each narrative is a vector of 100 numbers instead of `r format(ncol(X_train), big.mark = ",")`. We fit the same lasso on these features.
+
+```{r}
+#| cache: true
+set.seed(735)
+cv_lsa <- cv.glmnet(Z_train, y_train, family = "binomial", alpha = 1, nfolds = 5)
+
+test <- test |>
+  mutate(p_lsa = as.numeric(predict(cv_lsa, Z_test, s = "lambda.1se", type = "response")),
+         lsa   = factor(if_else(p_lsa > 0.5, "yes", "no"), levels = c("yes", "no")))
+
+bind_rows(
+  class_metrics(test, truth = fall, estimate = lasso) |> mutate(method = "TF-IDF + lasso"),
+  class_metrics(test, truth = fall, estimate = lsa)   |> mutate(method = "LSA (100 dims) + lasso")
+) |>
+  select(method, .metric, .estimate) |>
+  pivot_wider(names_from = .metric, values_from = .estimate) |>
+  kbl2(digits = 3)
+```
+
+The LSA features are a little worse than the full TF-IDF matrix. That makes sense: the SVD was computed from the same training narratives, so it can't add any information. It only compresses what is already in $\mathbf{X}$. 
+
+**Pretrained** embedding models are different: they were trained on billions of words, so they bring outside knowledge (e.g., that "lost his footing" and "slipped" mean similar things), and that is why they can help when labeled data are scarce.
+
+## Semantic search
+
+Document vectors also let us search by meaning. We'll embed a new sentence with the same steps (tokens, TF-IDF with the training IDF, multiply by $\mathbf{V}$) and find the training narratives with the highest cosine similarity.
+
+```{r}
+embed_text <- function(text) {
+  tok <- make_tokens(tibble(doc = seq_along(text), narrative = text))
+  X <- tfidf(make_dtm(tok, seq_along(text), vocab))
+  as.matrix(X %*% sv$v)
+}
+
+unit_rows <- function(Z) Z / pmax(sqrt(rowSums(Z^2)), 1e-12)   # length 1, so dot product = cosine
+Z_unit <- unit_rows(Z_train)
+
+search <- function(query, k = 5) {
+  q <- unit_rows(embed_text(query))
+  sim <- drop(Z_unit %*% t(q))
+  train |> mutate(cosine = sim) |> slice_max(cosine, n = k) |>
+    select(cosine, EventTitle, narrative)
+}
+
+search("worker slipped on ice in the parking lot and broke her wrist") |> kbl2(digits = 2)
+```
+
+All of the top matches describe the same kind of event as the query. Some match on meaning rather than exact words (e.g., slipping on "leaves" or "wet pavement" instead of ice), because those words appear in similar narratives in the training data.
+
+**Try it:** search for "heat exhaustion while roofing in the afternoon sun" or "finger caught in a conveyor belt".
+
+## Pretrained embeddings 
+
+To use a pretrained embedding model, we can call Python's `sentence-transformers` library from R. The line `py_require()` tells `reticulate` which Python package we need. The first time it runs, it sets up a private Python with that package installed, which takes a few minutes. It must run before the first `import()` in an R session; if you get `No module named 'sentence_transformers'`, restart R and run the chunk from the top. The model is downloaded the first time (about 90 MB) and then runs on your own computer, so the text never leaves it.
+
+```{r}
+#| cache: true
+library(reticulate)
+py_require("sentence-transformers")   # run before the first import()
+st <- import("sentence_transformers")
+model <- st$SentenceTransformer("all-MiniLM-L6-v2")   # a small, general-purpose model
+
+E_train <- model$encode(train$narrative)   # a 15,000 x 384 matrix
+E_test  <- model$encode(test$narrative)
+
+set.seed(735)
+cv_emb <- cv.glmnet(E_train, y_train, family = "binomial", alpha = 1, nfolds = 5)
+```
+
+Everything after `encode()` is exactly what we did with the LSA vectors.
+
+
+```{r}
+#| cache: true
+test <- test |>
+  mutate(p_emb = as.numeric(predict(cv_emb, E_test, s = "lambda.1se", type = "response")),
+         lemp   = factor(if_else(p_emb > 0.5, "yes", "no"), levels = c("yes", "no")))
+
+bind_rows(
+  class_metrics(test, truth = fall, estimate = lasso) |> mutate(method = "TF-IDF + lasso"),
+  class_metrics(test, truth = fall, estimate = lemp)   |> mutate(method = "embeddings + lasso")
+) |>
+  select(method, .metric, .estimate) |>
+  pivot_wider(names_from = .metric, values_from = .estimate) |>
+  kbl2(digits = 3)
+```
+
+# Prompting an LLM
+
+The code that calls the LLM is **not run** when these notes are rendered, because it needs either an API key for a commercial model or a model running on your own computer, and it is slow. We ran it once with a local model and saved the answers, which we load below. The code uses the `ellmer` package (version 0.3 or later). To run it:
+
+* **Local model:** install Ollama (<https://ollama.com>), run `ollama pull llama3.1` in a terminal, and use `chat_ollama()`. The text stays on your computer.
+* **Commercial model:** get an API key, put it in your `.Renviron` file (e.g., `OPENAI_API_KEY=...`), and use `chat_openai()` or `chat_anthropic()`. The text is sent to the company, so only do this with public data like these.
+
+## The codebook is the prompt
+
+The most important part is the instructions. We copy the definition the human coders use:
+
+```{r}
+#| eval: false
+codebook <- "
+You are coding OSHA severe injury reports using the OIICS event classification.
+Decide whether the event is in division 4: 'Falls, slips, trips'.
+
+Division 4 includes:
+- falls to a lower level (from ladders, roofs, scaffolds, vehicles, stairs, ...)
+- falls on the same level (slipping or tripping and falling to the floor)
+- slips or trips WITHOUT a fall, if that caused the injury
+- jumps to a lower level
+
+Division 4 does NOT include:
+- being struck by a falling object (that is contact with objects and equipment)
+- a vehicle or machine falling over with the worker in it (transportation or contact)
+
+Answer only from the narrative. If the narrative does not say how the injury happened, answer 'unclear'.
+"
+```
+
+## Asking for structured output
+
+```{r}
+#| eval: false
+library(ellmer)
+
+chat <- chat_ollama(model = "llama3.1", system_prompt = codebook)
+
+fall_type <- type_object(
+  fall     = type_enum(values = c("yes", "no", "unclear"),
+                       description = "Is this a fall, slip, or trip (OIICS division 4)?"),
+  evidence = type_string(description = "The words in the narrative that support the answer")
+)
+
+# One narrative
+one <- chat$chat_structured(test$narrative[1], type = fall_type)
+one
+
+# A development sample of 200 narratives: returns a data frame with columns fall and evidence
+set.seed(1)
+dev <- test |> slice_sample(n = 200)
+llm_out <- parallel_chat_structured(chat, as.list(dev$narrative), type = fall_type)
+
+# Save the answers, so we never have to run this again
+saveRDS(list(first = one,
+             dev   = tibble(narrative = dev$narrative,
+                            llm_fall  = llm_out$fall, evidence = llm_out$evidence),
+             model = "llama3.1", date = Sys.Date()),
+        "osha_llm_dev.rds")
+```
+
+We ran this code with `llama3.1` (8 billion parameters) through Ollama on a MacBook Air. The 200 narratives took about 23 minutes, roughly 7 seconds each. The lasso classifies all 5,000 test narratives in well under a second. Here are the saved answers:
+
+```{r}
+saved <- readRDS("osha_llm_dev.rds")
+saved$first          # the answer for the first test narrative
+
+# The same development sample of 200, with the LLM's answers added
+set.seed(1)
+dev <- test |>
+  slice_sample(n = 200) |>
+  left_join(saved$dev, by = "narrative")
+```
+
+Already the first answer is odd: the model said "unclear" and gave "yes" as the evidence, which is not a quote from the narrative.
+
+## Evaluating the LLM
+
+The LLM's answers are evaluated exactly like the lasso: compare with the OSHA codes. The "unclear" answers need a decision. Here we count them as "no" and report how many there were.
+
+```{r}
+dev <- dev |>
+  mutate(llm = factor(if_else(llm_fall == "yes", "yes", "no"), levels = c("yes", "no")))
+
+count(dev, llm_fall, fall)
+
+bind_rows(
+  class_metrics(dev, truth = fall, estimate = llm)   |> mutate(method = "llama3.1 (prompted)"),
+  class_metrics(dev, truth = fall, estimate = lasso) |> mutate(method = "TF-IDF + lasso")
+) |>
+  select(method, .metric, .estimate) |>
+  pivot_wider(names_from = .metric, values_from = .estimate) |>
+  kbl2(digits = 3)
+```
+
+The LLM looks about as good as the lasso. But the counts above show why: all 113 "unclear" answers (57% of the sample) were reports that are **not** falls, and we counted "unclear" as "no". The model used "unclear" to mean "not a fall", even when the narrative says exactly what happened:
+
+```{r}
+dev |>
+  filter(llm_fall == "unclear") |>
+  select(fall, narrative, evidence) |>
+  head(5) |>
+  kable() |>
+  kable_styling(full_width = FALSE)
+```
+
+None of these narratives is unclear, and the `evidence` column holds "yes" or "no" instead of words from the narrative. Had we counted "unclear" as "yes", or dropped those reports, the results would look very different. This is why we read the answers, not just the metrics. Things to try:
+
+* Reword the codebook so that "no" means "the narrative describes some other kind of event", and "unclear" is only for narratives that don't say how the injury happened.
+* Put `evidence` before `fall` in `type_object()`, so the model quotes the text before it decides.
+* Try a larger model. An 8-billion-parameter model running on a laptop is small by today's standards.
+
+On a development sample of 200, the confidence intervals are wide. Revise the codebook using the errors (read the `evidence` column!), then evaluate **once** on a separate test sample.
+
+
+# Designing the validation sample
+
+In a real project, we don't have 100,000 labeled reports. Someone has to read and code a sample of documents to estimate how well a method works. How should that sample be chosen?
+
+Here we use the OSHA codes as the "truth" for **every** report, and we pretend that we can only afford to label 400 reports. Because we know the truth for all of them, we can see how well each sampling design works.
+
+## A rare outcome: heat illness
+
+Falls are common (about a third of reports). The sampling question matters most for **rare** outcomes, so we use exposure to environmental heat, which is about 2.5% of reports. Our classifier is a keyword search for the word "heat":
+
+```{r}
+pop <- osha |>
+  mutate(flag = str_detect(narrative, regex("\\bheat\\b", ignore_case = TRUE)))
+
+# The true sensitivity and PPV of the keyword search, in the whole population
+true_se  <- with(pop, mean(flag[heat]))
+true_ppv <- with(pop, mean(heat[flag]))
+tibble(heat_cases = sum(pop$heat), flagged = sum(pop$flag), sensitivity = true_se, PPV = true_ppv) |>
+  kbl2(digits = 3)
+```
+
+## Weighting a stratified sample
+
+In a **stratified** sample, we divide the reports into groups (strata) and sample a fixed number from each. Some groups are over-sampled, so the estimates of sensitivity and PPV are **weighted** to account for this: each sampled report counts for the number of reports in the population that it represents. The code below does this for us.
+
+```{r}
+draw_sample <- function(strata, alloc) {
+  # strata: the stratum of every report; alloc: how many to sample from each stratum
+  idx <- unlist(map(names(alloc), ~ sample(which(strata == .x), alloc[[.x]])))
+  w   <- unlist(map(names(alloc), ~ rep(sum(strata == .x) / alloc[[.x]], alloc[[.x]])))
+  s <- pop[idx, ]
+  tibble(heat_cases = sum(s$heat),
+         se_hat     = sum(w * s$flag * s$heat) / sum(w * s$heat),
+         ppv_hat    = sum(w * s$flag * s$heat) / sum(w * s$flag))
+}
+```
+
+## Three designs
+
+We compare three ways of choosing the 400 reports:
+
+1. **Simple random sample** of 400.
+2. **Two strata:** 200 flagged and 200 unflagged reports.
+3. **Three strata:** we split the unflagged reports further, using words that often go with heat illness but are not "heat" (hot, sun, dehydration, collapsed, fainted, ...). We sample 150 flagged, 150 "maybe", and 100 of the rest.
+
+```{r}
+maybe_words <- "hot|sun|temperature|dehydrat|exhaust|collaps|cramp|faint|dizz|unconscious|passed out|unresponsive"
+
+pop <- pop |>
+  mutate(two_strata   = if_else(flag, "flagged", "not flagged"),
+         three_strata = case_when(flag ~ "flagged",
+                                  str_detect(narrative, regex(maybe_words, ignore_case = TRUE)) ~ "maybe",
+                                  TRUE ~ "rest"))
+
+pop |> group_by(three_strata) |>
+  summarise(reports = n(), heat_cases = sum(heat)) |> kbl2()
+```
+
+This table uses the truth, which we would not have in practice, but it shows the idea: almost all the heat cases the keyword **missed** are in the "maybe" stratum, which is only about 5% of the reports.
+
+We draw each design 1,000 times:
+
+```{r}
+#| cache: true
+set.seed(735)
+one_stratum <- rep("all", nrow(pop))
+
+sims <- map_dfr(1:1000, ~ bind_rows(
+  draw_sample(one_stratum, c(all = 400)) |> mutate(design = "1. Simple random"),
+  draw_sample(pop$two_strata, c(flagged = 200, `not flagged` = 200)) |> mutate(design = "2. Two strata"),
+  draw_sample(pop$three_strata, c(flagged = 150, maybe = 150, rest = 100)) |> mutate(design = "3. Three strata")
+))
+
+sims |>
+  group_by(design) |>
+  summarise(avg_heat_cases = mean(heat_cases),
+            se_mean = mean(se_hat, na.rm = TRUE), se_sd = sd(se_hat, na.rm = TRUE),
+            ppv_mean = mean(ppv_hat, na.rm = TRUE), ppv_sd = sd(ppv_hat, na.rm = TRUE)) |>
+  kbl2(digits = 3)
+```
+
+```{r}
+#| fig-width: 9
+#| fig-height: 5
+sims |>
+  pivot_longer(c(se_hat, ppv_hat), names_to = "measure", values_to = "estimate") |>
+  mutate(measure = if_else(measure == "se_hat", "Sensitivity", "PPV")) |>
+  ggplot(aes(estimate, fill = design)) +
+  geom_density(alpha = 0.5, color = NA) +
+  geom_vline(data = tibble(measure = c("Sensitivity", "PPV"), truth = c(true_se, true_ppv)),
+             aes(xintercept = truth), linetype = 2) +
+  facet_wrap(~measure, scales = "free") +
+  labs(x = "Estimate (dashed line = truth)", y = "Density", fill = NULL) +
+  theme(legend.position = "bottom")
+```
+
+What we learn:
+
+* **Simple random sample:** only about 10 heat cases among 400 reports, so both estimates are very uncertain.
+* **Two strata:** PPV is now precise, because PPV is estimated from the flagged reports, and we sampled 200 of them. But the sensitivity estimate is no better. Sensitivity depends on how many heat cases were **missed**, and the missed cases are hidden among about 100,000 unflagged reports: 200 unflagged reports contain very few of them. In many samples they contain **none**, and the estimated sensitivity is exactly 1 (the spike at 1.0 in the plot).
+* **Three strata:** the "maybe" stratum concentrates the missed cases, so we find many of them, and the sensitivity estimate becomes much more precise as well.
+
+We still sample 100 reports from the "rest". The rest contains very few heat cases, but if we didn't sample it at all, we would be assuming it contains none. That is why we must also sample unflagged reports in the two-strata design: if we only labeled flagged reports, every heat case in our sample would be flagged, and we would estimate the sensitivity as 100%.
+
+
+# Correcting a prevalence estimate
+
+Suppose the goal is to estimate the share of severe injuries that are falls, slips, or trips, but we only have a classifier's labels. To make the bias easy to see, we'll use the keyword search, which has the most errors. We pretend that the 5,000 test reports are unlabeled, except for a random **validation sample** of 300 that someone coded by hand.
+
+```{r}
+set.seed(1)
+val <- test |> slice_sample(n = 300)
+
+se_val <- with(val, mean(kw[fall == "yes"] == "yes"))
+sp_val <- with(val, mean(kw[fall == "no"]  == "no"))
+p_naive <- mean(test$kw == "yes")
+
+rogan_gladen <- function(p, se, sp) (p + sp - 1) / (se + sp - 1)
+
+tibble(truth       = mean(test$fall == "yes"),
+       naive       = p_naive,
+       corrected   = rogan_gladen(p_naive, se_val, sp_val)) |>
+  kbl2(digits = 3)
+```
+
+The corrected estimate is much closer to the truth than the naive one. But $\widehat{\text{Se}}$ and $\widehat{\text{Sp}}$ come from only 300 reports, so the corrected estimate has extra uncertainty. A simple way to include it is the **bootstrap**: resample the validation sample, re-estimate Se and Sp, and recompute the correction each time.
+
+```{r}
+set.seed(2)
+boot_rg <- map_dbl(1:2000, function(b) {
+  v  <- val[sample(nrow(val), replace = TRUE), ]
+  se <- mean(v$kw[v$fall == "yes"] == "yes")
+  sp <- mean(v$kw[v$fall == "no"]  == "no")
+  rogan_gladen(p_naive, se, sp)
+})
+
+quantile(boot_rg, c(0.025, 0.975))
+```
+
+(We treat the naive proportion over the 5,000 reports as fixed, since its sampling error is small compared with that of Se and Sp.)
+
+**When the errors differ between groups.** The correction above uses one Se and one Sp for everyone. Suppose we compare industries (the first two digits of the NAICS code: 23 = construction, 31--33 = manufacturing, 62 = health care). If the keyword search works differently in different industries, a single correction is not enough.
+
+```{r}
+test |>
+  mutate(industry = case_when(sector == "23" ~ "Construction",
+                              sector %in% c("31", "32", "33") ~ "Manufacturing",
+                              sector == "62" ~ "Health care")) |>
+  filter(!is.na(industry)) |>
+  group_by(industry) |>
+  summarise(n = n(),
+            sensitivity = mean(kw[fall == "yes"] == "yes"),
+            specificity = mean(kw[fall == "no"] == "no"),
+            true_prev   = mean(fall == "yes"),
+            naive_prev  = mean(kw == "yes"),
+            corrected   = rogan_gladen(naive_prev, se_val, sp_val)
+            ) |>
+  kbl2(digits = 3)
+```
+
+Here we computed Se and Sp in each industry from the full test set, which we would not have in practice. The keyword's specificity varies between industries. In manufacturing, where falls are less common, the pooled correction overshoots: it is further from the truth than the naive estimate. If we plan to compare industries, the validation sample should be stratified by industry so that Se and Sp can be estimated in each one.
+
+In practice, Se and Sp for each industry have to come from the validation sample. Here we estimate them from our 300 hand-coded reports and use them to correct each industry's estimate:
+
+```{r}
+add_industry <- function(d) {
+  d |>
+    mutate(industry = case_when(sector == "23" ~ "Construction",
+                                sector %in% c("31", "32", "33") ~ "Manufacturing",
+                                sector == "62" ~ "Health care")) |>
+    filter(!is.na(industry))
+}
+
+# Se and Sp in each industry, from the validation sample only
+val_ind <- add_industry(val) |>
+  group_by(industry) |>
+  summarise(n_val      = n(),
+            n_val_fall = sum(fall == "yes"),
+            se_ind     = mean(kw[fall == "yes"] == "yes"),
+            sp_ind     = mean(kw[fall == "no"]  == "no"))
+
+# The naive estimate in each industry uses all of its test reports
+add_industry(test) |>
+  group_by(industry) |>
+  summarise(true_prev  = mean(fall == "yes"),
+            naive_prev = mean(kw == "yes")) |>
+  left_join(val_ind, by = "industry") |>
+  mutate(pooled_corr   = rogan_gladen(naive_prev, se_val, sp_val),
+         industry_corr = rogan_gladen(naive_prev, se_ind, sp_ind)) |>
+  kbl2(digits = 3)
+```
+
+In manufacturing, using that industry's own Se and Sp fixes the problem: the corrected estimate is 0.139 (truth 0.153), compared with 0.080 from the pooled correction. But look at the sample sizes. Our 300 random reports include only 15 from health care: 9 falls and 6 non-falls, so its specificity of 1.00 rests on 6 reports. In construction and health care, the industry-specific corrections are further from the truth than the pooled ones.
+
+This is the bias–variance trade-off again. A pooled Se and Sp are stable but biased for industries where the classifier behaves differently. Industry-specific values remove that bias but are noisy when an industry has few validation reports. Stratifying the validation sample by industry (for example, 100 reports from each) avoids having to choose.
+
+
+
+# Finding themes with clustering
+
+Finally, an unsupervised task: without using the OSHA codes, what kinds of events are in the narratives? We cluster the LSA document vectors with $k$-means. We use the unit-length vectors, so that narratives are grouped by direction (what they talk about) rather than length.
+
+```{r}
+#| cache: true
+set.seed(735)
+km <- kmeans(Z_unit, centers = 8, nstart = 10, iter.max = 50)
+table(km$cluster)
+```
+
+To describe each cluster, we find the terms with the highest average TF-IDF among its narratives:
+
+```{r}
+top_terms <- map_dfr(1:8, function(k) {
+  m <- colMeans(X_train[km$cluster == k, , drop = FALSE])
+  tibble(cluster = k, size = sum(km$cluster == k),
+         top_terms = paste(names(sort(m, decreasing = TRUE))[1:8], collapse = ", "))
+})
+top_terms |> kbl2()
+```
+
+Now we check how the clusters line up with the OSHA event divisions, which the clustering did not use:
+
+```{r}
+division_names <- c("1" = "Violence", "2" = "Transportation", "3" = "Fire/explosion",
+                    "4" = "Fall/slip/trip", "5" = "Exposure", "6" = "Contact with objects",
+                    "7" = "Overexertion", "9" = "Nonclassifiable")
+
+train |>
+  mutate(cluster = km$cluster, division = division_names[division]) |>
+  count(cluster, division) |>
+  group_by(cluster) |>
+  mutate(percent = round(100 * n / sum(n))) |>
+  slice_max(percent, n = 2) |>
+  select(cluster, division, percent) |>
+  kbl2()
+```
+
+Most clusters line up closely with one event division, even though the clustering never saw the codes. Two details are worth noticing:
+
+* Falls were split into **two** clusters: one about slipping and tripping on the floor, and one about ladders, feet, and the ground. These match the OIICS groups "falls on the same level" and "falls to a lower level".
+* Some clusters mix divisions but share a topic. The burns cluster mixes "exposure" (hot substances) and "fires and explosions", and the forklift and truck cluster mixes "contact with objects" and "transportation incidents".
+
+This is the "unknown categories" approach from the slides. The clusters don't replace a codebook, but reading a few narratives from each cluster is a quick way to start writing one.
+
+
+# Exercises
+
+1. Improve the keyword search for falls by adding words that the lasso found ("slipped", "tripped", "lost balance", ...) and an exception for "falling object". Compute its sensitivity and PPV on the test set. How close can you get to the lasso?
+2. Refit the TF-IDF + lasso model using single words only (no bigrams). Which bigrams were most useful, and how much does performance change?
+3. Change the vocabulary cutoff from 20 narratives to 5 and to 100. How do the number of columns of $\mathbf{X}$ and the test-set performance change?
+4. Fit the LSA + lasso model with 25 and with 300 dimensions instead of 100. What happens to the test-set performance?
+5. In the three-strata design, change the allocation to 50 flagged, 250 "maybe", and 100 rest. Which estimate (sensitivity or PPV) becomes more precise, and which less? Why?
+6. Repeat the prevalence correction with the lasso instead of the keyword search. How large is the correction, and why?
